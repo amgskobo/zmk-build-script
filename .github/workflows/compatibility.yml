@@ -1,0 +1,201 @@
+name: Compatibility
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    name: Shell compatibility (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check Bash syntax
+        run: bash -n ./build.sh
+
+      - name: Check LF line endings
+        run: |
+          if git grep -I -n $'\r' -- .; then
+            echo "CRLF line endings found." >&2
+            exit 1
+          fi
+
+      - name: Check host-side help
+        run: ./build.sh --help
+
+      - name: Check container-side help
+        run: ZMK_IN_CONTAINER=1 ./build.sh help
+
+      - name: Check host-side contract
+        run: |
+          compat_dir="${RUNNER_TEMP}/compat-zmk-config"
+          mkdir -p "${compat_dir}/config/boards"
+          touch "${compat_dir}/config/west.yml" "${compat_dir}/build.yaml"
+          if ./build.sh validate "${compat_dir}" 2> "${RUNNER_TEMP}/compat.err"; then
+            :
+          fi
+          if grep -q "config/boards" "${RUNNER_TEMP}/compat.err"; then
+            echo "ZMK config/boards compatibility path was not accepted" >&2
+            exit 1
+          fi
+
+          snippet_dir="${RUNNER_TEMP}/snippet-zmk-config"
+          mkdir -p "${snippet_dir}/config" "${snippet_dir}/snippets/local-test"
+          touch "${snippet_dir}/config/west.yml" "${snippet_dir}/build.yaml"
+          printf 'name: local-test\n' > "${snippet_dir}/snippets/local-test/snippet.yml"
+          if ./build.sh validate "${snippet_dir}" 2> "${RUNNER_TEMP}/snippet.err"; then
+            echo "root snippets/ without snippet_root was accepted unexpectedly" >&2
+            exit 1
+          fi
+          grep -q "root snippet_root requires" "${RUNNER_TEMP}/snippet.err"
+
+          if ./build.sh validate .github/fixtures/ci-zmk-config -m "${RUNNER_TEMP}/missing-module" 2> "${RUNNER_TEMP}/module.err"; then
+            echo "missing local module was accepted unexpectedly" >&2
+            exit 1
+          fi
+          grep -q "local module directory not found" "${RUNNER_TEMP}/module.err"
+
+  docker:
+    name: Docker validate and build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check runner tools
+        run: bash .github/scripts/check-runner-tools.sh
+
+      - name: Validate CI fixture
+        run: ./build.sh validate .github/fixtures/ci-zmk-config
+
+      - name: Validate target-shape fixture
+        run: ./build.sh validate .github/fixtures/target-shapes-zmk-config --settings-reset
+
+      - name: Validate CI fixture with local module input
+        run: |
+          module_dir="${RUNNER_TEMP}/zmk-feature-ci-extra"
+          mkdir -p "${module_dir}/zephyr" "${module_dir}/boards/shields/ci-extra" "${module_dir}/snippets/ci-extra"
+          cat > "${module_dir}/zephyr/module.yml" <<'EOF'
+          name: zmk-feature-ci-extra
+          build:
+            settings:
+              board_root: .
+              snippet_root: .
+          EOF
+          printf 'name: ci-extra\n' > "${module_dir}/snippets/ci-extra/snippet.yml"
+          ./build.sh validate .github/fixtures/ci-zmk-config -m "${module_dir}"
+
+      - name: Validate legacy root module layout
+        run: |
+          legacy_dir="${RUNNER_TEMP}/legacy-root-module-zmk-config"
+          mkdir -p "${legacy_dir}/config" "${legacy_dir}/boards/shields/legacy-test" "${legacy_dir}/zephyr" "${legacy_dir}/zmk_search"
+          cat > "${legacy_dir}/config/west.yml" <<'EOF'
+          manifest:
+            remotes:
+              - name: zmkfirmware
+                url-base: https://github.com/zmkfirmware
+            projects:
+              - name: zmk
+                remote: zmkfirmware
+                revision: main
+                import: app/west.yml
+            self:
+              path: config
+          EOF
+          cat > "${legacy_dir}/build.yaml" <<'EOF'
+          include:
+            - board: nice_nano/nrf52840/zmk
+              shield: legacy-test
+          EOF
+          cat > "${legacy_dir}/module.yml" <<'EOF'
+          build:
+            cmake: .
+          EOF
+          touch "${legacy_dir}/CMakeLists.txt"
+          printf 'ignored\n' > "${legacy_dir}/zmk_search/generated.txt"
+          ./build.sh validate "${legacy_dir}"
+          test ! -f "${legacy_dir}/zephyr/module.yml"
+
+      - name: Build CI fixture
+        run: ./build.sh .github/fixtures/ci-zmk-config --pristine
+
+      - name: Build with local west project override
+        run: |
+          override_parent="${RUNNER_TEMP}/module-override"
+          override_name="zmk-studio-messages"
+          second_override_name="zcbor"
+          extra_module="${override_parent}/zmk-feature-ci-extra"
+          rm -rf "${override_parent}"
+          mkdir -p "${override_parent}"
+
+          container_id="$(docker create -v zmk-cache:/workspaces zmkfirmware/zmk-build-arm:stable)"
+          trap 'docker rm -f "${container_id}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container_id}:/workspaces/zmk-config/modules/msgs/${override_name}" "${override_parent}/"
+          docker cp "${container_id}:/workspaces/zmk-config/modules/lib/${second_override_name}" "${override_parent}/"
+          touch "${override_parent}/${override_name}/.ci-local-override"
+          touch "${override_parent}/${second_override_name}/.ci-local-override"
+          mkdir -p "${extra_module}/zephyr" "${extra_module}/boards/shields/ci-extra" "${extra_module}/snippets/ci-extra"
+          cat > "${extra_module}/zephyr/module.yml" <<'EOF'
+          name: zmk-feature-ci-extra
+          build:
+            settings:
+              board_root: .
+              snippet_root: .
+          EOF
+          printf 'name: ci-extra\n' > "${extra_module}/snippets/ci-extra/snippet.yml"
+
+          ./build.sh .github/fixtures/module-override-zmk-config \
+            -m "${override_parent}/${override_name}" \
+            -m "${override_parent}/${second_override_name}" \
+            -m "${extra_module}" \
+            --pristine |
+            tee "${RUNNER_TEMP}/module-override-build.log"
+          grep -q "Overlaying local west project: ${override_name} -> modules/msgs/${override_name}" "${RUNNER_TEMP}/module-override-build.log"
+          grep -q "Overlaying local west project: ${second_override_name} -> modules/lib/${second_override_name}" "${RUNNER_TEMP}/module-override-build.log"
+          grep -q "Adding local extra module: zmk-feature-ci-extra" "${RUNNER_TEMP}/module-override-build.log"
+
+      - name: Build after local west project override
+        run: |
+          ./build.sh .github/fixtures/module-override-zmk-config --pristine |
+            tee "${RUNNER_TEMP}/module-override-restore-build.log"
+          grep -q "Restoring previous local overlay from backup: zcbor -> modules/lib/zcbor" \
+            "${RUNNER_TEMP}/module-override-restore-build.log"
+          grep -q "Restoring previous local overlay from backup: zmk-studio-messages -> modules/msgs/zmk-studio-messages" \
+            "${RUNNER_TEMP}/module-override-restore-build.log"
+
+      - name: Upload firmware artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: zmk-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/**/build.log
+            .build/**/build-summary.txt
+            .build/**/*.uf2
+            .build/**/*.hex
+            .build/**/*.bin
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: true

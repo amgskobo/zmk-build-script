@@ -1,0 +1,37 @@
+include:
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_left nice_view_adapter
+    snippet: studio-rpc-usb-uart
+    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_SPLIT=y -DCONFIG_ZMK_POINTING=y -DCUSTOM_LABEL="space heavy target"
+    artifact-name: ci_extra_nice_nano_corne_left_nice_view_adapter
+
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_right nice_view_adapter
+    snippet: studio-rpc-usb-uart
+    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_SPLIT=y
+    artifact-name: ci_split_nice_nano_corne_right_nice_view_adapter
+
+  - board: nice_nano/nrf52840/zmk
+    shield: settings_reset
+    artifact-name: ci_bootloader_settings_reset
+
+  - board: xiao_ble/nrf52840/zmk
+    shield: settings_reset
+    artifact-name: ci_bootloader_settings_reset_xiao_ble
+
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_left
+    artifact-name: ci_bootloader_corne_left
+
+  - board: xiao_ble/nrf52840/zmk
+    shield: tester_xiao
+    artifact-name: ci_xiao_ble_tester
+
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_right
+    artifact-name: ci_bootloader_corne_right
+
+  - board: nice_nano/nrf52840/zmk
+    shield: settings_reset
+    cmake-args: -DCONFIG_ZMK_SETTINGS_RESET_ON_START=y
+    artifact-name: ci_reset_nice_nano

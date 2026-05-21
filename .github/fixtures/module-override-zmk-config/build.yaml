@@ -1,0 +1,6 @@
+include:
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_left nice_view_adapter
+    snippet: studio-rpc-usb-uart
+    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_SPLIT=y
+    artifact-name: ci_module_override_zmk_studio_messages

@@ -1,0 +1,34 @@
+defaults:
+  cmake-args: -DDEFAULT_FLAG=1
+
+board: nice_nano/nrf52840/zmk
+shield:
+  - corne_left
+  - corne_right
+artifact-name: matrix-{board}-{shield}
+
+include:
+  - board:
+      - nice_nano/nrf52840/zmk
+      - xiao_ble/nrf52840/zmk
+    shield: settings_reset
+    artifact-name: reset-{board}
+
+  - board: xiao_ble/nrf52840/zmk
+    shield: tester_xiao
+    snippet:
+      - studio-rpc-usb-uart
+      - zmk-usb-logging
+    cmake_args: -DLEGACY_ALIAS=y
+    extra_cmake_args:
+      - -DEXTRA_ALIAS=1
+      - -DCUSTOM_LABEL=two board fixture
+    artifact_name: xiao-alias-{shield}-{snippet}
+
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_left
+    artifact-name: skipped-target
+    skip: true
+
+exclude:
+  - artifact-name: matrix-nice_nano_nrf52840_zmk-corne_right
