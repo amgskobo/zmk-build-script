@@ -29,6 +29,57 @@ your-zmk-config/
 
 Windows では Git Bash を使ってください。標準的な Unix tool が使える Bash 環境を前提にします。
 
+## Windows / macOS / Linux での使い方
+
+Docker が起動していて、コマンドを Bash で実行できれば、同じ script を 3 OS で使えます。
+
+host CPU architecture は通常 script の利用条件には含めません。AMD64/x86_64 host でも
+ARM64 host でも、Docker 経由で同じ command を実行します。`zmk-build-arm` の `arm` は
+ZMK board 向け ARM firmware toolchain の意味で、host machine が ARM である必要はありません。
+
+Docker が image platform を自動選択できない場合や、ARM64 host で amd64 image を使いたい場合は
+次のように指定できます。
+
+```bash
+ZMK_DOCKER_PLATFORM=linux/amd64 ./build.sh ../your-zmk-config --pristine
+```
+
+### Windows
+
+1. Docker Desktop と Git for Windows を入れます。
+2. Docker Desktop を起動し、Linux engine が使える状態まで待ちます。
+3. Git Bash から実行します。
+
+```bash
+./build.sh ../your-zmk-config --pristine
+```
+
+PowerShell から起動する場合は、`bash` が WSL に解決されることを避けるため Git Bash を明示します。
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' ./build.sh ../your-zmk-config --pristine
+```
+
+### macOS
+
+1. Docker Desktop または Docker Engine を入れます。
+2. Docker を起動します。
+3. Terminal から実行します。
+
+```bash
+./build.sh ../your-zmk-config --pristine
+```
+
+### Linux
+
+1. Docker Engine または Docker Desktop を入れます。
+2. user shell から `docker ps` が通る状態にします。
+3. Bash から実行します。
+
+```bash
+./build.sh ../your-zmk-config --pristine
+```
+
 ## build
 
 ```bash

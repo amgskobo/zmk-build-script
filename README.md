@@ -34,6 +34,60 @@ On Windows, use Git Bash. PowerShell can launch Git Bash, but the script itself
 must run under Bash. Use a normal Bash environment with standard Unix tools
 available.
 
+## Use On Windows, macOS, And Linux
+
+The same script works on all three host OSes as long as Docker is running and
+the command is executed by Bash.
+
+Host CPU architecture is normally not part of the script contract. AMD64/x86_64
+and ARM64 hosts both run the same command through Docker. The `zmk-build-arm`
+image name refers to the ARM firmware toolchain used for ZMK boards, not a
+requirement that the host machine itself is ARM.
+
+If Docker cannot choose a working image platform automatically, or if an ARM64
+host needs the amd64 image, set:
+
+```bash
+ZMK_DOCKER_PLATFORM=linux/amd64 ./build.sh ../your-zmk-config --pristine
+```
+
+### Windows
+
+1. Install Docker Desktop and Git for Windows.
+2. Start Docker Desktop and wait until the Linux engine is ready.
+3. Run from Git Bash:
+
+```bash
+./build.sh ../your-zmk-config --pristine
+```
+
+PowerShell is fine as a launcher, but call Git Bash explicitly so `bash` does
+not resolve to WSL by accident:
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' ./build.sh ../your-zmk-config --pristine
+```
+
+### macOS
+
+1. Install Docker Desktop or another Docker Engine setup.
+2. Start Docker.
+3. Run from Terminal:
+
+```bash
+./build.sh ../your-zmk-config --pristine
+```
+
+### Linux
+
+1. Install Docker Engine or Docker Desktop.
+2. Make sure `docker ps` works from your user shell.
+3. Run from Bash:
+
+```bash
+./build.sh ../your-zmk-config --pristine
+```
+
 ## Build
 
 ```bash
