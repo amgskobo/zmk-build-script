@@ -60,7 +60,7 @@ jobs:
             .build/**/*.uf2
             .build/**/*.hex
             .build/**/*.bin
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
           include-hidden-files: true
 
@@ -99,7 +99,7 @@ jobs:
             .build/**/*.uf2
             .build/**/*.hex
             .build/**/*.bin
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
           include-hidden-files: true
 
@@ -138,6 +138,6 @@ jobs:
             .build/**/*.uf2
             .build/**/*.hex
             .build/**/*.bin
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
           include-hidden-files: true

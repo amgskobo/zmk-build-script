@@ -924,6 +924,7 @@ require_host_commands() {
 
 validate_module_inputs() {
     local mod name seen=" "
+    [ "${#MODULES[@]}" -gt 0 ] || return 0
     for mod in "${MODULES[@]}"; do
         [ -d "${mod}" ] || die "local module directory not found: ${mod}"
         name="$(basename "${mod}")"
@@ -1049,6 +1050,7 @@ copy_target_to_container() {
     fi
 
     local mod name
+    [ "${#MODULES[@]}" -gt 0 ] || return 0
     for mod in "${MODULES[@]}"; do
         name="$(basename "${mod}")"
         msg "Copying module: ${name}"
@@ -1127,8 +1129,6 @@ if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = "auto" ]; then
     resolved_image_tag="$(docker_tag_for_zmk_revision "${detected_zmk_revision}")"
 fi
 zmk_build_image="$(resolve_docker_image "${resolved_image_tag}")"
-docker_platform_args=()
-[ -n "${ZMK_DOCKER_PLATFORM:-}" ] && docker_platform_args=(--platform "${ZMK_DOCKER_PLATFORM}")
 RUN_STARTED_AT="$(date +%s)"
 artifact_dir="${SCRIPT_DIR}/.build/${run_id}"
 LOG_FILE="${artifact_dir}/build.log"
@@ -1143,15 +1143,26 @@ fi
 msg "Docker image: ${zmk_build_image}"
 
 docker rm -f "${container_name}" >/dev/null 2>&1 || true
-docker create --name "${container_name}" \
-    "${docker_platform_args[@]}" \
-    -v zmk-cache:/workspaces \
-    -e ZMK_IN_CONTAINER=1 \
-    -e PRISTINE="${PRISTINE}" \
-    -e SETTINGS_RESET="${SETTINGS_RESET}" \
-    -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
-    -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-    "${zmk_build_image}" tail -f /dev/null >/dev/null
+if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
+    docker create --name "${container_name}" \
+        --platform "${ZMK_DOCKER_PLATFORM}" \
+        -v zmk-cache:/workspaces \
+        -e ZMK_IN_CONTAINER=1 \
+        -e PRISTINE="${PRISTINE}" \
+        -e SETTINGS_RESET="${SETTINGS_RESET}" \
+        -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
+        -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
+        "${zmk_build_image}" tail -f /dev/null >/dev/null
+else
+    docker create --name "${container_name}" \
+        -v zmk-cache:/workspaces \
+        -e ZMK_IN_CONTAINER=1 \
+        -e PRISTINE="${PRISTINE}" \
+        -e SETTINGS_RESET="${SETTINGS_RESET}" \
+        -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
+        -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
+        "${zmk_build_image}" tail -f /dev/null >/dev/null
+fi
 container_created=1
 docker start "${container_name}" >/dev/null
 
