@@ -29,11 +29,7 @@ jobs:
         run: bash -n ./build.sh
 
       - name: Check LF line endings
-        run: |
-          if git grep -I -n $'\r' -- .; then
-            echo "CRLF line endings found." >&2
-            exit 1
-          fi
+        run: bash .github/scripts/check-lf.sh
 
       - name: Check host-side help
         run: ./build.sh --help

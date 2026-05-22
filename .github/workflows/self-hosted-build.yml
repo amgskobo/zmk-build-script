@@ -41,11 +41,7 @@ jobs:
           git checkout-index -f -a
       - run: bash .github/scripts/check-runner-tools.sh
       - run: bash -n ./build.sh
-      - run: |
-          if git grep -I -n $'\r' -- .; then
-            echo "CRLF line endings found." >&2
-            exit 1
-          fi
+      - run: bash .github/scripts/check-lf.sh
       - run: |
           if [ "${{ inputs.mode }}" = "validate" ]; then
             ./build.sh validate .github/fixtures/ci-zmk-config
@@ -84,11 +80,7 @@ jobs:
           git checkout-index -f -a
       - run: bash .github/scripts/check-runner-tools.sh
       - run: bash -n ./build.sh
-      - run: |
-          if git grep -I -n $'\r' -- .; then
-            echo "CRLF line endings found." >&2
-            exit 1
-          fi
+      - run: bash .github/scripts/check-lf.sh
       - run: |
           if [ "${{ inputs.mode }}" = "validate" ]; then
             ./build.sh validate .github/fixtures/ci-zmk-config
@@ -127,11 +119,7 @@ jobs:
           git checkout-index -f -a
       - run: bash .github/scripts/check-runner-tools.sh
       - run: bash -n ./build.sh
-      - run: |
-          if git grep -I -n $'\r' -- .; then
-            echo "CRLF line endings found." >&2
-            exit 1
-          fi
+      - run: bash .github/scripts/check-lf.sh
       - run: |
           if [ "${{ inputs.mode }}" = "validate" ]; then
             ./build.sh validate .github/fixtures/ci-zmk-config
