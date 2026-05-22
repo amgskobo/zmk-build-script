@@ -1,14 +1,21 @@
 # Self-hosted Runner Setup
 
-Use this guide when you want full Docker validation on your own Windows, macOS,
-or Linux machines.
+Use this guide when you want a real-machine Docker smoke test on your own macOS
+or Windows machines. Linux self-hosted runners are optional because the hosted
+Compatibility workflow already covers Ubuntu Docker validation.
 
 ## Why Self-hosted Runners
 
-GitHub hosted CI is enough for regular compatibility checks plus Ubuntu Docker
-validation and CI fixture builds. A self-hosted runner is useful when you need
-proof that Docker Desktop or Docker Engine works on the actual machine you care
-about, especially for macOS and Windows.
+GitHub hosted CI is the release gate for regular compatibility checks, Ubuntu
+Docker validation, CI fixture builds, target-shape parsing, and module override
+coverage. A self-hosted runner is useful when you need proof that Docker Desktop
+or Docker Engine works on the actual macOS or Windows machine you care about.
+Linux self-hosted runs are useful only when you need proof for a specific Linux
+host.
+
+The self-hosted workflow intentionally runs only the standard CI fixture. Treat
+it as real-machine Docker smoke coverage, not as a replacement for the hosted
+Compatibility workflow.
 
 Keep the self-hosted workflow manual-only unless the runner is isolated and you
 trust every workflow that can run on the repository.
@@ -134,18 +141,21 @@ Open `Actions` -> `Self-hosted Build` -> `Run workflow`.
 Recommended order:
 
 ```text
-platform: macos
+platform: <the OS label for your online runner>
 mode: validate
 ```
 
 Then:
 
 ```text
-platform: macos
+platform: <the same OS label>
 mode: build
 ```
 
-After each OS succeeds individually, run:
+The workflow default is `platform: macos` because self-hosted coverage is mainly
+for macOS and Windows. Choose `windows` explicitly for a Windows runner and
+`linux` only when you need to smoke-test a specific Linux host. After each OS
+succeeds individually, and only when all selected runner types are online, run:
 
 ```text
 platform: all

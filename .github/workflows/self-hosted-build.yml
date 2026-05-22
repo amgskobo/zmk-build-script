@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Self-hosted platform to run
+        description: Self-hosted platform to run. Use all only when every OS runner is online.
         required: true
         type: choice
-        options: [all, linux, macos, windows]
-        default: all
+        options: [macos, windows, linux, all]
+        default: macos
       mode:
         description: Run validate only or a full build
         required: true
         type: choice
-        options: [build, validate]
+        options: [validate, build]
         default: validate
       pristine:
         description: Use --pristine for full builds
@@ -35,6 +35,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - run: |
+          git config core.autocrlf false
+          git config core.eol lf
+          git checkout-index -f -a
       - run: bash .github/scripts/check-runner-tools.sh
       - run: bash -n ./build.sh
       - run: |
@@ -74,6 +78,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - run: |
+          git config core.autocrlf false
+          git config core.eol lf
+          git checkout-index -f -a
       - run: bash .github/scripts/check-runner-tools.sh
       - run: bash -n ./build.sh
       - run: |
@@ -113,6 +121,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - run: |
+          git config core.autocrlf false
+          git config core.eol lf
+          git checkout-index -f -a
       - run: bash .github/scripts/check-runner-tools.sh
       - run: bash -n ./build.sh
       - run: |

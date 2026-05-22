@@ -22,6 +22,16 @@ your-zmk-config/
 `config/boards` は ZMK が今も検索する compatibility path なので拒否しません。root の
 `dts/` や `snippets/` は `zephyr/module.yml` の settings で宣言されている必要があります。
 
+## 大きな特徴
+
+- cross-platform host flow: Windows、macOS、Linux で同じ Docker + Bash entrypoint を使います。
+- host CPU independent: AMD64/x86_64 host でも ARM64 host でも Docker 経由で動きます。`zmk-build-arm` の `arm` は firmware toolchain の意味で、host CPU の条件ではありません。
+- local module override: `-m <dir>` と `local_modules/` で、同名 west project の overlay と extra ZMK module 追加の両方に対応します。
+- persistent west workspace: dependency は run 間で再利用し、target config は毎回 fresh に copy します。
+- safe overlay restore: local west project override は backup して、次回 build で復元します。
+- target ごとに artifact 1 個: `.uf2` を優先し、`.bin` / `.hex` fallback も扱います。
+- CI coverage: ZMK 4.1 HWMv2 の代表 board、target shape parser、複数 local module override path を確認します。
+
 ## 必要なもの
 
 - Docker Desktop または Docker Engine
@@ -206,13 +216,20 @@ Linux 実機で Docker validation を確認したい場合だけ `SELF_HOSTED_RU
 
 ## Docker image
 
-既定値:
+既定の tag mode は `auto` です。`auto` では `config/west.yml` を読み、
+`zmk` project の `revision` から Docker image tag を選びます。
+
+- `main`、`master`、または不明な revision -> `stable`
+- `v0.3` / `0.3` -> `3.5-branch`
+- `v4.1` / `4.1` / `4.1-branch` -> `4.1-branch`
+
+現在の ZMK `main` では次に解決されます。
 
 ```text
 zmkfirmware/zmk-build-arm:stable
 ```
 
-override:
+明示 override は常に優先されます。
 
 ```bash
 ZMK_BUILD_IMAGE=zmkfirmware/zmk-build-arm:stable ./build.sh ../your-zmk-config

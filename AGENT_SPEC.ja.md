@@ -48,6 +48,18 @@ root `dts/` や `snippets/` は、`zephyr/module.yml` の
 8. `.uf2` を最優先し、なければ fallback として `.bin` / `.hex` を 1 個だけ copy
 9. `build.log` と `build-summary.txt` を保存
 
+## Docker image tag
+
+既定は `ZMK_BUILD_IMAGE_TAG=auto` とし、target repo の `config/west.yml` にある
+`zmk` project の `revision` から Docker image tag を選びます。
+
+- `main` / `master` / 不明な revision は `stable`
+- `v0.3` / `0.3` は `3.5-branch`
+- `v4.1` / `4.1` / `4.1-branch` は `4.1-branch`
+
+`ZMK_BUILD_IMAGE` は full image override として最優先です。
+`ZMK_BUILD_IMAGE_TAG` に `auto` 以外を指定した場合は、その tag をそのまま使います。
+
 ## build.yaml
 
 対応する key:

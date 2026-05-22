@@ -46,7 +46,7 @@ Supported target layout:
 Environment:
   ZMK_BUILD_IMAGE            Full Docker image override.
   ZMK_BUILD_IMAGE_REPOSITORY Docker image repository (default: zmkfirmware/zmk-build-arm).
-  ZMK_BUILD_IMAGE_TAG        Docker image tag (default: stable).
+  ZMK_BUILD_IMAGE_TAG        Docker image tag (default: auto; main -> stable, v0.3 -> 3.5-branch, 4.1 -> 4.1-branch).
   ZMK_DOCKER_PLATFORM        Optional docker --platform value.
   ZMK_FALLBACK_BINARY        Fallback firmware extension after uf2 (default: bin).
 EOF
@@ -935,11 +935,65 @@ validate_module_inputs() {
     done
 }
 
+trim_manifest_scalar() {
+    local value="$1"
+    value="${value%%#*}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "${value}" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    printf '%s\n' "${value}"
+}
+
+detect_zmk_revision() {
+    local manifest="${TARGET_DIR}/config/west.yml" revision
+    [ -f "${manifest}" ] || return 1
+    revision="$(
+        awk '
+            /^[[:space:]]*-[[:space:]]*name:[[:space:]]*zmk([[:space:]]*(#.*)?)?$/ {
+                in_zmk = 1
+                next
+            }
+            in_zmk && /^[[:space:]]*-[[:space:]]*name:/ {
+                in_zmk = 0
+            }
+            in_zmk && /^[[:space:]]*revision:[[:space:]]*/ {
+                sub(/^[[:space:]]*revision:[[:space:]]*/, "", $0)
+                print
+                exit
+            }
+        ' "${manifest}"
+    )"
+    [ -n "${revision}" ] || return 1
+    trim_manifest_scalar "${revision}"
+}
+
+docker_tag_for_zmk_revision() {
+    local revision="$1"
+    case "${revision}" in
+        ""|main|master)
+            printf '%s\n' "stable"
+            ;;
+        v0.3|v0.3.*|v0.3-branch|0.3|0.3.*)
+            printf '%s\n' "3.5-branch"
+            ;;
+        v4.1|v4.1.*|4.1|4.1.*|4.1-branch)
+            printf '%s\n' "4.1-branch"
+            ;;
+        *)
+            printf '%s\n' "stable"
+            ;;
+    esac
+}
+
 resolve_docker_image() {
+    local tag="${1:-${ZMK_BUILD_IMAGE_TAG:-auto}}"
     if [ -n "${ZMK_BUILD_IMAGE:-}" ]; then
         printf '%s\n' "${ZMK_BUILD_IMAGE}"
     else
-        printf '%s:%s\n' "${ZMK_BUILD_IMAGE_REPOSITORY:-zmkfirmware/zmk-build-arm}" "${ZMK_BUILD_IMAGE_TAG:-stable}"
+        printf '%s:%s\n' "${ZMK_BUILD_IMAGE_REPOSITORY:-zmkfirmware/zmk-build-arm}" "${tag}"
     fi
 }
 
@@ -1065,7 +1119,14 @@ validate_host_layout
 validate_module_inputs
 require_host_commands docker tar
 
-zmk_build_image="$(resolve_docker_image)"
+requested_image_tag="${ZMK_BUILD_IMAGE_TAG:-auto}"
+resolved_image_tag="${requested_image_tag}"
+detected_zmk_revision=""
+if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = "auto" ]; then
+    detected_zmk_revision="$(detect_zmk_revision || true)"
+    resolved_image_tag="$(docker_tag_for_zmk_revision "${detected_zmk_revision}")"
+fi
+zmk_build_image="$(resolve_docker_image "${resolved_image_tag}")"
 docker_platform_args=()
 [ -n "${ZMK_DOCKER_PLATFORM:-}" ] && docker_platform_args=(--platform "${ZMK_DOCKER_PLATFORM}")
 RUN_STARTED_AT="$(date +%s)"
@@ -1076,6 +1137,9 @@ touch "${SCRIPT_DIR}/.build/.gitkeep"
 
 echo -e "${CYAN}Starting ZMK ${MODE}...${NC}"
 msg "Target: ${TARGET_DIR}"
+if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = "auto" ]; then
+    msg "Detected ZMK revision: ${detected_zmk_revision:-<unknown>} (Docker tag: ${resolved_image_tag})"
+fi
 msg "Docker image: ${zmk_build_image}"
 
 docker rm -f "${container_name}" >/dev/null 2>&1 || true

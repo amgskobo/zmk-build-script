@@ -25,6 +25,23 @@ When a legacy target repo has root module content plus root `module.yml` but no
 `zephyr/module.yml`, the container creates a transient `zephyr/module.yml` from
 the current root layout. The source repo is not modified.
 
+## Key Features
+
+- Cross-platform host flow: Windows, macOS, and Linux use the same Docker + Bash
+  script entrypoint.
+- Host CPU independent: AMD64/x86_64 and ARM64 hosts run through Docker; the
+  `zmk-build-arm` image name refers to the firmware toolchain, not the host CPU.
+- Local module override: `-m <dir>` and `local_modules/` can overlay matching
+  west projects or be added as extra ZMK modules.
+- Persistent west workspace: dependencies are reused between runs, while the
+  target config is copied fresh each time.
+- Safe overlay restore: local west project overrides are backed up and restored
+  on the next build.
+- One artifact per target: `.uf2` is preferred, with `.bin` / `.hex` fallback
+  support.
+- CI coverage: representative ZMK 4.1 HWMv2 boards, target-shape parsing, and
+  multiple local module override paths are validated.
+
 ## Requirements
 
 - Docker Desktop or Docker Engine
@@ -228,13 +245,21 @@ Windows, macOS, or Linux machines.
 
 ## Docker Image
 
-Default image:
+The default tag mode is `auto`. In auto mode the script reads
+`config/west.yml`, detects the `zmk` project revision, and chooses the Docker
+image tag:
+
+- `main`, `master`, or unknown revision -> `stable`
+- `v0.3` / `0.3` -> `3.5-branch`
+- `v4.1` / `4.1` / `4.1-branch` -> `4.1-branch`
+
+For current ZMK `main`, this resolves to:
 
 ```text
 zmkfirmware/zmk-build-arm:stable
 ```
 
-Overrides:
+Explicit overrides always win:
 
 ```bash
 ZMK_BUILD_IMAGE=zmkfirmware/zmk-build-arm:stable ./build.sh ../your-zmk-config
