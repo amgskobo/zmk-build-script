@@ -101,7 +101,8 @@ service.
 ## Windows Runner
 
 Install Git for Windows and Docker Desktop. The workflow uses `shell: bash`, so
-Git Bash must be available to the Actions runner.
+Git Bash must be installed at the default `C:\Program Files\Git\bin\bash.exe`
+path used by the workflow.
 
 Local preflight from Git Bash:
 

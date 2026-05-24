@@ -94,8 +94,8 @@ Docker Desktop を使える同じ user で runner を起動して確認してく
 
 ## Windows runner
 
-Git for Windows と Docker Desktop をインストールします。workflow は `shell: bash` を使うため、
-Actions runner から Git Bash を実行できる必要があります。
+Git for Windows と Docker Desktop をインストールします。workflow は Git Bash を
+既定 path の `C:\Program Files\Git\bin\bash.exe` から実行します。
 
 Git Bash からのローカル preflight:
 
