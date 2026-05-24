@@ -1,5 +1,7 @@
 # ZMK Build Script
 
+[日本語版 README](README.ja.md)
+
 Small Docker + Bash helper for building current-layout ZMK keyboard repositories.
 
 The script intentionally supports only the modern ZMK layout:
@@ -245,7 +247,8 @@ Removes generated `.build` runs while keeping `.build/.gitkeep`.
 
 The hosted `Compatibility` workflow is the default release gate. Use
 `SELF_HOSTED_RUNNERS.md` only when you need Docker validation on your own
-Windows, macOS, or Linux machines.
+Windows or macOS machines. Linux self-hosted runners are disabled; hosted
+Ubuntu covers Linux Docker validation.
 
 ## Docker Image
 

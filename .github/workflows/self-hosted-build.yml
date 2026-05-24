@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Self-hosted platform to run. Use all only when every OS runner is online.
+        description: Self-hosted platform to run. Linux self-hosted is disabled; all runs macOS and Windows.
         required: true
         type: choice
-        options: [macos, windows, linux, all]
+        options: [macos, windows, all]
         default: macos
       mode:
         description: Run validate only or a full build
@@ -25,59 +25,6 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    name: Linux self-hosted ${{ inputs.mode }}
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
-    runs-on: [self-hosted, linux, zmk-docker]
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Force LF checkout
-        run: bash .github/scripts/force-lf-checkout.sh
-      - name: Check runner tools
-        run: bash .github/scripts/check-runner-tools.sh
-      - name: Check Bash syntax
-        run: |
-          bash -n ./build.sh
-          for script in .github/scripts/*.sh; do
-            bash -n "${script}"
-          done
-      - name: Check LF line endings
-        run: bash .github/scripts/check-lf.sh
-      - name: Check LF helper behavior
-        run: bash .github/scripts/test-check-lf.sh
-      - name: Check output helper behavior
-        run: bash .github/scripts/test-check-build-output.sh
-      - name: Run build script
-        run: |
-          if [ "${{ inputs.mode }}" = "validate" ]; then
-            ./build.sh validate .github/fixtures/ci-zmk-config
-          elif [ "${{ inputs.pristine }}" = "true" ]; then
-            ./build.sh .github/fixtures/ci-zmk-config --pristine
-          else
-            ./build.sh .github/fixtures/ci-zmk-config
-          fi
-      - name: Check build output
-        run: bash .github/scripts/check-build-output.sh "${{ inputs.mode }}"
-      - name: Upload build output
-        uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: zmk-self-hosted-linux-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .build/**/build.log
-            .build/**/build-summary.txt
-            .build/**/*.uf2
-            .build/**/*.hex
-            .build/**/*.bin
-          if-no-files-found: error
-          retention-days: 14
-          include-hidden-files: true
-
   macos:
     name: macOS self-hosted ${{ inputs.mode }}
     if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}

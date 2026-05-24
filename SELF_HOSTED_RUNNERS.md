@@ -1,17 +1,15 @@
 # Self-hosted Runner Setup
 
 Use this guide when you want a real-machine Docker smoke test on your own macOS
-or Windows machines. Linux self-hosted runners are optional because the hosted
-Compatibility workflow already covers Ubuntu Docker validation.
+or Windows machines. Linux self-hosted runners are disabled here because the
+hosted Compatibility workflow already covers Ubuntu Docker validation.
 
 ## Why Self-hosted Runners
 
 GitHub hosted CI is the release gate for regular compatibility checks, Ubuntu
 Docker validation, CI fixture builds, target-shape parsing, and module override
 coverage. A self-hosted runner is useful when you need proof that Docker Desktop
-or Docker Engine works on the actual macOS or Windows machine you care about.
-Linux self-hosted runs are useful only when you need proof for a specific Linux
-host.
+works on the actual macOS or Windows machine you care about.
 
 The self-hosted workflow intentionally runs only the standard CI fixture. Treat
 it as real-machine Docker smoke coverage, not as a replacement for the hosted
@@ -27,7 +25,6 @@ one custom label:
 
 | Host | Required labels |
 |---|---|
-| Linux | `self-hosted`, `linux`, `zmk-docker` |
 | macOS | `self-hosted`, `macOS`, `zmk-docker` |
 | Windows | `self-hosted`, `windows`, `zmk-docker` |
 
@@ -124,30 +121,6 @@ bash .github/scripts/check-build-output.sh validate
 If you run the Actions runner as a Windows service, make sure that service user
 can access Docker Desktop without an interactive approval prompt.
 
-## Linux Runner
-
-Install Docker Engine or Docker Desktop and make sure the runner user can access
-Docker.
-
-Local preflight:
-
-```bash
-bash --version
-tar --help | grep -- --exclude
-docker version
-docker info
-bash -n ./build.sh
-for script in .github/scripts/*.sh; do bash -n "${script}"; done
-bash .github/scripts/check-lf.sh
-bash .github/scripts/test-check-lf.sh
-bash .github/scripts/test-check-build-output.sh
-./build.sh validate .github/fixtures/ci-zmk-config
-bash .github/scripts/check-build-output.sh validate
-```
-
-If you add the runner user to the `docker` group, restart the runner session or
-service before trying the workflow.
-
 ## Run the Workflow
 
 Open `Actions` -> `Self-hosted Build` -> `Run workflow`.
@@ -167,9 +140,9 @@ mode: build
 ```
 
 The workflow default is `platform: macos` because self-hosted coverage is mainly
-for macOS and Windows. Choose `windows` explicitly for a Windows runner and
-`linux` only when you need to smoke-test a specific Linux host. After each OS
-succeeds individually, and only when all selected runner types are online, run:
+for macOS and Windows. Choose `windows` explicitly for a Windows runner. Linux
+self-hosted is disabled in this workflow. After macOS and Windows succeed
+individually, and only when both runner types are online, run:
 
 ```text
 platform: all

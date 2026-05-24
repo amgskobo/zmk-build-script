@@ -1,5 +1,7 @@
 # ZMK Build Script
 
+[English README](README.md)
+
 現在の ZMK keyboard repository layout だけを扱う、小さい Docker + Bash build helper です。
 
 対応する layout はこれだけです。
@@ -215,8 +217,9 @@ build:
 
 ## self-hosted runner
 
-通常の release gate は hosted `Compatibility` workflow です。自分の Windows、macOS、
-Linux 実機で Docker validation を確認したい場合だけ `SELF_HOSTED_RUNNERS.ja.md` を使います。
+通常の release gate は hosted `Compatibility` workflow です。自分の Windows / macOS
+実機で Docker validation を確認したい場合だけ `SELF_HOSTED_RUNNERS.ja.md` を使います。
+Linux self-hosted runner は無効です。Linux Docker validation は hosted Ubuntu で確認します。
 
 ## Docker image
 

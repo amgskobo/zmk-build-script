@@ -75,6 +75,9 @@ if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
     FIRMWARE_EXTENSIONS=(uf2 "${ZMK_FALLBACK_BINARY}" hex bin)
     FIELD_SEP=$'\037'
     EXTRA_MODULE_PATHS=()
+    WEST_UPDATE_FAILED=0
+    WEST_UPDATE_FAILED_PROJECTS=""
+    WEST_UPDATE_MISSING_PROJECTS=""
 
     ensure_zmk_layout() {
         [ -f "${SOURCE_DIR}/${CONFIG_DIR}/west.yml" ] ||
@@ -254,14 +257,65 @@ PY
         shopt -u nullglob dotglob
     }
 
-    workspace_projects_missing() {
+    missing_workspace_projects() {
         local name path
         cd "${WORK_DIR}"
         while IFS=$'\t' read -r name path; do
             [ "${name}" = "manifest" ] && continue
-            [ -d "${WORK_DIR}/${path}" ] && [ -n "$(ls -A "${WORK_DIR}/${path}" 2>/dev/null)" ] || return 0
+            if [ ! -d "${WORK_DIR}/${path}" ] || [ -z "$(ls -A "${WORK_DIR}/${path}" 2>/dev/null)" ]; then
+                printf '%s\t%s\n' "${name}" "${path}"
+            fi
         done < <(west list -f $'{name}\t{path}')
-        return 1
+    }
+
+    workspace_projects_missing() {
+        [ -n "$(missing_workspace_projects)" ]
+    }
+
+    west_update_failed_projects() {
+        local log_path="$1"
+        sed -nE \
+            -e 's/^ERROR: update failed for projects?:[[:space:]]*//p' \
+            -e 's/^ERROR: update failed for project[[:space:]]+//p' \
+            "${log_path}" |
+            tr ',' '\n' |
+            awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if ($0 != "") print}'
+    }
+
+    verify_west_update_result() {
+        [ "${WEST_UPDATE_FAILED:-0}" = "1" ] || return 0
+
+        local missing_after missing_list="" name path failed_projects unresolved="" supplied=""
+        missing_after="$(missing_workspace_projects || true)"
+        if [ -n "${missing_after}" ]; then
+            while IFS=$'\t' read -r name path; do
+                [ -n "${name}" ] || continue
+                missing_list="${missing_list}${missing_list:+, }${name} (${path})"
+            done <<< "${missing_after}"
+            fail "west update failed and workspace still has missing project(s): ${missing_list}"
+        fi
+
+        failed_projects="${WEST_UPDATE_FAILED_PROJECTS}"
+        if [ -z "${failed_projects}" ] && [ -n "${WEST_UPDATE_MISSING_PROJECTS}" ]; then
+            failed_projects="$(printf '%s\n' "${WEST_UPDATE_MISSING_PROJECTS}" | awk -F '\t' '{print $1}')"
+        fi
+        [ -n "${failed_projects}" ] ||
+            fail "west update failed; refusing to continue with potentially stale dependencies"
+
+        while IFS= read -r name; do
+            [ -n "${name}" ] || continue
+            if local_overlay_recorded_for "${name}"; then
+                supplied="${supplied}${supplied:+, }${name}"
+            else
+                unresolved="${unresolved}${unresolved:+, }${name}"
+            fi
+        done <<< "${failed_projects}"
+
+        [ -z "${unresolved}" ] ||
+            fail "west update failed for project(s) without local override: ${unresolved}"
+
+        log "Continuing after west update failure because failed project(s) were supplied locally: ${supplied}"
+        stamp_manifest
     }
 
     clear_local_overlay_projects() {
@@ -318,6 +372,15 @@ PY
         printf '%s\t%s\n' "${name}" "${project_path}" >> "${LOCAL_OVERLAY_STAMP}"
     }
 
+    local_overlay_recorded_for() {
+        local wanted="$1" name project_path
+        [ -f "${LOCAL_OVERLAY_STAMP}" ] || return 1
+        while IFS=$'\t' read -r name project_path; do
+            [ "${name}" = "${wanted}" ] && return 0
+        done < "${LOCAL_OVERLAY_STAMP}"
+        return 1
+    }
+
     ensure_west_workspace() {
         sync_config_to_workspace
         cd "${WORK_DIR}"
@@ -340,11 +403,21 @@ PY
         fi
 
         if [ "${need_full_update}" = "1" ]; then
+            local west_update_log
             log "Updating west dependencies"
-            west update --fetch-opt=--filter=tree:0 ||
-                log "west update failed for at least one project; local modules may still provide overrides"
+            WEST_UPDATE_FAILED=0
+            WEST_UPDATE_FAILED_PROJECTS=""
+            WEST_UPDATE_MISSING_PROJECTS=""
+            west_update_log="$(mktemp)"
+            if ! west update --fetch-opt=--filter=tree:0 2>&1 | tee "${west_update_log}"; then
+                WEST_UPDATE_FAILED=1
+                WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
+                WEST_UPDATE_MISSING_PROJECTS="$(missing_workspace_projects || true)"
+                log "west update failed; checking local module overrides before continuing"
+            fi
+            rm -f "${west_update_log}"
             west zephyr-export || true
-            stamp_manifest
+            [ "${WEST_UPDATE_FAILED}" = "1" ] || stamp_manifest
         fi
     }
 
@@ -763,6 +836,7 @@ PY
         ensure_west_workspace
         sync_local_modules
         cd "${WORK_DIR}"
+        verify_west_update_result
         west zephyr-export || true
 
         built=0
@@ -953,15 +1027,22 @@ detect_zmk_revision() {
     [ -f "${manifest}" ] || return 1
     revision="$(
         awk '
-            /^[[:space:]]*-[[:space:]]*name:[[:space:]]*zmk([[:space:]]*(#.*)?)?$/ {
-                in_zmk = 1
+            function clean_scalar(value) {
+                sub(/[[:space:]]*#.*/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
+                    value = substr(value, 2, length(value) - 2)
+                }
+                return value
+            }
+            /^[[:space:]]*-[[:space:]]*name[[:space:]]*:/ {
+                name = $0
+                sub(/^[[:space:]]*-[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", name)
+                in_zmk = (clean_scalar(name) == "zmk")
                 next
             }
-            in_zmk && /^[[:space:]]*-[[:space:]]*name:/ {
-                in_zmk = 0
-            }
-            in_zmk && /^[[:space:]]*revision:[[:space:]]*/ {
-                sub(/^[[:space:]]*revision:[[:space:]]*/, "", $0)
+            in_zmk && /^[[:space:]]*revision[[:space:]]*:/ {
+                sub(/^[[:space:]]*revision[[:space:]]*:[[:space:]]*/, "", $0)
                 print
                 exit
             }
