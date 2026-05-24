@@ -1106,13 +1106,17 @@ build_tar_excludes() {
         --exclude './node_modules'
         --exclude './out'
         --exclude './tmp'
-        --exclude './zmk'
         --exclude './zmk_search'
-        --exclude './modules'
-        --exclude './tools'
-        --exclude './bootloader'
-        --exclude './optional'
     )
+    if [ -d "${TARGET_DIR}/.west" ]; then
+        SOURCE_TAR_EXCLUDES+=(
+            --exclude './zmk'
+            --exclude './modules'
+            --exclude './tools'
+            --exclude './bootloader'
+            --exclude './optional'
+        )
+    fi
 }
 
 copy_target_to_container() {
