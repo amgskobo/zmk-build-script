@@ -144,7 +144,7 @@ jobs:
     timeout-minutes: 180
     defaults:
       run:
-        shell: '"C:\Program Files\Git\bin\bash.exe" --noprofile --norc -e -o pipefail {0}'
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

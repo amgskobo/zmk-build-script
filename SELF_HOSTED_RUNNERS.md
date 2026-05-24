@@ -102,7 +102,8 @@ service.
 
 Install Git for Windows and Docker Desktop. The workflow uses `shell: bash`, so
 Git Bash must be installed at the default `C:\Program Files\Git\bin\bash.exe`
-path used by the workflow.
+path. The workflow calls it through the equivalent short path to avoid the WSL
+`bash.exe` shim.
 
 Local preflight from Git Bash:
 
