@@ -10,7 +10,7 @@
 - 既存の user changes を revert しない
 - 最新 ZMK layout 以外の互換層を増やさない
 - build output は target ごとに firmware 1 個だけにする
-- `build.log` と `build-summary.txt` は必要。失敗時は summary に error excerpt を残す
+- `build.log` と `build-summary.txt` は必要。run directory 名は `run-YYYY-MM-DD_HH-MM-SS-pid-PID` にする。失敗時は summary に error excerpt を残す
 - local module override は必要。`-m` と `local_modules/` は維持する
 
 ## 対応 layout
@@ -104,17 +104,27 @@ studio 有効 target を 1 つ full build します。
 
 ```powershell
 & 'C:\Program Files\Git\bin\bash.exe' -n ./build.sh
+& 'C:\Program Files\Git\bin\bash.exe' -lc 'for script in .github/scripts/*.sh; do bash -n "$script"; done'
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/test-check-lf.sh
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/test-check-build-output.sh
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-lf.sh
 git -c core.autocrlf=false diff --check
 ```
 
-LF 全確認も行います。build path を触った場合は、少なくとも次を実行します。
+build / validate path を触った場合は、少なくとも次を実行し、各 run の直後に
+`check-build-output.sh` で `build.log` / `build-summary.txt` / mode / artifact count を確認します。
 
 ```powershell
 & 'C:\Program Files\Git\bin\bash.exe' ./build.sh validate .github/fixtures/ci-zmk-config
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-build-output.sh validate
 & 'C:\Program Files\Git\bin\bash.exe' ./build.sh validate .github/fixtures/ci-zmk-config --settings-reset
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-build-output.sh validate
 & 'C:\Program Files\Git\bin\bash.exe' ./build.sh validate .github/fixtures/target-shapes-zmk-config --settings-reset
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-build-output.sh validate
 & 'C:\Program Files\Git\bin\bash.exe' ./build.sh .github/fixtures/module-override-zmk-config --pristine
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-build-output.sh build
 & 'C:\Program Files\Git\bin\bash.exe' ./build.sh .github/fixtures/ci-zmk-config --pristine
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-build-output.sh build
 ```
 
 ## legacy root module

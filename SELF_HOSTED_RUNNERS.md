@@ -69,8 +69,12 @@ tar --help | grep -- --exclude
 docker version
 docker info
 bash -n ./build.sh
-if git grep -I -n $'\r' -- .; then exit 1; fi
+for script in .github/scripts/*.sh; do bash -n "${script}"; done
+bash .github/scripts/check-lf.sh
+bash .github/scripts/test-check-lf.sh
+bash .github/scripts/test-check-build-output.sh
 ./build.sh validate .github/fixtures/ci-zmk-config
+bash .github/scripts/check-build-output.sh validate
 ```
 
 For the first GitHub run, use:
@@ -107,8 +111,12 @@ tar --help | grep -- --exclude
 docker version
 docker info
 bash -n ./build.sh
-if git grep -I -n $'\r' -- .; then exit 1; fi
+for script in .github/scripts/*.sh; do bash -n "${script}"; done
+bash .github/scripts/check-lf.sh
+bash .github/scripts/test-check-lf.sh
+bash .github/scripts/test-check-build-output.sh
 ./build.sh validate .github/fixtures/ci-zmk-config
+bash .github/scripts/check-build-output.sh validate
 ```
 
 If you run the Actions runner as a Windows service, make sure that service user
@@ -127,8 +135,12 @@ tar --help | grep -- --exclude
 docker version
 docker info
 bash -n ./build.sh
-if git grep -I -n $'\r' -- .; then exit 1; fi
+for script in .github/scripts/*.sh; do bash -n "${script}"; done
+bash .github/scripts/check-lf.sh
+bash .github/scripts/test-check-lf.sh
+bash .github/scripts/test-check-build-output.sh
 ./build.sh validate .github/fixtures/ci-zmk-config
+bash .github/scripts/check-build-output.sh validate
 ```
 
 If you add the runner user to the `docker` group, restart the runner session or
@@ -165,8 +177,13 @@ mode: build
 The workflow always uses `.github/fixtures/ci-zmk-config`, so no config path or
 fixture name is required.
 
-The workflow uploads `.build/**/build-summary.txt`, `build.log`, and generated
-firmware files.
+The workflow checks the most recent valid `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID`
+directory, verifies that `build-summary.txt` reports `Status: SUCCESS` and
+matches the requested mode, then uploads `.build/**/build-summary.txt`,
+`build.log`, and generated firmware files. Build mode also fails if no firmware
+file is produced or if the firmware count is lower than the built target count.
+A `build-summary.txt` outside the run directory naming contract is treated as an
+invalid stale output and fails the check.
 
 ## Troubleshooting
 

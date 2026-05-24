@@ -1075,9 +1075,18 @@ failure_excerpt() {
     fi
 }
 
+built_target_count() {
+    if [ -f "${LOG_FILE}" ]; then
+        sed -E $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g' "${LOG_FILE}" |
+            sed -n 's/^Build complete: \([0-9][0-9]*\) target(s)\.$/\1/p' |
+            tail -n 1
+    fi
+}
+
 write_summary() {
-    local status="$1" reason="${2:-}" elapsed
+    local status="$1" reason="${2:-}" elapsed built_targets
     elapsed="$(( $(date +%s) - RUN_STARTED_AT ))"
+    built_targets="$(built_target_count)"
 
     {
         echo "ZMK Build Summary"
@@ -1089,6 +1098,9 @@ write_summary() {
         echo "Target: ${TARGET_DIR}"
         echo "Docker image: ${zmk_build_image}"
         echo "Elapsed: ${elapsed}s"
+        if [ -n "${built_targets}" ]; then
+            echo "Built targets: ${built_targets}"
+        fi
         echo "Pristine: ${PRISTINE}"
         echo "Extra snippets: ${HOST_SNIPPETS:-<none>}"
         if [ ${#MODULES[@]} -gt 0 ]; then

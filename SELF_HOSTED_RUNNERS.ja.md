@@ -64,8 +64,12 @@ tar --help | grep -- --exclude
 docker version
 docker info
 bash -n ./build.sh
-if git grep -I -n $'\r' -- .; then exit 1; fi
+for script in .github/scripts/*.sh; do bash -n "${script}"; done
+bash .github/scripts/check-lf.sh
+bash .github/scripts/test-check-lf.sh
+bash .github/scripts/test-check-build-output.sh
 ./build.sh validate .github/fixtures/ci-zmk-config
+bash .github/scripts/check-build-output.sh validate
 ```
 
 最初の GitHub 実行はこれがおすすめです。
@@ -101,8 +105,12 @@ tar --help | grep -- --exclude
 docker version
 docker info
 bash -n ./build.sh
-if git grep -I -n $'\r' -- .; then exit 1; fi
+for script in .github/scripts/*.sh; do bash -n "${script}"; done
+bash .github/scripts/check-lf.sh
+bash .github/scripts/test-check-lf.sh
+bash .github/scripts/test-check-build-output.sh
 ./build.sh validate .github/fixtures/ci-zmk-config
+bash .github/scripts/check-build-output.sh validate
 ```
 
 Actions runner を Windows service として動かす場合は、その service user が対話承認なしで
@@ -120,8 +128,12 @@ tar --help | grep -- --exclude
 docker version
 docker info
 bash -n ./build.sh
-if git grep -I -n $'\r' -- .; then exit 1; fi
+for script in .github/scripts/*.sh; do bash -n "${script}"; done
+bash .github/scripts/check-lf.sh
+bash .github/scripts/test-check-lf.sh
+bash .github/scripts/test-check-build-output.sh
 ./build.sh validate .github/fixtures/ci-zmk-config
+bash .github/scripts/check-build-output.sh validate
 ```
 
 runner user を `docker` group に追加した場合は、workflow を試す前に runner session または service を再起動してください。
@@ -157,7 +169,11 @@ mode: build
 workflow は常に `.github/fixtures/ci-zmk-config` を使います。
 config directory path や fixture 名の入力は不要です。
 
-workflow は `.build/**/build-summary.txt`、`build.log`、生成された firmware file を upload します。
+workflow は直近の有効な `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID` directory を確認します。
+`.build/**/build-summary.txt` が `Status: SUCCESS` で requested mode と一致することを確認し、
+`.build/**/build-summary.txt`、`build.log`、生成された firmware file を upload します。
+build mode では firmware file が 0 件、または built target count より少ない場合も失敗します。
+run directory 命名規則外の `build-summary.txt` は stale な invalid output として失敗します。
 
 ## トラブルシューティング
 

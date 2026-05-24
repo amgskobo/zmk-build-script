@@ -144,13 +144,17 @@ Each build target copies back one firmware file only. Preference order is
 Artifacts are saved under:
 
 ```text
-.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
-+-- example_corne_left.uf2
-+-- build.log
-+-- build-summary.txt
+.build/
++-- run-YYYY-MM-DD_HH-MM-SS-pid-PID/
+    +-- example_corne_left.uf2
+    +-- build.log
+    +-- build-summary.txt
 ```
 
 Example: `.build/run-2026-05-21_20-50-31-pid-1234/`.
+Run directory names are part of the output contract and must follow
+`run-YYYY-MM-DD_HH-MM-SS-pid-PID`; output checks sort valid run directories by
+that name and fail if a `build-summary.txt` appears outside this convention.
 
 ## Validate
 

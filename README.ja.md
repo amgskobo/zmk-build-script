@@ -127,13 +127,17 @@ host 側へコピーする firmware は target ごとに 1 個だけです。優
 成果物はここに保存します。
 
 ```text
-.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
-+-- example_corne_left.uf2
-+-- build.log
-+-- build-summary.txt
+.build/
++-- run-YYYY-MM-DD_HH-MM-SS-pid-PID/
+    +-- example_corne_left.uf2
+    +-- build.log
+    +-- build-summary.txt
 ```
 
 例: `.build/run-2026-05-21_20-50-31-pid-1234/`
+run directory 名は output contract の一部で、`run-YYYY-MM-DD_HH-MM-SS-pid-PID` に従います。
+output check はこの命名規則に合う run directory を sort し、
+規則外の場所に `build-summary.txt` がある場合は失敗します。
 
 ## validate
 

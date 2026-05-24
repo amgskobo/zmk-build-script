@@ -26,10 +26,20 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Check Bash syntax
-        run: bash -n ./build.sh
+        run: |
+          bash -n ./build.sh
+          for script in .github/scripts/*.sh; do
+            bash -n "${script}"
+          done
 
       - name: Check LF line endings
         run: bash .github/scripts/check-lf.sh
+
+      - name: Check LF helper behavior
+        run: bash .github/scripts/test-check-lf.sh
+
+      - name: Check output helper behavior
+        run: bash .github/scripts/test-check-build-output.sh
 
       - name: Check host-side help
         run: ./build.sh --help
@@ -86,8 +96,14 @@ jobs:
       - name: Validate CI fixture
         run: ./build.sh validate .github/fixtures/ci-zmk-config
 
+      - name: Check CI fixture validate output
+        run: bash .github/scripts/check-build-output.sh validate
+
       - name: Validate target-shape fixture
         run: ./build.sh validate .github/fixtures/target-shapes-zmk-config --settings-reset
+
+      - name: Check target-shape validate output
+        run: bash .github/scripts/check-build-output.sh validate
 
       - name: Validate CI fixture with local module input
         run: |
@@ -102,6 +118,9 @@ jobs:
           EOF
           printf 'name: ci-extra\n' > "${module_dir}/snippets/ci-extra/snippet.yml"
           ./build.sh validate .github/fixtures/ci-zmk-config -m "${module_dir}"
+
+      - name: Check local module validate output
+        run: bash .github/scripts/check-build-output.sh validate
 
       - name: Validate legacy root module layout
         run: |
@@ -134,8 +153,14 @@ jobs:
           ./build.sh validate "${legacy_dir}"
           test ! -f "${legacy_dir}/zephyr/module.yml"
 
+      - name: Check legacy root module validate output
+        run: bash .github/scripts/check-build-output.sh validate
+
       - name: Build CI fixture
         run: ./build.sh .github/fixtures/ci-zmk-config --pristine
+
+      - name: Check CI fixture build output
+        run: bash .github/scripts/check-build-output.sh build
 
       - name: Build with local west project override
         run: |
@@ -172,6 +197,9 @@ jobs:
           grep -q "Overlaying local west project: ${second_override_name} -> modules/lib/${second_override_name}" "${RUNNER_TEMP}/module-override-build.log"
           grep -q "Adding local extra module: zmk-feature-ci-extra" "${RUNNER_TEMP}/module-override-build.log"
 
+      - name: Check local west project override output
+        run: bash .github/scripts/check-build-output.sh build
+
       - name: Build after local west project override
         run: |
           ./build.sh .github/fixtures/module-override-zmk-config --pristine |
@@ -180,6 +208,9 @@ jobs:
             "${RUNNER_TEMP}/module-override-restore-build.log"
           grep -q "Restoring previous local overlay from backup: zmk-studio-messages -> modules/msgs/zmk-studio-messages" \
             "${RUNNER_TEMP}/module-override-restore-build.log"
+
+      - name: Check restored local west project output
+        run: bash .github/scripts/check-build-output.sh build
 
       - name: Upload firmware artifacts
         if: always()
