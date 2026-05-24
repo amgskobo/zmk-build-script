@@ -40,7 +40,7 @@ jobs:
         run: |
           git config core.autocrlf false
           git config core.eol lf
-          git checkout-index -f -a
+          git reset --hard HEAD
       - name: Check runner tools
         run: bash .github/scripts/check-runner-tools.sh
       - name: Check Bash syntax
@@ -96,7 +96,7 @@ jobs:
         run: |
           git config core.autocrlf false
           git config core.eol lf
-          git checkout-index -f -a
+          git reset --hard HEAD
       - name: Check runner tools
         run: bash .github/scripts/check-runner-tools.sh
       - name: Check Bash syntax
@@ -152,7 +152,7 @@ jobs:
         run: |
           git config core.autocrlf false
           git config core.eol lf
-          git checkout-index -f -a
+          git reset --hard HEAD
       - name: Check runner tools
         run: bash .github/scripts/check-runner-tools.sh
       - name: Check Bash syntax
