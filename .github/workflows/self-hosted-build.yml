@@ -83,7 +83,7 @@ jobs:
   windows:
     name: Windows self-hosted ${{ inputs.mode }}
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
-    runs-on: [self-hosted, windows, zmk-docker]
+    runs-on: [self-hosted, Windows, zmk-docker]
     timeout-minutes: 180
     defaults:
       run:
