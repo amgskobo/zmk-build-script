@@ -1092,6 +1092,7 @@ cleanup_container() {
 trap cleanup_container EXIT
 
 build_tar_excludes() {
+    local source_dir="${1:-${TARGET_DIR}}"
     SOURCE_TAR_EXCLUDES=(
         --exclude .git
         --exclude .west
@@ -1108,7 +1109,7 @@ build_tar_excludes() {
         --exclude './tmp'
         --exclude './zmk_search'
     )
-    if [ -d "${TARGET_DIR}/.west" ]; then
+    if [ -d "${source_dir}/.west" ]; then
         SOURCE_TAR_EXCLUDES+=(
             --exclude './zmk'
             --exclude './modules'
@@ -1121,7 +1122,7 @@ build_tar_excludes() {
 
 copy_target_to_container() {
     docker exec "${container_name}" mkdir -p /root/zmk-config
-    build_tar_excludes
+    build_tar_excludes "${TARGET_DIR}"
     (cd "${TARGET_DIR}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
         docker exec -i "${container_name}" tar --no-same-owner -xf - -C /root/zmk-config
 
@@ -1130,8 +1131,14 @@ copy_target_to_container() {
 
     if [ -d "${SCRIPT_DIR}/local_modules" ]; then
         msg "Copying local_modules/"
-        (cd "${SCRIPT_DIR}/local_modules" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
-            docker exec -i "${container_name}" /bin/bash -c 'mkdir -p /root/local_modules && tar --no-same-owner -xf - -C /root/local_modules'
+        local local_mod local_name
+        for local_mod in "${SCRIPT_DIR}/local_modules"/*; do
+            [ -d "${local_mod}" ] || continue
+            local_name="$(basename "${local_mod}")"
+            build_tar_excludes "${local_mod}"
+            (cd "${local_mod}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
+                docker exec -i "${container_name}" /bin/bash -c 'mkdir -p "/root/local_modules/$1" && tar --no-same-owner -xf - -C "/root/local_modules/$1"' _ "${local_name}"
+        done
     fi
 
     local mod name
@@ -1139,6 +1146,7 @@ copy_target_to_container() {
     for mod in "${MODULES[@]}"; do
         name="$(basename "${mod}")"
         msg "Copying module: ${name}"
+        build_tar_excludes "${mod}"
         (cd "${mod}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
             docker exec -i "${container_name}" /bin/bash -c 'mkdir -p "/root/external_modules/$1" && tar --no-same-owner -xf - -C "/root/external_modules/$1"' _ "${name}"
     done

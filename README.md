@@ -231,6 +231,9 @@ west project name, that project is overlaid after `west update`. Otherwise it is
 passed to ZMK through `ZMK_EXTRA_MODULES`. Modules in this tool's
 `local_modules/` directory are loaded the same way.
 
+Generated west project directories are filtered per copy source, so cached
+dependencies are skipped without dropping intentional module content.
+
 If a previous local overlay left files in the persistent west workspace, the
 matching project directory is cleared before `west update` so the next checkout
 does not conflict with stale local files.

@@ -97,6 +97,8 @@ studio 有効 target を 1 つ full build します。
 
 - `-m <dir>` は host から Docker 内へ copy する
 - `local_modules/<name>` も自動で Docker 内へ copy する
+- copy 元が `.west` を持つ場合だけ、その copy 元の generated west project directory を除外する
+- `.west` を持たない module では `zmk`、`modules`、`tools`、`bootloader`、`optional` などの名前も保持する
 - directory name が west project name と一致する場合は、その project path を local 版で overlay する
 - 一致しない場合は local extra module として `ZMK_EXTRA_MODULES` に追加する
 
@@ -107,6 +109,7 @@ studio 有効 target を 1 つ full build します。
 & 'C:\Program Files\Git\bin\bash.exe' -lc 'for script in .github/scripts/*.sh; do bash -n "$script"; done'
 & 'C:\Program Files\Git\bin\bash.exe' .github/scripts/test-check-lf.sh
 & 'C:\Program Files\Git\bin\bash.exe' .github/scripts/test-check-build-output.sh
+& 'C:\Program Files\Git\bin\bash.exe' .github/scripts/test-copy-excludes.sh
 & 'C:\Program Files\Git\bin\bash.exe' .github/scripts/check-lf.sh
 git -c core.autocrlf=false diff --check
 ```

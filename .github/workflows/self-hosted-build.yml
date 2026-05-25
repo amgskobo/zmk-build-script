@@ -52,6 +52,8 @@ jobs:
         run: bash .github/scripts/test-check-lf.sh
       - name: Check output helper behavior
         run: bash .github/scripts/test-check-build-output.sh
+      - name: Test copy excludes
+        run: bash .github/scripts/test-copy-excludes.sh
       - name: Run build script
         run: |
           if [ "${{ inputs.mode }}" = "validate" ]; then
@@ -105,6 +107,8 @@ jobs:
         run: bash .github/scripts/test-check-lf.sh
       - name: Check output helper behavior
         run: bash .github/scripts/test-check-build-output.sh
+      - name: Test copy excludes
+        run: bash .github/scripts/test-copy-excludes.sh
       - name: Run build script
         run: |
           if [ "${{ inputs.mode }}" = "validate" ]; then

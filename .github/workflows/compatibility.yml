@@ -93,6 +93,9 @@ jobs:
       - name: Check runner tools
         run: bash .github/scripts/check-runner-tools.sh
 
+      - name: Test copy excludes
+        run: bash .github/scripts/test-copy-excludes.sh
+
       - name: Validate CI fixture
         run: ./build.sh validate .github/fixtures/ci-zmk-config
 

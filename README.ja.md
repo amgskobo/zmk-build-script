@@ -207,6 +207,8 @@ build:
 
 `-m` で渡した module は Docker 内へ copy します。directory name が west project name と一致する場合は `west update` 後にその project を local 版で上書きします。一致しない場合は `ZMK_EXTRA_MODULES` として ZMK に渡します。この tool の `local_modules/` に置いた module も同じ扱いです。
 
+generated west project directory は copy 元ごとに除外するため、cache 済み dependency を避けつつ、通常 module の意図した content は保持します。
+
 ## clean
 
 ```bash
