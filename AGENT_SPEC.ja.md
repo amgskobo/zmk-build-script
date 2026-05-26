@@ -102,6 +102,89 @@ studio 有効 target を 1 つ full build します。
 - directory name が west project name と一致する場合は、その project path を local 版で overlay する
 - 一致しない場合は local extra module として `ZMK_EXTRA_MODULES` に追加する
 
+## bug を見つけた場合
+
+bug は症状を消すだけで終わらせません。次の順で扱います。
+
+1. 失敗箇所を host shell、host -> container copy、container -> workspace sync、`west update`、local module overlay、build、artifact copy、summary、workflow scheduling に分ける
+2. 同じ pattern が macOS / Windows / hosted / self-hosted の片側だけに残っていないか検索する
+3. 実装を最小差分で直す。user が明示していない commit / push はしない
+4. 可能なら `.github/scripts/test-*.sh`、fixture、workflow check のどれかで再発防止する
+5. test で固定しすぎる場合は、固定すべき契約だけを agent file に記録する
+6. 直した内容をこの file の「対応済み bug / 注意点」に追記する
+7. 最後に LF、whitespace、helper tests、必要な Docker validate/build、必要なら remote CI を確認する
+
+追記 format:
+
+```text
+- 症状: ...
+  原因: ...
+  対応: ...
+  確認: ...
+```
+
+## 対応済み bug / 注意点
+
+- 症状: PowerShell からの `bash` が WSL に解決され、日本語を含む `G:\...` path で失敗することがある
+  原因: Windows host で `bash` の解決先が Git Bash ではなく WSL になる
+  対応: Windows の検証 command は `C:\Program Files\Git\bin\bash.exe` を明示する
+  確認: `bash -n`、helper tests、Docker validate は Git Bash executable 経由で実行する
+- 症状: local module copy で `zmk`、`modules`、`tools`、`bootloader`、`optional` が必要な content まで消える可能性がある
+  原因: generated west project directory かどうかを copy 元ごとに判定しないと、通常 module content と west workspace cache を取り違える
+  対応: copy 元が `.west` を持つ場合だけ generated west project directory を除外し、`.west` を持たない module では保持する
+  確認: `.github/scripts/test-copy-excludes.sh` で target repo、`-m` external module、`local_modules/<name>` の `.west` あり / なしを検証する
+- 症状: Windows self-hosted job が runner online / idle でも queued のまま進まない
+  原因: self-hosted runner label は大文字小文字を含めて一致が必要。`windows` と `Windows` は別 label
+  対応: Windows self-hosted workflow は `runs-on: [self-hosted, Windows, zmk-docker]`、macOS は `runs-on: [self-hosted, macOS, zmk-docker]` にする
+  確認: queued が続く場合は `gh api repos/<owner>/<repo>/actions/runners` で label / status / busy を確認し、必要なら `gh workflow run self-hosted-build.yml --ref main -f platform=all -f mode=build -f pristine=true` を watch する
+- 症状: workflow の grep / assertion が実装の正しい error text とずれて CI だけ失敗する
+  原因: script の message 変更後に workflow expectation が更新されていない
+  対応: workflow は現在の script 出力に合わせ、古い文言を前提にしない
+  確認: host-side contract checks と helper behavior tests を両方実行する
+- 症状: bug 対応後に、何を直し何を確認したかが次回 agent に残らない
+  原因: agent file に bug 対応の記録 format と完了判定がなかった
+  対応: `AGENTS.md` に bug 発見時の入口手順を追加し、この file に「bug を見つけた場合」と「対応済み bug / 注意点」を追加する
+  確認: agent file diff、LF check、helper tests、必要な Docker validate を確認する
+
+## 完成度チェック / 完了判定
+
+完了扱いにする前に、次を確認します。
+
+- scope が user の最新指示に合っているか。古い指示や広すぎる調査に引きずられない
+- 変更 file が user の依頼 scope に対して必要最小限か。scope と無関係な workflow / docs を触っていないか
+- bug を直した場合、同系統の再発確認または agent file への契約記録があるか
+- `git status --short --branch` で未追跡 file や意図しない差分が残っていないか
+- LF / whitespace / syntax / helper tests を実行したか
+- Docker が関係する変更では `check-runner-tools.sh`、該当 fixture、`check-build-output.sh` まで確認したか
+- artifact / fallback / sync を触った場合、`.uf2` 以外の `.bin` / `.hex` と artifact count の前提を壊していないか
+- workflow / self-hosted を触った場合、hosted `Compatibility` と手動 `Self-hosted Build` のどちらを確認したかを明記したか
+- commit / push は user が明示した場合だけ行い、行った場合は remote CI の結果も確認したか
+- 実行できなかった check は、理由と残リスクを報告したか
+
+確認範囲は変更範囲に合わせます。
+
+- agent docs / README だけ: `bash -n ./build.sh`、全 `.github/scripts/*.sh` syntax、`check-lf.sh`、`git diff --check` を最低限にする。記述が build / CI の実挙動に触れる場合は該当 helper test も実行する
+- helper scripts / LF / summary: helper behavior test、`check-lf.sh`、`git diff --check` を必ず実行する
+- copy / local module / sync: `check-runner-tools.sh`、`test-copy-excludes.sh`、関連 fixture validate/build、`check-build-output.sh` を実行する
+- artifact / fallback / build output: build mode の fixture と `check-build-output.sh build` で artifact count と `.uf2` / `.bin` / `.hex` fallback を確認する
+- workflow / self-hosted: local syntax と helper tests に加え、push 後に hosted `Compatibility`、必要なら手動 `Self-hosted Build` を確認する。push していない場合は remote CI 未実行と明記する
+
+完了報告 format:
+
+```text
+変更:
+- ...
+
+確認:
+- PASS ...
+- 未実行 ... 理由: ...
+
+状態:
+- commit: なし / <hash>
+- push: なし / <remote>
+- worktree: clean / dirty
+```
+
 ## 変更時の確認
 
 ```powershell
