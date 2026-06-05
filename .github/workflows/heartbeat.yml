@@ -1,0 +1,40 @@
+name: Heartbeat
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions schedules use UTC cron only; do not add a timezone key.
+    # 00:17 UTC = 09:17 JST on the first day of the month.
+    - cron: "17 0 1 * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: heartbeat-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Update heartbeat
+        run: |
+          mkdir -p .github/heartbeat
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/heartbeat/last-run.txt
+
+      - name: Commit heartbeat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/heartbeat/last-run.txt
+          if git diff --cached --quiet; then
+            echo "No heartbeat changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: heartbeat"
+          git push

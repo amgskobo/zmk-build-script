@@ -1,0 +1,239 @@
+name: Auto Build External ZMK Repos
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_file:
+        description: Source list file to resolve.
+        required: true
+        type: string
+        default: repos.txt
+      mode:
+        description: Run validate only or full firmware builds.
+        required: true
+        type: choice
+        options: [build, validate]
+        default: build
+      build_jobs:
+        description: Target-level parallelism inside each source build.
+        required: true
+        type: choice
+        options: ["1", "2", "3", "4"]
+        default: "1"
+      source_jobs:
+        description: Maximum source matrix jobs to run at once.
+        required: true
+        type: choice
+        options: ["1", "2", "3", "4", "6", "8", "12", "16"]
+        default: "4"
+      pristine:
+        description: Pass --pristine for full builds.
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    # GitHub Actions schedules use UTC cron only; do not add a timezone key.
+    # 00:13 UTC = 09:13 JST.
+    - cron: "13 0 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: zmk-external-auto-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EXTERNAL_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || 'build' }}
+  EXTERNAL_BUILD_JOBS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_jobs || '1' }}
+  EXTERNAL_SOURCE_JOBS: ${{ github.event.inputs.source_jobs || '4' }}
+  EXTERNAL_PRISTINE: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.pristine == 'true' }}
+
+jobs:
+  sources:
+    name: Resolve source list
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      source_file: ${{ steps.resolve.outputs.source_file }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve source list
+        id: resolve
+        shell: bash
+        run: |
+          SOURCE_FILE="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_file || 'repos.txt' }}"
+          if [ ! -f "${SOURCE_FILE}" ]; then
+            echo "Source list file not found: ${SOURCE_FILE}" >&2
+            exit 1
+          fi
+          list="$(bash ./scripts/auto-build-external.sh --list "${SOURCE_FILE}")"
+          if [ -z "${list}" ]; then
+            echo "Source list is empty: ${SOURCE_FILE}" >&2
+            exit 1
+          fi
+          matrix="$(bash ./scripts/auto-build-external.sh --list-json "${SOURCE_FILE}")"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+          echo "source_file=${SOURCE_FILE}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Source list"
+            echo
+            echo "Source file: \`${SOURCE_FILE}\`"
+            echo
+            echo "| slug | cache | type | source |"
+            echo "| --- | --- | --- | --- |"
+            while IFS=$'\t' read -r slug cache type source; do
+              printf '| `%s` | `%s` | %s | `%s` |\n' "${slug}" "${cache}" "${type}" "${source}"
+            done <<< "${list}"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build-runner:
+    name: ${{ matrix.source.slug }}
+    needs: sources
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(github.event.inputs.source_jobs || '4') }}
+      matrix:
+        source: ${{ fromJSON(needs.sources.outputs.matrix).include }}
+    runs-on: [self-hosted, zmk-docker, zmk-docker-active]
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Show selected runner (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          {
+            echo "## Selected runner"
+            echo
+            echo "- source: \`${{ matrix.source.slug }}\`"
+            echo "- runner.os: \`${{ runner.os }}\`"
+            echo "- runner.name: \`${{ runner.name }}\`"
+            echo "- runner.arch: \`${{ runner.arch }}\`"
+            echo
+            echo "- mode: \`${EXTERNAL_MODE}\`"
+            echo "- build_jobs: \`${EXTERNAL_BUILD_JOBS}\`"
+            echo "- source_jobs: \`${EXTERNAL_SOURCE_JOBS}\`"
+            echo "- pristine: \`${EXTERNAL_PRISTINE}\`"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Show selected runner (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: |
+          {
+            echo "## Selected runner"
+            echo
+            echo "- source: \`${{ matrix.source.slug }}\`"
+            echo "- runner.os: \`${{ runner.os }}\`"
+            echo "- runner.name: \`${{ runner.name }}\`"
+            echo "- runner.arch: \`${{ runner.arch }}\`"
+            echo
+            echo "- mode: \`${EXTERNAL_MODE}\`"
+            echo "- build_jobs: \`${EXTERNAL_BUILD_JOBS}\`"
+            echo "- source_jobs: \`${EXTERNAL_SOURCE_JOBS}\`"
+            echo "- pristine: \`${EXTERNAL_PRISTINE}\`"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Force LF checkout (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: bash .github/scripts/force-lf-checkout.sh
+
+      - name: Force LF checkout (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: bash .github/scripts/force-lf-checkout.sh
+
+      - name: Check runner tools (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: bash .github/scripts/check-runner-tools.sh
+
+      - name: Check runner tools (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: bash .github/scripts/check-runner-tools.sh
+
+      - name: Check Bash syntax (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          bash -n ./build.sh
+          for script in .github/scripts/*.sh scripts/*.sh; do
+            bash -n "${script}"
+          done
+
+      - name: Check Bash syntax (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: |
+          bash -n ./build.sh
+          for script in .github/scripts/*.sh scripts/*.sh; do
+            bash -n "${script}"
+          done
+
+      - name: Build source (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          args=(--mode "${EXTERNAL_MODE}" --jobs "${EXTERNAL_BUILD_JOBS}" --source-slug "${{ matrix.source.slug }}")
+          if [ "${EXTERNAL_MODE}" = "build" ] && [ "${EXTERNAL_PRISTINE}" = "true" ]; then
+            args+=(--pristine)
+          fi
+          if [ "${{ matrix.source.type }}" = "repo" ]; then
+            args=(--repo "${{ matrix.source.source }}" "${args[@]}")
+          else
+            args=(--path "${{ matrix.source.source }}" "${args[@]}")
+          fi
+          bash ./scripts/build-external-source.sh "${args[@]}"
+
+      - name: Build source (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        continue-on-error: true
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: |
+          args=(--mode "${EXTERNAL_MODE}" --jobs "${EXTERNAL_BUILD_JOBS}" --source-slug "${{ matrix.source.slug }}")
+          if [ "${EXTERNAL_MODE}" = "build" ] && [ "${EXTERNAL_PRISTINE}" = "true" ]; then
+            args+=(--pristine)
+          fi
+          if [ "${{ matrix.source.type }}" = "repo" ]; then
+            args=(--repo "${{ matrix.source.source }}" "${args[@]}")
+          else
+            args=(--path "${{ matrix.source.source }}" "${args[@]}")
+          fi
+          bash ./scripts/build-external-source.sh "${args[@]}"
+
+      - name: Check build output (Unix)
+        if: ${{ runner.os != 'Windows' && always() }}
+        shell: bash
+        run: bash .github/scripts/check-build-output.sh "${EXTERNAL_MODE}"
+
+      - name: Check build output (Windows)
+        if: ${{ runner.os == 'Windows' && always() }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: bash .github/scripts/check-build-output.sh "${EXTERNAL_MODE}"
+
+      - name: Upload firmware artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: zmk-external-${{ env.EXTERNAL_MODE }}-${{ matrix.source.slug }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/**/build.log
+            .build/**/build-summary.txt
+            .build/**/*.uf2
+            .build/**/*.hex
+            .build/**/*.bin
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: true

@@ -1,0 +1,8 @@
+https://github.com/urob/zmk-config.git
+https://github.com/folke/zmk-config.git
+https://github.com/kumamuk-git/zmk-config-roBa.git
+https://github.com/t-ogura/zmk-config-prospector.git
+https://github.com/kureyakey/zmk-config-zonkey.git
+https://github.com/sayu-hub/zmk-config-moNa2-v2.git
+https://github.com/4mplelab/zmk-config-LisM.git
+
