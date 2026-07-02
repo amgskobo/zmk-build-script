@@ -467,7 +467,7 @@ PY
         sync_config_to_workspace
         cd "${WORK_DIR}"
 
-        local need_full_update=0 west_update_attempt west_update_log
+        local need_full_update=0 west_update_attempt west_update_log stale_locks
         if [ ! -d .west ]; then
             log "Initializing west workspace"
             west init -l "${CONFIG_DIR}"
@@ -495,6 +495,11 @@ PY
             for west_update_attempt in $(seq 1 "${WEST_UPDATE_ATTEMPTS}"); do
                 [ "${west_update_attempt}" = "1" ] ||
                     log "Retrying west update (${west_update_attempt}/${WEST_UPDATE_ATTEMPTS})"
+                stale_locks="$(find "${WORK_DIR}" -path '*/.git/index.lock' -type f 2>/dev/null || true)"
+                if [ -n "${stale_locks}" ]; then
+                    log "Removing stale git index.lock files"
+                    find "${WORK_DIR}" -path '*/.git/index.lock' -type f -exec rm -f -- {} +
+                fi
                 if west update --fetch-opt=--filter=tree:0 2>&1 | tee -a "${west_update_log}"; then
                     WEST_UPDATE_FAILED=0
                     break
