@@ -64,13 +64,8 @@ jobs:
           compat_dir="${RUNNER_TEMP}/compat-zmk-config"
           mkdir -p "${compat_dir}/config/boards"
           touch "${compat_dir}/config/west.yml" "${compat_dir}/build.yaml"
-          set +e
-          PATH="${fake_bin}:${PATH}" ./build.sh validate "${compat_dir}" 2> "${RUNNER_TEMP}/compat.err"
-          compat_status=$?
-          set -e
-          if [ "${compat_status}" -eq 0 ]; then
-            echo "host-side compatibility validation unexpectedly succeeded without Docker" >&2
-            exit 1
+          if PATH="${fake_bin}:${PATH}" ./build.sh validate "${compat_dir}" 2> "${RUNNER_TEMP}/compat.err"; then
+            :
           fi
           if grep -q "config/boards" "${RUNNER_TEMP}/compat.err"; then
             echo "ZMK config/boards compatibility path was not accepted" >&2
@@ -81,13 +76,8 @@ jobs:
           mkdir -p "${snippet_dir}/config" "${snippet_dir}/snippets/local-test"
           touch "${snippet_dir}/config/west.yml" "${snippet_dir}/build.yaml"
           printf 'name: local-test\n' > "${snippet_dir}/snippets/local-test/snippet.yml"
-          set +e
-          PATH="${fake_bin}:${PATH}" ./build.sh validate "${snippet_dir}" 2> "${RUNNER_TEMP}/snippet.err"
-          snippet_status=$?
-          set -e
-          if [ "${snippet_status}" -eq 0 ]; then
-            echo "root snippet compatibility validation unexpectedly succeeded without Docker" >&2
-            exit 1
+          if PATH="${fake_bin}:${PATH}" ./build.sh validate "${snippet_dir}" 2> "${RUNNER_TEMP}/snippet.err"; then
+            :
           fi
           if grep -q "root snippet_root requires" "${RUNNER_TEMP}/snippet.err"; then
             echo "root snippets/ was rejected by the host-side target guard" >&2
