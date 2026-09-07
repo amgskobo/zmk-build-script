@@ -44,6 +44,8 @@ https://github.com/caksoylar/zmk-config.git
 
 https://github.com/urob/zmk-config.git
 git@github.com:GEIGEIGEIST/zmk-config-totem.git
+git://github.com/example/zmk-config.git
+file:///tmp/zmk-config.git
 path:local-one
 local-two
 https://github.com/caksoylar/zmk-config.git
@@ -58,6 +60,10 @@ assert_contains "${list}" $'urob-zmk-config\tzmk-cache-external-urob-zmk-config\
   "list did not include urob slug"
 assert_contains "${list}" $'geigeigeist-zmk-config-totem\tzmk-cache-external-geigeigeist-zmk-config-totem\trepo\tgit@github.com:GEIGEIGEIST/zmk-config-totem.git' \
   "list did not include ssh slug"
+assert_contains "${list}" $'example-zmk-config\tzmk-cache-external-example-zmk-config\trepo\tgit://github.com/example/zmk-config.git' \
+  "list did not include git protocol slug"
+assert_contains "${list}" $'tmp-zmk-config\tzmk-cache-external-tmp-zmk-config\trepo\tfile:///tmp/zmk-config.git' \
+  "list did not include file protocol slug"
 assert_contains "${list}" $'local-one\tzmk-cache-external-local-one\tpath\t'"${local_one}" \
   "list did not include prefixed local path"
 assert_contains "${list}" $'local-two\tzmk-cache-external-local-two\tpath\t'"${local_two}" \
@@ -76,6 +82,20 @@ assert_contains "${path_list}" $'custom-local\tzmk-cache-external-custom-local\t
   "explicit path slug was not honored"
 assert_contains "${path_list}" $'local-two\tzmk-cache-external-local-two\tpath\t'"${local_two}" \
   "second explicit path was not listed"
+
+path_cases_file="${tmp_dir}/path-cases.txt"
+cat > "${path_cases_file}" <<'EOF'
+path://server/share
+path:\\server\share
+path:C:relative
+EOF
+path_cases="$(bash "${builder}" --list "${path_cases_file}")"
+assert_contains "${path_cases}" $'share\tzmk-cache-external-share\tpath\t//server/share' \
+  "UNC slash path was not treated as absolute"
+assert_contains "${path_cases}" $'share-2\tzmk-cache-external-share-2\tpath\t\\\\server\\share' \
+  "UNC backslash path was not treated as absolute"
+assert_contains "${path_cases}" $'c-relative\tzmk-cache-external-c-relative\tpath\t'"${tmp_dir}/C:relative" \
+  "drive-relative path was not resolved from the source file"
 
 empty_file="${tmp_dir}/empty.txt"
 printf '# no sources\n\n' > "${empty_file}"

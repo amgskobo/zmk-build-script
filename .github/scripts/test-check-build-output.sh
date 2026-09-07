@@ -75,6 +75,18 @@ EOF
 run_fail validate "does not report success"
 
 reset_case
+write_summary <<'EOF'
+ZMK Build Summary
+=================
+
+Status: FAILED
+Mode: build
+Built targets: 1
+EOF
+touch "${run_path}/partial.uf2"
+run_fail build "does not report success"
+
+reset_case
 rm -f "${run_path}/build.log"
 write_summary <<'EOF'
 ZMK Build Summary
@@ -177,6 +189,6 @@ Mode: build
 Built targets: 2
 EOF
 touch "${run_path}/only.uf2"
-run_ok build
+run_fail build "lower than built target count"
 
 echo "check-build-output.sh behavior tests passed."

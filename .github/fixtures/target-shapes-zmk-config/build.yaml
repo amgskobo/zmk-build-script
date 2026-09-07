@@ -30,5 +30,11 @@ include:
     artifact-name: skipped-target
     skip: true
 
+  - board: nice_nano/nrf52840/zmk
+    shield: corne_left
+    snippet: excluded-by-snippet
+    artifact-name: snippet-excluded-{snippet}
+
 exclude:
   - artifact-name: matrix-nice_nano_nrf52840_zmk-corne_right
+  - artifact-name: snippet-excluded-excluded-by-snippet

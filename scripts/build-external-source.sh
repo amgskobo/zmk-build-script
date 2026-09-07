@@ -51,7 +51,7 @@ validate_positive_int() {
 
 is_repo_url() {
     case "$1" in
-        http://*|https://*|ssh://*|git@*:*)
+        http://*|https://*|ssh://*|git://*|file://*|git@*:*)
             return 0
             ;;
     esac
@@ -60,7 +60,7 @@ is_repo_url() {
 
 is_absolute_path() {
     case "$1" in
-        /*|[A-Za-z]:*)
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*|\\\\*)
             return 0
             ;;
     esac
@@ -172,6 +172,11 @@ docker_no_pathconv() {
     MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker "$@"
 }
 
+require_docker() {
+    command -v docker >/dev/null 2>&1 || { echo "ERROR: Missing required command: docker" >&2; exit 1; }
+    docker_no_pathconv info >/dev/null 2>&1 || { echo "ERROR: Docker daemon is not available." >&2; exit 1; }
+}
+
 host_is_windows() {
     local os
     os="$(uname -s 2>/dev/null || true)"
@@ -257,7 +262,23 @@ clone_repo_with_docker() {
                 git clone --depth=1 "$1" /tmp/source || exit "$?"
                 [ "$2" = "1" ] || exit 0
                 pruned_file="$(mktemp)"
-                find /tmp/source -depth \( -name "*[[:space:]]" -o -name "*." \) -print > "${pruned_file}"
+                find /tmp/source -depth -print | while IFS= read -r path; do
+                    [ "${path}" != /tmp/source ] || continue
+                    base="${path##*/}"
+                    bad=0
+                    case "${base}" in
+                        *[[:space:]]|*.) bad=1 ;;
+                    esac
+                    if printf '%s\n' "${base}" | grep -Eq "[<>:\"\\\\|?*]"; then
+                        bad=1
+                    fi
+                    stem="${base%%.*}"
+                    upper="$(printf '%s' "${stem}" | tr '[:lower:]' '[:upper:]')"
+                    case "${upper}" in
+                        CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) bad=1 ;;
+                    esac
+                    [ "${bad}" = "1" ] && printf '%s\n' "${path}"
+                done > "${pruned_file}"
                 if [ -s "${pruned_file}" ]; then
                     echo "[source:$3] Removed Windows-incompatible clone path(s) before docker cp:" >&2
                     while IFS= read -r path; do
@@ -317,7 +338,10 @@ build_single_source() {
     echo "[source:${SOURCE_SLUG}] Type: ${SOURCE_TYPE}"
     echo "[source:${SOURCE_SLUG}] Source: ${SOURCE_VALUE}"
     echo "[source:${SOURCE_SLUG}] Docker cache volume: ${cache_volume}"
-    [ "${ZMK_EXTERNAL_PRISTINE}" != "1" ] || docker volume rm "${cache_volume}" 2>/dev/null || true
+    if [ "${SOURCE_TYPE}" = "repo" ] || [ "${ZMK_EXTERNAL_PRISTINE}" = "1" ]; then
+        require_docker
+    fi
+    [ "${ZMK_EXTERNAL_PRISTINE}" != "1" ] || docker_no_pathconv volume rm "${cache_volume}" 2>/dev/null || true
 
     if [ "${SOURCE_TYPE}" = "repo" ]; then
         clone_dir="${WORK_DIR}/${SOURCE_SLUG}"

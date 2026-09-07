@@ -29,12 +29,12 @@ root の `boards/` または外部 module を使ってください。root の `d
 
 - cross-platform host flow: Windows、macOS、Linux で同じ Docker + Bash entrypoint を使います。
 - host CPU independent: AMD64/x86_64 host でも ARM64 host でも Docker 経由で動きます。`zmk-build-arm` の `arm` は firmware toolchain の意味で、host CPU の条件ではありません。
-- local module override: `-m <dir>` と `local_modules/` で、同名 west project の overlay と extra ZMK module 追加の両方に対応します。
+- explicit module override: 各 `-m <dir>` で、同名 west project の overlay と extra ZMK module 追加の両方に対応します。`local_modules/` は無視します。
 - persistent west workspace: dependency は run 間で再利用し、target config は毎回 fresh に copy します。
 - safe overlay restore: local west project override は backup して、次回 build で復元します。
 - target parallel build: `--jobs N` / `ZMK_BUILD_JOBS=N` で `build.yaml` target を並列 build できます。外部 repo の full/pristine workflow では、target 並列と Ninja 内部の compile 並列が重なりすぎないように既定を 1 にします。
 - target ごとに artifact 1 個: `.uf2` を優先し、`.bin` / `.hex` fallback も扱います。
-- CI coverage: ZMK 4.1 HWMv2 の代表 board、target shape parser、複数 local module override path を確認します。
+- CI coverage: ZMK 4.1 HWMv2 の代表 board、target shape parser、明示的な module override path を確認します。
 
 ## 必要なもの
 
@@ -220,13 +220,13 @@ build:
     snippet_root: .
 ```
 
-## local module
+## explicit module
 
 ```bash
 ./build.sh ../your-zmk-config -m ../zmk-input-matrix
 ```
 
-`-m` で渡した module は Docker 内へ copy します。directory name が west project name と一致する場合は `west update` 後にその project を local 版で上書きします。一致しない場合は `ZMK_EXTRA_MODULES` として ZMK に渡します。この tool の `local_modules/` に置いた module も同じ扱いです。
+`-m` で渡した module は Docker 内へ copy します。directory name が west project name と一致する場合は `west update` 後にその project を local 版で上書きします。一致しない場合は `ZMK_EXTRA_MODULES` として ZMK に渡します。すべての module は `-m` で明示し、この tool の `local_modules/` は使用しません。
 
 generated west project directory は copy 元ごとに除外するため、cache 済み dependency を避けつつ、通常 module の意図した content は保持します。
 
@@ -332,7 +332,7 @@ offline の場合は job が queue に残ります。`concurrency` の
 5. `ZMK_CONFIG=/root/zmk-config/config` で build し、ZMK が `config/boards` と root `boards` の両方を見られるようにする
 6. `zephyr/module.yml` がある場合は `/root/zmk-config` を `ZMK_EXTRA_MODULES` に渡す
 7. 必要なときだけ `west update`
-8. 前回の local west project overlay を backup から復元してから、`local_modules/` と `-m` の module override を適用
+8. 前回の west project overlay を backup から復元してから、明示した `-m` の module override を適用
 9. `build.yaml` から生成した各 target を、必要なら target ごとの build directory で並列 build
 10. target ごとに firmware artifact 1 個だけを `.build/` へ copy
 11. `build.log` と `build-summary.txt` を保存し、失敗時は summary に error excerpt を残す

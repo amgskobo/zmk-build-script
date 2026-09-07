@@ -183,33 +183,39 @@ jobs:
 
       - name: Build source (Unix)
         if: ${{ runner.os != 'Windows' }}
-        continue-on-error: true
         shell: bash
+        env:
+          SOURCE_SLUG: ${{ matrix.source.slug }}
+          SOURCE_TYPE: ${{ matrix.source.type }}
+          SOURCE_VALUE: ${{ matrix.source.source }}
         run: |
-          args=(--mode "${EXTERNAL_MODE}" --jobs "${EXTERNAL_BUILD_JOBS}" --source-slug "${{ matrix.source.slug }}")
+          args=(--mode "${EXTERNAL_MODE}" --jobs "${EXTERNAL_BUILD_JOBS}" --source-slug "${SOURCE_SLUG}")
           if [ "${EXTERNAL_MODE}" = "build" ] && [ "${EXTERNAL_PRISTINE}" = "true" ]; then
             args+=(--pristine)
           fi
-          if [ "${{ matrix.source.type }}" = "repo" ]; then
-            args=(--repo "${{ matrix.source.source }}" "${args[@]}")
+          if [ "${SOURCE_TYPE}" = "repo" ]; then
+            args=(--repo "${SOURCE_VALUE}" "${args[@]}")
           else
-            args=(--path "${{ matrix.source.source }}" "${args[@]}")
+            args=(--path "${SOURCE_VALUE}" "${args[@]}")
           fi
           bash ./scripts/build-external-source.sh "${args[@]}"
 
       - name: Build source (Windows)
         if: ${{ runner.os == 'Windows' }}
-        continue-on-error: true
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        env:
+          SOURCE_SLUG: ${{ matrix.source.slug }}
+          SOURCE_TYPE: ${{ matrix.source.type }}
+          SOURCE_VALUE: ${{ matrix.source.source }}
         run: |
-          args=(--mode "${EXTERNAL_MODE}" --jobs "${EXTERNAL_BUILD_JOBS}" --source-slug "${{ matrix.source.slug }}")
+          args=(--mode "${EXTERNAL_MODE}" --jobs "${EXTERNAL_BUILD_JOBS}" --source-slug "${SOURCE_SLUG}")
           if [ "${EXTERNAL_MODE}" = "build" ] && [ "${EXTERNAL_PRISTINE}" = "true" ]; then
             args+=(--pristine)
           fi
-          if [ "${{ matrix.source.type }}" = "repo" ]; then
-            args=(--repo "${{ matrix.source.source }}" "${args[@]}")
+          if [ "${SOURCE_TYPE}" = "repo" ]; then
+            args=(--repo "${SOURCE_VALUE}" "${args[@]}")
           else
-            args=(--path "${{ matrix.source.source }}" "${args[@]}")
+            args=(--path "${SOURCE_VALUE}" "${args[@]}")
           fi
           bash ./scripts/build-external-source.sh "${args[@]}"
 

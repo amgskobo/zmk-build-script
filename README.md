@@ -34,8 +34,8 @@ the current root layout. The source repo is not modified.
   script entrypoint.
 - Host CPU independent: AMD64/x86_64 and ARM64 hosts run through Docker; the
   `zmk-build-arm` image name refers to the firmware toolchain, not the host CPU.
-- Local module override: `-m <dir>` and `local_modules/` can overlay matching
-  west projects or be added as extra ZMK modules.
+- Explicit module override: each `-m <dir>` can overlay a matching west project
+  or be added as an extra ZMK module. `local_modules/` is ignored.
 - Persistent west workspace: dependencies are reused between runs, while the
   target config is copied fresh each time.
 - Safe overlay restore: local west project overrides are backed up and restored
@@ -47,7 +47,7 @@ the current root layout. The source repo is not modified.
 - One artifact per target: `.uf2` is preferred, with `.bin` / `.hex` fallback
   support.
 - CI coverage: representative ZMK 4.1 HWMv2 boards, target-shape parsing, and
-  multiple local module override paths are validated.
+  explicit module override paths are validated.
 
 ## Requirements
 
@@ -246,7 +246,7 @@ build:
     snippet_root: .
 ```
 
-## Local Modules
+## Explicit Modules
 
 ```bash
 ./build.sh ../your-zmk-config -m ../zmk-input-matrix
@@ -254,8 +254,8 @@ build:
 
 Modules passed with `-m` are copied into Docker. If the directory name matches a
 west project name, that project is overlaid after `west update`. Otherwise it is
-passed to ZMK through `ZMK_EXTRA_MODULES`. Modules in this tool's
-`local_modules/` directory are loaded the same way.
+passed to ZMK through `ZMK_EXTRA_MODULES`. Pass every module explicitly with
+`-m`; this tool does not load `local_modules/`.
 
 Generated west project directories are filtered per copy source, so cached
 dependencies are skipped without dropping intentional module content.
@@ -375,8 +375,8 @@ host, remove its `zmk-docker-active` label or stop the runner.
 6. If `zephyr/module.yml` exists, passes `/root/zmk-config` through
    `ZMK_EXTRA_MODULES`.
 7. Runs `west update` only when the workspace needs it.
-8. Restores any previous local west project overlays from backup, then applies
-   `local_modules/` and `-m` module overrides.
+8. Restores any previous west project overlays from backup, then applies the
+   explicit `-m` module overrides.
 9. Builds each generated `build.yaml` target, optionally in parallel with one
    build directory per target.
 10. Copies one firmware artifact per target back to `.build/`.

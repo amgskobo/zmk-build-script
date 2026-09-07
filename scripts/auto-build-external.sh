@@ -61,7 +61,7 @@ validate_positive_int() {
 
 is_repo_url() {
     case "$1" in
-        http://*|https://*|ssh://*|git@*:*)
+        http://*|https://*|ssh://*|git://*|file://*|git@*:*)
             return 0
             ;;
     esac
@@ -70,7 +70,7 @@ is_repo_url() {
 
 is_absolute_path() {
     case "$1" in
-        /*|[A-Za-z]:*)
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*|\\\\*)
             return 0
             ;;
     esac

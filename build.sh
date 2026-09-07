@@ -84,7 +84,6 @@ if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
     WEST_UPDATE_ATTEMPTS="${ZMK_WEST_UPDATE_ATTEMPTS:-3}"
     USER_ZMK_EXTRA_MODULES="${USER_ZMK_EXTRA_MODULES:-}"
     ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}"
-    LOCAL_MODULES_DIR="${LOCAL_MODULES_DIR:-/root/local_modules}"
     EXTERNAL_MODULES_DIR="${EXTERNAL_MODULES_DIR:-/root/external_modules}"
     FIRMWARE_EXTENSIONS=(uf2 "${ZMK_FALLBACK_BINARY}" hex bin)
     FIELD_SEP=$'\037'
@@ -211,7 +210,7 @@ PY
 
     validate_module_roots() {
         local root="$1" label="$2" kind="$3"
-        local need_settings=()
+        local need_settings=() need_build_keys=()
 
         if [ "${kind}" = "module" ] && [ -d "${root}/boards" ]; then
             need_settings+=(board_root)
@@ -222,17 +221,26 @@ PY
         if [ -d "${root}/snippets" ]; then
             need_settings+=(snippet_root)
         fi
+        if [ "${kind}" = "module" ] && [ -f "${root}/CMakeLists.txt" ]; then
+            need_build_keys+=(cmake)
+        fi
+        if [ "${kind}" = "module" ] && [ -f "${root}/Kconfig" ]; then
+            need_build_keys+=(kconfig)
+        fi
 
-        [ ${#need_settings[@]} -gt 0 ] || return 0
+        [ ${#need_settings[@]} -gt 0 ] || [ ${#need_build_keys[@]} -gt 0 ] || return 0
         local module_yml="${root}/zephyr/module.yml"
         [ -f "${module_yml}" ] ||
-            fail "${label}: root ${need_settings[*]} requires zephyr/module.yml with build.settings entries"
+            fail "${label}: root module content requires zephyr/module.yml"
 
-        python3 - "${module_yml}" "${label}" "${need_settings[@]}" <<'PY'
+        python3 - "${module_yml}" "${label}" \
+            "${need_settings[*]}" "${need_build_keys[*]}" <<'PY'
 import sys
 import yaml
 
-module_yml, label, *required = sys.argv[1:]
+module_yml, label, settings_arg, build_keys_arg = sys.argv[1:]
+required_settings = [name for name in settings_arg.split() if name]
+required_build_keys = [name for name in build_keys_arg.split() if name]
 
 with open(module_yml, "r", encoding="utf-8") as f:
     data = yaml.safe_load(f) or {}
@@ -251,10 +259,13 @@ if not isinstance(settings, dict):
     print(f"{label}: zephyr/module.yml build.settings must be a map.", file=sys.stderr)
     sys.exit(1)
 
-missing = [name for name in required if settings.get(name) not in (".", "./")]
-if missing:
-    joined = ", ".join(f"build.settings.{name}: ." for name in missing)
-    print(f"{label}: root module content requires {joined}", file=sys.stderr)
+missing_settings = [name for name in required_settings if settings.get(name) not in (".", "./")]
+missing_build_keys = [name for name in required_build_keys if not build.get(name)]
+if missing_settings or missing_build_keys:
+    joined = []
+    joined.extend(f"build.settings.{name}: ." for name in missing_settings)
+    joined.extend(f"build.{name}" for name in missing_build_keys)
+    print(f"{label}: root module content requires {', '.join(joined)}", file=sys.stderr)
     sys.exit(1)
 PY
     }
@@ -406,10 +417,10 @@ PY
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             if project_path="$(project_path_for_name "${name}")" && [ -e "${WORK_DIR}/${project_path}" ]; then
-                log "Clearing stale local overlay: ${name} -> ${project_path}"
+                log "Clearing stale module input overlay: ${name} -> ${project_path}"
                 rm -rf "${WORK_DIR:?}/${project_path}"
             fi
-        done < <(local_module_dirs)
+        done < <(module_input_dirs)
     }
 
     clear_recorded_local_overlays() {
@@ -419,15 +430,15 @@ PY
         while IFS=$'\t' read -r name project_path; do
             [ -n "${project_path}" ] || continue
             case "${project_path}" in
-                /*|*..*) fail "invalid recorded local overlay path: ${project_path}" ;;
+                /*|*..*) fail "invalid recorded module input overlay path: ${project_path}" ;;
             esac
             backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
             if [ -d "${backup_path}" ]; then
-                log "Restoring previous local overlay from backup: ${name} -> ${project_path}"
+                log "Restoring previous module input overlay from backup: ${name} -> ${project_path}"
                 copy_tree "${backup_path}" "${WORK_DIR}/${project_path}"
                 rm -rf "${backup_path}"
             elif [ -e "${WORK_DIR}/${project_path}" ]; then
-                log "Clearing previous local overlay: ${name} -> ${project_path}"
+                log "Clearing previous module input overlay: ${name} -> ${project_path}"
                 rm -rf "${WORK_DIR:?}/${project_path}"
                 need_update=0
             else
@@ -438,17 +449,17 @@ PY
         return "${need_update}"
     }
 
-    backup_local_overlay_project() {
+    backup_module_input_overlay_project() {
         local name="$1" project_path="$2" backup_path
         backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
         rm -rf "${backup_path}"
         if [ -e "${WORK_DIR}/${project_path}" ]; then
-            log "Backing up west project before local overlay: ${name} -> ${project_path}"
+            log "Backing up west project before module input overlay: ${name} -> ${project_path}"
             copy_tree "${WORK_DIR}/${project_path}" "${backup_path}"
         fi
     }
 
-    record_local_overlay() {
+    record_module_input_overlay() {
         local name="$1" project_path="$2"
         mkdir -p "$(dirname "${LOCAL_OVERLAY_STAMP}")"
         printf '%s\t%s\n' "${name}" "${project_path}" >> "${LOCAL_OVERLAY_STAMP}"
@@ -509,7 +520,7 @@ PY
             if [ "${WEST_UPDATE_FAILED}" = "1" ]; then
                 WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
                 WEST_UPDATE_MISSING_PROJECTS="$(missing_workspace_projects || true)"
-                log "west update failed after ${WEST_UPDATE_ATTEMPTS} attempt(s); checking local module overrides before continuing"
+                log "west update failed after ${WEST_UPDATE_ATTEMPTS} attempt(s); checking explicit module inputs before continuing"
             fi
             rm -f "${west_update_log}"
             west zephyr-export || true
@@ -517,13 +528,8 @@ PY
         fi
     }
 
-    local_module_dirs() {
+    module_input_dirs() {
         local mod
-        if [ -d "${LOCAL_MODULES_DIR}" ]; then
-            for mod in "${LOCAL_MODULES_DIR}"/*; do
-                [ -d "${mod}" ] && printf '%s\n' "${mod}"
-            done
-        fi
         if [ -d "${EXTERNAL_MODULES_DIR}" ]; then
             for mod in "${EXTERNAL_MODULES_DIR}"/*; do
                 [ -d "${mod}" ] && printf '%s\n' "${mod}"
@@ -542,7 +548,20 @@ EOF
         printf '%s\n' "${path}"
     }
 
-    sync_local_modules() {
+    validate_module_inputs() {
+        local mod name seen=" "
+        while IFS= read -r mod; do
+            [ -n "${mod}" ] || continue
+            name="$(basename "${mod}")"
+            case "${seen}" in
+                *" ${name} "*) fail "duplicate module input name: ${name}" ;;
+            esac
+            seen="${seen}${name} "
+            validate_module_roots "${mod}" "module input ${name}" "module"
+        done < <(module_input_dirs)
+    }
+
+    sync_module_inputs() {
         local mod name project_path extra_path seen=" "
         EXTRA_MODULE_PATHS=()
 
@@ -550,22 +569,22 @@ EOF
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             case "${seen}" in
-                *" ${name} "*) fail "duplicate local module name: ${name}" ;;
+                *" ${name} "*) fail "duplicate module input name: ${name}" ;;
             esac
             seen="${seen}${name} "
-            validate_module_roots "${mod}" "local module ${name}" "module"
+            validate_module_roots "${mod}" "module input ${name}" "module"
             if project_path="$(project_path_for_name "${name}")"; then
-                log "Overlaying local west project: ${name} -> ${project_path}"
-                backup_local_overlay_project "${name}" "${project_path}"
+                log "Overlaying module input west project: ${name} -> ${project_path}"
+                backup_module_input_overlay_project "${name}" "${project_path}"
                 copy_module_tree "${mod}" "${WORK_DIR}/${project_path}"
-                record_local_overlay "${name}" "${project_path}"
+                record_module_input_overlay "${name}" "${project_path}"
             else
-                extra_path="/workspaces/local-extra-modules/${name}"
-                log "Adding local extra module: ${name}"
+                extra_path="/workspaces/module-inputs/${name}"
+                log "Adding module input as extra module: ${name}"
                 copy_module_tree "${mod}" "${extra_path}"
                 EXTRA_MODULE_PATHS+=("${extra_path}")
             fi
-        done < <(local_module_dirs)
+        done < <(module_input_dirs)
     }
 
     parse_build_yaml() {
@@ -668,7 +687,8 @@ def format_artifact(template, board, shield, snippet):
     )
 
 def merged_target(mapping, board, shield):
-    snippet = joined(raw_with_default(mapping, "snippet"), "snippet")
+    yaml_snippet = joined(raw_with_default(mapping, "snippet"), "snippet")
+    snippet = yaml_snippet
     if host_snippets:
         snippet = " ".join(part for part in (snippet, host_snippets) if part)
 
@@ -679,12 +699,15 @@ def merged_target(mapping, board, shield):
 
     artifact_template = scalar(raw_with_default(mapping, "artifact-name"), "artifact-name", allow_empty=True)
     artifact = safe_name(format_artifact(artifact_template, board, shield, snippet))
+    exclude_artifact = safe_name(format_artifact(artifact_template, board, shield, yaml_snippet))
     return {
         "board": board,
         "shield": shield,
         "snippet": snippet,
         "cmake-args": cmake_args,
         "artifact-name": artifact,
+        "_exclude-snippet": yaml_snippet,
+        "_exclude-artifact-name": exclude_artifact,
     }
 
 def add_matrix_targets(source, require_board):
@@ -733,7 +756,8 @@ def exclusion_matches(exclusion, target):
             continue
         compared = True
         options = scalar_list(value, key, allow_empty=True)
-        if target[key] not in options:
+        target_value = target.get(f"_exclude-{key}", target[key])
+        if target_value not in options:
             return False
     return compared
 
@@ -933,6 +957,7 @@ PY
         local host_snippets="${1:-}"
         local targets
         ensure_zmk_layout
+        validate_module_inputs
         [ -f "${SOURCE_DIR}/${BUILD_YAML}" ] || fail "build.yaml not found"
         targets="$(mktemp)"
         parse_build_yaml "${host_snippets}" > "${targets}"
@@ -956,7 +981,7 @@ PY
         [ -s "${targets}" ] || fail "build.yaml contains no build targets"
 
         ensure_west_workspace
-        sync_local_modules
+        sync_module_inputs
         cd "${WORK_DIR}"
         verify_west_update_result
         west zephyr-export || true
@@ -1118,9 +1143,14 @@ module_yml_mentions_root_setting() {
         grep -Eq "^[[:space:]]*${setting}:[[:space:]]*'?\\./?'?[[:space:]]*(#.*)?$" "${module_yml}"
 }
 
+module_yml_mentions_build_key() {
+    local module_yml="$1" key="$2"
+    grep -Eq "^[[:space:]]*${key}:[[:space:]]*[^[:space:]#]+" "${module_yml}"
+}
+
 validate_host_module_roots() {
     local root="$1" label="$2" kind="$3"
-    local settings=()
+    local settings=() build_keys=()
     [ "${kind}" != "target" ] || return 0
     if [ "${kind}" = "module" ] && [ -d "${root}/boards" ]; then
         settings+=(board_root)
@@ -1131,15 +1161,25 @@ validate_host_module_roots() {
     if [ -d "${root}/snippets" ]; then
         settings+=(snippet_root)
     fi
-    [ ${#settings[@]} -gt 0 ] || return 0
+    if [ "${kind}" = "module" ] && [ -f "${root}/CMakeLists.txt" ]; then
+        build_keys+=(cmake)
+    fi
+    if [ "${kind}" = "module" ] && [ -f "${root}/Kconfig" ]; then
+        build_keys+=(kconfig)
+    fi
+    [ ${#settings[@]} -gt 0 ] || [ ${#build_keys[@]} -gt 0 ] || return 0
     local module_yml="${root}/zephyr/module.yml"
     [ -f "${module_yml}" ] ||
-        die "${label}: root ${settings[*]} requires zephyr/module.yml with build.settings entries"
+        die "${label}: root module content requires zephyr/module.yml"
 
-    local setting
+    local setting build_key
     for setting in "${settings[@]}"; do
         module_yml_mentions_root_setting "${module_yml}" "${setting}" ||
             die "${label}: root module content requires build.settings.${setting}: ."
+    done
+    for build_key in "${build_keys[@]}"; do
+        module_yml_mentions_build_key "${module_yml}" "${build_key}" ||
+            die "${label}: root module content requires build.${build_key}"
     done
 }
 
@@ -1154,17 +1194,28 @@ require_host_commands() {
     [ "${missing}" = "0" ] || exit 1
 }
 
+require_tar_exclude() {
+    tar --help 2>&1 | grep -q -- '--exclude' ||
+        die "tar must support --exclude"
+}
+
+validate_one_module_input() {
+    local mod="$1" label_prefix="$2" name seen_ref
+    [ -d "${mod}" ] || die "module input directory not found: ${mod}"
+    name="$(basename "${mod}")"
+    seen_ref=" ${VALIDATED_MODULE_NAMES} "
+    case "${seen_ref}" in
+        *" ${name} "*) die "duplicate module input name: ${name}" ;;
+    esac
+    validate_host_module_roots "${mod}" "${label_prefix} ${name}" "module"
+    VALIDATED_MODULE_NAMES="${VALIDATED_MODULE_NAMES}${VALIDATED_MODULE_NAMES:+ }${name}"
+}
+
 validate_module_inputs() {
-    local mod name seen=" "
-    [ "${#MODULES[@]}" -gt 0 ] || return 0
+    local mod
+    VALIDATED_MODULE_NAMES=""
     for mod in "${MODULES[@]}"; do
-        [ -d "${mod}" ] || die "local module directory not found: ${mod}"
-        name="$(basename "${mod}")"
-        case "${seen}" in
-            *" ${name} "*) die "duplicate local module name: ${name}" ;;
-        esac
-        validate_host_module_roots "${mod}" "local module ${name}" "module"
-        seen="${seen}${name} "
+        validate_one_module_input "${mod}" "module input"
     done
 }
 
@@ -1249,8 +1300,15 @@ cleanup_container() {
 }
 trap cleanup_container EXIT
 
+is_generated_dependency_tree() {
+    local path="$1"
+    [ -d "${path}" ] || return 1
+    [ -e "${path}/.git" ] && return 0
+    find "${path}" -mindepth 2 -maxdepth 4 -name .git -print -quit 2>/dev/null | grep -q .
+}
+
 build_tar_excludes() {
-    local source_dir="${1:-${TARGET_DIR}}"
+    local source_dir="${1:-${TARGET_DIR}}" generated_dir
     SOURCE_TAR_EXCLUDES=(
         --exclude .git
         --exclude .west
@@ -1268,13 +1326,11 @@ build_tar_excludes() {
         --exclude './zmk_search'
     )
     if [ -d "${source_dir}/.west" ]; then
-        SOURCE_TAR_EXCLUDES+=(
-            --exclude './zmk'
-            --exclude './modules'
-            --exclude './tools'
-            --exclude './bootloader'
-            --exclude './optional'
-        )
+        for generated_dir in zmk modules tools bootloader optional; do
+            if is_generated_dependency_tree "${source_dir}/${generated_dir}"; then
+                SOURCE_TAR_EXCLUDES+=(--exclude "./${generated_dir}")
+            fi
+        done
     fi
 }
 
@@ -1286,18 +1342,6 @@ copy_target_to_container() {
 
     tr -d '\r' < "$0" |
         docker exec -i "${container_name}" /bin/bash -c 'cat > /root/zmk-config/build.sh && chmod +x /root/zmk-config/build.sh'
-
-    if [ -d "${SCRIPT_DIR}/local_modules" ]; then
-        msg "Copying local_modules/"
-        local local_mod local_name
-        for local_mod in "${SCRIPT_DIR}/local_modules"/*; do
-            [ -d "${local_mod}" ] || continue
-            local_name="$(basename "${local_mod}")"
-            build_tar_excludes "${local_mod}"
-            (cd "${local_mod}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
-                docker exec -i "${container_name}" /bin/bash -c 'mkdir -p "/root/local_modules/$1" && tar --no-same-owner -xf - -C "/root/local_modules/$1"' _ "${local_name}"
-        done
-    fi
 
     local mod name
     [ "${#MODULES[@]}" -gt 0 ] || return 0
@@ -1313,10 +1357,14 @@ copy_target_to_container() {
 copy_artifacts_from_container() {
     local artifact_dir="$1"
     mkdir -p "${artifact_dir}"
-    docker exec "${container_name}" tar -C /root/zmk-config/.build -cf - . |
-        (cd "${artifact_dir}" && tar xf -)
+    if ! docker exec "${container_name}" tar -C /root/zmk-config/.build -cf - . |
+        (cd "${artifact_dir}" && tar xf -); then
+        echo "failed to copy build output from the container" >&2
+        return 1
+    fi
     if ! find "${artifact_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) | grep -q .; then
-        die "no firmware artifact was copied from the container"
+        echo "no firmware artifact was copied from the container" >&2
+        return 1
     fi
 }
 
@@ -1368,10 +1416,10 @@ write_summary() {
         echo "Build jobs: ${BUILD_JOBS}"
         echo "Extra snippets: ${HOST_SNIPPETS:-<none>}"
         if [ ${#MODULES[@]} -gt 0 ]; then
-            echo "Local modules:"
+            echo "Module inputs:"
             printf '  - %s\n' "${MODULES[@]}"
         else
-            echo "Local modules: <none>"
+            echo "Module inputs: <none>"
         fi
         echo
         echo "Files"

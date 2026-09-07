@@ -73,21 +73,8 @@ if [ ! -f "${build_log}" ]; then
 fi
 
 if ! grep -qx 'Status: SUCCESS' "${build_summary}"; then
-  if [ "${mode}" = "build" ]; then
-    firmware_list="$(
-      find "${run_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) -print |
-        sort
-    )"
-    if [ -n "${firmware_list}" ]; then
-      echo "build-summary.txt reports FAILED but firmware files exist — accepting partial success: ${build_summary}" >&2
-    else
-      echo "build-summary.txt does not report success and no firmware files found: ${build_summary}" >&2
-      exit 1
-    fi
-  else
-    echo "build-summary.txt does not report success: ${build_summary}" >&2
-    exit 1
-  fi
+  echo "build-summary.txt does not report success: ${build_summary}" >&2
+  exit 1
 fi
 
 summary_mode="$(sed -n 's/^Mode: //p' "${build_summary}" | tail -n 1)"
@@ -117,12 +104,8 @@ if [ "${mode}" = "build" ]; then
 
   firmware_count="$(printf '%s\n' "${firmware_list}" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   if [ "${firmware_count}" -lt "${built_targets}" ]; then
-    if [ "${firmware_count}" -gt 0 ]; then
-      echo "Firmware artifact count (${firmware_count}) is lower than built target count (${built_targets}) — partial success." >&2
-    else
-      echo "Firmware artifact count (${firmware_count}) is lower than built target count (${built_targets})." >&2
-      exit 1
-    fi
+    echo "Firmware artifact count (${firmware_count}) is lower than built target count (${built_targets})." >&2
+    exit 1
   fi
 
   echo "[output] built targets: ${built_targets}"

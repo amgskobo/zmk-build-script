@@ -10,7 +10,6 @@ mkdir -p "${tmp_parent}"
 tmp_dir="$(mktemp -d "${tmp_parent}/zmk-copy-excludes.XXXXXX")"
 tool_root="${tmp_dir}/tool-root"
 fixture="${tool_root}/.github/fixtures/ci-zmk-config"
-local_modules_root="${tool_root}/local_modules"
 containers=()
 last_container=""
 
@@ -36,6 +35,13 @@ add_payload_dirs() {
   done
   mkdir -p "${root}/src"
   printf 'keep\n' > "${root}/src/keep.txt"
+}
+
+add_generated_git_markers() {
+  local root="$1" dir
+  for dir in modules tools zmk bootloader optional; do
+    mkdir -p "${root}/${dir}/.git"
+  done
 }
 
 make_target() {
@@ -77,6 +83,27 @@ run_validate() {
   fi
 }
 
+run_validate_fail() {
+  local scenario="$1" target="$2" expected="$3" module_arg="${4:-}" log_path
+  local container="zmk-copy-excludes-${scenario}-$$"
+  containers+=("${container}")
+  log_path="${tmp_dir}/${scenario}.log"
+
+  echo "[copy-excludes] ${scenario}"
+  set +e
+  if [ -n "${module_arg}" ]; then
+    ZMK_KEEP_CONTAINER=1 ZMK_CONTAINER_NAME="${container}" \
+      bash "${tool_root}/build.sh" validate "${target}" --settings-reset -m "${module_arg}" >"${log_path}" 2>&1
+  else
+    ZMK_KEEP_CONTAINER=1 ZMK_CONTAINER_NAME="${container}" \
+      bash "${tool_root}/build.sh" validate "${target}" --settings-reset >"${log_path}" 2>&1
+  fi
+  status=$?
+  set -e
+  [ "${status}" -ne 0 ] || { echo "expected failure for ${scenario}" >&2; return 1; }
+  grep -F "${expected}" "${log_path}" >/dev/null || { tail -n 120 "${log_path}" >&2; return 1; }
+}
+
 assert_preserved() {
   local container="$1" base="$2"
   docker exec "${container}" /bin/bash -lc '
@@ -104,14 +131,25 @@ assert_excluded() {
   ' _ "${base}"
 }
 
-mkdir -p "${local_modules_root}"
+assert_absent() {
+  local container="$1" path="$2"
+  if docker exec "${container}" test -e "${path}"; then
+    echo "unexpectedly present:${path}" >&2
+    return 1
+  fi
+}
 
 target_no_west="$(make_target target-no-west none)"
 run_validate target-no-west-preserve "${target_no_west}"
 assert_preserved "${last_container}" /root/zmk-config
 
 target_west="$(make_target target-west west)"
-run_validate target-west-exclude "${target_west}"
+run_validate target-west-preserve "${target_west}"
+assert_preserved "${last_container}" /root/zmk-config
+
+target_generated="$(make_target target-generated west)"
+add_generated_git_markers "${target_generated}"
+run_validate target-west-exclude-generated "${target_generated}"
 assert_excluded "${last_container}" /root/zmk-config
 
 module_target="$(make_target module-target west)"
@@ -121,17 +159,17 @@ run_validate external-no-west-preserve "${module_target}" "${external_no_west}"
 assert_preserved "${last_container}" /root/external_modules/external-no-west
 
 external_west="$(make_module external-west west)"
-run_validate external-west-exclude "${module_target}" "${external_west}"
-assert_excluded "${last_container}" /root/external_modules/external-west
+run_validate external-west-preserve "${module_target}" "${external_west}"
+assert_preserved "${last_container}" /root/external_modules/external-west
 
-local_no_west="$(make_module local-no-west none "${local_modules_root}")"
-run_validate local-no-west-preserve "${module_target}"
-assert_preserved "${last_container}" /root/local_modules/local-no-west
-rm -rf "${local_no_west}"
+mkdir -p "${tool_root}/local_modules"
+ignored_local="$(make_module ignored-local none "${tool_root}/local_modules")"
+run_validate ignored-local-modules "${module_target}"
+assert_absent "${last_container}" /root/local_modules
+rm -rf "${tool_root}/local_modules"
 
-local_west="$(make_module local-west west "${local_modules_root}")"
-run_validate local-west-exclude "${module_target}"
-assert_excluded "${last_container}" /root/local_modules/local-west
-rm -rf "${local_west}"
+cmake_only="$(make_module cmake-only none)"
+printf 'cmake_minimum_required(VERSION 3.20.0)\n' > "${cmake_only}/CMakeLists.txt"
+run_validate_fail cmake-only-module "${module_target}" "module input cmake-only: root module content requires zephyr/module.yml" "${cmake_only}"
 
 echo "copy exclude behavior tests passed."

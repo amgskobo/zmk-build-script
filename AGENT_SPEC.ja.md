@@ -8,10 +8,10 @@
 - Windows / macOS / Linux 差分は script 内で吸収する
 - user が明示しない限り commit / push しない
 - 既存の user changes を revert しない
-- target repo は外部 repo 追跡のため必要最小限の legacy layout 互換を持たせる。`-m` / `local_modules/` の明示 module input は厳格に検証する
+- target repo は外部 repo 追跡のため必要最小限の legacy layout 互換を持たせる。明示した `-m` module input は厳格に検証する。`local_modules/` は廃止し、存在しても無視する
 - build output は target ごとに firmware 1 個だけにする
 - `build.log` と `build-summary.txt` は必要。run directory 名は `run-YYYY-MM-DD_HH-MM-SS-pid-PID` にする。失敗時は summary に error excerpt を残す
-- local module override は必要。`-m` と `local_modules/` は維持する
+- module override は必要。すべて `-m` で明示し、`local_modules/` は維持しない
 - 外部 repo の full/pristine auto build は target-level 並列を既定 `build_jobs=1` にする。`--jobs` / `ZMK_BUILD_JOBS` は manual tuning 用に維持する
 
 ## 対応 layout
@@ -59,7 +59,7 @@ target repo は、build script の `normalize_target_module_metadata` が contai
 3. build 時の `ZMK_CONFIG` は `/root/zmk-config/config` を使う
 4. 必要に応じて target repo の module metadata を container 内で正規化し、`zephyr/module.yml` がある場合は `/root/zmk-config` を `ZMK_EXTRA_MODULES` に追加
 5. `west update` が必要な場合だけ実行
-6. `local_modules/` と `-m` の module override を適用
+6. 明示した `-m` module override を適用
 7. `build.yaml` から生成した target を build。`--jobs` / `ZMK_BUILD_JOBS` が 2 以上なら target ごとに build directory を分けて並列 build。これは target-level 並列だけを制御し、各 target 内の `west build` / Ninja compile 並列は別に発生し得る
 8. `.uf2` を最優先し、なければ fallback として `.bin` / `.hex` を 1 個だけ copy
 9. container の main log stream にも同じ build output を流し、`build.log` と `build-summary.txt` を保存
@@ -111,10 +111,10 @@ CI は cache 済みの `zmk-studio-messages` と `zcbor` west project を host �
 studio 有効 target を 1 つ full build します。
 これにより `proto/zmk` のような入れ子 path が module copy で落ちないことも確認します。
 
-## local module
+## explicit module input
 
 - `-m <dir>` は host から Docker 内へ copy する
-- `local_modules/<name>` も自動で Docker 内へ copy する
+- `local_modules/` は自動検出も copy もしない。残っていても無視し、必要な module は必ず `-m <dir>` で指定する
 - copy 元が `.west` を持つ場合だけ、その copy 元の generated west project directory を除外する
 - `.west` を持たない module では `zmk`、`modules`、`tools`、`bootloader`、`optional` などの名前も保持する
 - directory name が west project name と一致する場合は、その project path を local 版で overlay する
@@ -124,7 +124,7 @@ studio 有効 target を 1 つ full build します。
 
 bug は症状を消すだけで終わらせません。次の順で扱います。
 
-1. 失敗箇所を host shell、host -> container copy、container -> workspace sync、`west update`、local module overlay、build、artifact copy、summary、workflow scheduling に分ける
+1. 失敗箇所を host shell、host -> container copy、container -> workspace sync、`west update`、module input overlay、build、artifact copy、summary、workflow scheduling に分ける
 2. 同じ pattern が macOS / Windows / hosted / self-hosted の片側だけに残っていないか検索する
 3. 実装を最小差分で直す。user が明示していない commit / push はしない
 4. 可能なら `.github/scripts/test-*.sh`、fixture、workflow check のどれかで再発防止する
@@ -147,10 +147,10 @@ bug は症状を消すだけで終わらせません。次の順で扱います�
   原因: Windows host で `bash` の解決先が Git Bash ではなく WSL になる
   対応: Windows の検証 command は `C:\Program Files\Git\bin\bash.exe` を明示する
   確認: `bash -n`、helper tests、Docker validate は Git Bash executable 経由で実行する
-- 症状: local module copy で `zmk`、`modules`、`tools`、`bootloader`、`optional` が必要な content まで消える可能性がある
+- 症状: `-m` module copy で `zmk`、`modules`、`tools`、`bootloader`、`optional` が必要な content まで消える可能性がある
   原因: generated west project directory かどうかを copy 元ごとに判定しないと、通常 module content と west workspace cache を取り違える
   対応: copy 元が `.west` を持つ場合だけ generated west project directory を除外し、`.west` を持たない module では保持する
-  確認: `.github/scripts/test-copy-excludes.sh` で target repo、`-m` external module、`local_modules/<name>` の `.west` あり / なしを検証する
+  確認: `.github/scripts/test-copy-excludes.sh` で target repo と `-m` module の `.west` あり / なしを検証する
 - 症状: Windows self-hosted job が runner online / idle でも queued のまま進まない
   原因: self-hosted runner label は大文字小文字を含めて一致が必要。`windows` と `Windows` は別 label
   対応: self-hosted workflow は OS label の大文字小文字を合わせ、Windows は `Windows`、macOS は `macOS`、Linux は `Linux` を使う。Docker 実行 job は `zmk-docker` と `zmk-docker-active` も要求する
@@ -225,7 +225,7 @@ bug は症状を消すだけで終わらせません。次の順で扱います�
   確認: `repos.txt` は `urob/zmk-config`、`minusfive/knucklehead`、`folke/zmk-config`、`sayu-hub` 系、`kumamuk-git/zmk-config-roBa`、`t-ogura` 系、`kureyakey/zmk-config-zonkey`、`nyasu0123/zmk-config-LisM`、`4mplelab/zmk-config-LisM`、`te9no/zmk-config-GeaconSolstice`、`waressyoi/Cocon-zmk-config` の 14 source にする。過去 run では一部 repo に active Linux build failure があったため、full external build で再分類する
 - 症状: 14 repo 復帰後の external auto build で、`kumamuk-git/zmk-config-roBa`、`nyasu0123/zmk-config-LisM`、`4mplelab/zmk-config-LisM`、`te9no/zmk-config-GeaconSolstice`、`t-ogura/zmk-config-cornix-tb` が実 build 前の layout guard で失敗し、実際の ZMK 互換性を追跡できない
   原因: target repo に対しても「`zephyr/` は `module.yml` だけ」「root `snippets/` / `dts/` は事前に `zephyr/module.yml` の `build.settings` が必要」という制約を host / container の早期 validation で強制していた。external auto build の目的は古い repo も含めた状態追跡なので、この制約は強すぎた
-  対応: target repo の host-side guard を緩め、container 内 copy で `normalize_target_module_metadata` が不足する `zephyr/module.yml` metadata を補う。legacy `zephyr/` content は warning として許容する。明示 input の `-m` / `local_modules/` は引き続き strict validation の対象にする
+  対応: target repo の host-side guard を緩め、container 内 copy で `normalize_target_module_metadata` が不足する `zephyr/module.yml` metadata を補う。legacy `zephyr/` content は warning として許容する。明示 input の `-m` は引き続き strict validation の対象にする
   確認: `bash -n ./build.sh`、全 `.sh` syntax、`.github/scripts/test-auto-build-external.sh`、`.github/scripts/check-lf.sh`、`git -c core.autocrlf=false diff --check`、root snippet compat validate、manual external auto build rerun で確認する
 - 症状: Linux の外部 repo build が firmware artifact を生成して `Status: SUCCESS` なのに、`build-summary.txt does not include Built targets for build mode` で Actions が失敗する
   原因: `build-summary.txt` の `Built targets` は `build.log` の `Build complete: N target(s).` 行だけから抽出していた。runner / Docker log stream によって行頭以外の prefix、CR、ANSI escape、または該当行欠落があると、build 成功後の summary 契約だけが偽陰性になる
@@ -288,6 +288,54 @@ bug は症状を消すだけで終わらせません。次の順で扱います�
   対応: `auto-build.yml` を 1 job 構成に簡素化し、`runs-on: [self-hosted, zmk-docker, zmk-docker-active]` で OS を pin しない。`zmk-docker` + `zmk-docker-active` を持つ online な runner を GitHub Actions の label routing に直接選ばせ、選ばれた runner の OS は `runner.os` で参照して shell step を分岐する (Windows は Git Bash、Unix は Bash)。source の iteration は 1 job 内の `scripts/auto-build-external.sh --repos-file ...` に集約。`concurrency.cancel-in-progress: true` で stale な queued run の上に新規 scheduled run が積もらないようにする。`ZMK_RUNNER_READ_TOKEN` / `active_os` input / `ZMK_ACTIVE_OSES` / `gh api` 呼び出し / `Probe GITHUB_TOKEN` step は全て削除。`SELF_HOSTED_RUNNERS` doc は `zmk-docker` / `zmk-docker-active` の役割と offload 運用 (label を外す or runner 停止) を維持
   確認: `bash -n` で workflow run block syntax、`git diff --check` で whitespace、README.md / README.ja.md / `SELF_HOSTED_RUNNERS.md` / `SELF_HOSTED_RUNNERS.ja.md` の新方針記述、3 runner offline 時に queue に残ることと online 時にいずれかの runner で build が進むこと、`runner.os` によって Unix shell と Git Bash shell が切り替わること、artifact 名に `${{ runner.os }}` が入ること、scheduled run と manual run のどちらも 1 job に収まることを確認する。失われる機能 (OS 優先順 fallback、host 単位 skip、3 OS 横断 full sweep) はこの変更の前提合意として扱う
 
+- 症状: 外部 repo auto-build の source 値に `$(...)` や backtick が含まれると、workflow の shell 展開で command substitution され得る
+  原因: `auto-build.yml` の `run:` block へ `${{ matrix.source.source }}` を直接 double quote 内に埋め込んでいたため、Actions の expression 展開後に Bash が再解釈していた
+  対応: source slug / type / value は `env:` 経由で shell に渡し、`run:` block 内では環境変数を quote して参照する。あわせて build step の `continue-on-error` を外し、失敗を job 結果に反映させる
+  確認: workflow syntax 相当の `bash -n`、`.github/scripts/test-auto-build-external.sh`、`git diff --check` で確認する
+- 症状: external auto-build で一部 target が失敗しても、firmware が 1 個でも残ると CI が成功扱いになる
+  原因: `.github/scripts/check-build-output.sh` が `Status: FAILED` + firmware あり、または `firmware_count < Built targets` を partial success として許容していた
+  対応: `Status: SUCCESS` 以外は常に失敗にし、build mode の firmware 数が built target 数より少ない場合も失敗にする。helper test の期待値も更新する
+  確認: `.github/scripts/test-check-build-output.sh`、`bash -n`、`git diff --check` で確認する
+- 症状: build 自体は成功したが container から firmware artifact を copy できない場合に、`build-summary.txt` が残らない
+  原因: `copy_artifacts_from_container` が `die` で即 exit し、呼び出し側の `write_summary "FAILED" "artifact copy failed"` へ戻らなかった
+  対応: artifact copy 失敗は function から `return 1` し、呼び出し側で summary を書いてから exit する
+  確認: `bash -n ./build.sh` と validate/build output helper の確認で summary contract を確認する
+- 症状: `.west` を持つ source に `zmk` / `modules` / `tools` / `bootloader` / `optional` という通常 content があると、host -> container copy で欠落する
+  原因: directory 名だけで generated dependency とみなして tar exclude していた
+  対応: `.west` がある場合でも名前だけでは除外せず、対象 tree 内に `.git` marker がある generated checkout らしい directory だけを除外する。copy exclude test は `.west` あり通常 content の保持と generated marker ありの除外を分けて検証する
+  確認: `.github/scripts/test-copy-excludes.sh`、`bash -n ./build.sh`、`git diff --check` で確認する
+- 症状: `file://` / `git://` source が repo URL として扱われず、Windows UNC path と `C:relative` の判定も壊れる
+  原因: external helper の `is_repo_url` が `http/https/ssh/git@` だけを受け、`is_absolute_path` が Windows drive-relative と drive absolute を区別していなかった
+  対応: `git://` / `file://` を repo URL に追加し、Windows drive absolute は `C:/...` と `C:\...` のみ absolute とする。UNC slash/backslash は absolute、`C:relative` は relative として扱う
+  確認: `.github/scripts/test-auto-build-external.sh`、`bash -n scripts/*.sh`、`git diff --check` で確認する
+- 症状: 廃止後の `local_modules/` が残っているのに、古い module が build に混入する
+  原因: `local_modules/` を自動読込する経路が残ると、`-m` だけを正とする指定を破る
+  対応: host / container の `local_modules/` 探索・copy 経路を全て削除し、必要な module を `-m <dir>` だけで渡す
+  確認: `.github/scripts/test-copy-excludes.sh` で `local_modules/` が残っていても container へ copy されないことを確認する
+- 症状: `CMakeLists.txt` または `Kconfig` だけを持つ `-m` module が `zephyr/module.yml` なしで検証を通る
+  原因: module root validation が `boards` / `dts` / `snippets` の build.settings だけを見ており、root CMake/Kconfig の build metadata を要求していなかった
+  対応: explicit module input では root `CMakeLists.txt` に `build.cmake`、root `Kconfig` に `build.kconfig` を要求し、metadata がない場合は validate で失敗させる
+  確認: `.github/scripts/test-copy-excludes.sh` に CMake-only `-m` module の validate 失敗 case を追加して確認する
+- 症状: CLI `-S/--snippet` を付けると、build.yaml の `exclude` に一致する target が復活する可能性がある
+  原因: parser が CLI snippet を target の `snippet` / `artifact-name` に合成した後で `exclude` を評価していた
+  対応: exclude 判定には YAML 由来の snippet / artifact-name を使い、実 build target には CLI snippet を合成した値を使うよう分離する
+  確認: `.github/fixtures/target-shapes-zmk-config` に snippet exclude case を追加し、`./build.sh validate .github/fixtures/target-shapes-zmk-config --settings-reset -S studio-rpc-usb-uart` で除外 target が復活しないことを確認する
+- 症状: external source helper が Docker 不在や daemon 停止時に raw/late failure になり、`--pristine` の `docker volume rm` も失敗を隠しやすい
+  原因: `scripts/build-external-source.sh` が repo clone や pristine volume cleanup の前に Docker availability を確認していなかった
+  対応: repo source または `--pristine` の Docker 使用前に `docker` command と daemon availability を preflight する。volume cleanup は `docker_no_pathconv` 経由に揃える
+  確認: `bash -n scripts/build-external-source.sh` と `.github/scripts/test-auto-build-external.sh` で既存 missing-path などの Docker 不要 failure が維持されることを確認する
+- 症状: local/direct `build.sh` が `tar --exclude` 非対応環境で container 作成後の copy 中に失敗する
+  原因: host command preflight は `tar` の存在だけを確認し、実際に使う `--exclude` capability を確認していなかった
+  対応: container 作成前に `tar --help` で `--exclude` support を確認する
+  確認: `bash -n ./build.sh`、`./build.sh validate .github/fixtures/ci-zmk-config --settings-reset`、`git diff --check` で確認する
+- 症状: Windows runner の URL source clone で、末尾空白 / 末尾 dot 以外の Windows-invalid path があると `docker cp` が失敗する可能性が残る
+  原因: clone container から Windows host filesystem へ戻す前の prune が trailing space/dot だけを対象にしていた
+  対応: Windows host では `:` / `*` / `?` / `"` / `<` / `>` / `|` / backslash を含む basename と、`CON` / `PRN` / `AUX` / `NUL` / `COM1..9` / `LPT1..9` の reserved device basename も除去する
+  確認: `bash -n scripts/build-external-source.sh` と `.github/scripts/test-auto-build-external.sh` で helper 契約を確認する。Windows-specific docker cp fixture は未追加のため、必要なら追加検証する
+- 症状: `compatibility.yml` の `config/boards` host-side contract check が、fake Docker へ到達していなくても通る可能性がある
+  原因: `config/boards` という拒否文言が stderr に出ないことだけを確認し、fake docker reached の sentinel を確認していなかった
+  対応: snippet compatibility check と同じく `compat.err` に `fake docker reached` が出ることを assert する
+  確認: workflow shell block の syntax 相当確認と `git diff --check` で確認する
 ## 完成度チェック / 完了判定
 
 完了扱いにする前に、次を確認します。
@@ -307,7 +355,7 @@ bug は症状を消すだけで終わらせません。次の順で扱います�
 
 - agent docs / README だけ: `bash -n ./build.sh`、全 `.github/scripts/*.sh` syntax、`check-lf.sh`、`git diff --check` を最低限にする。記述が build / CI の実挙動に触れる場合は該当 helper test も実行する
 - helper scripts / LF / summary: helper behavior test、`check-lf.sh`、`git diff --check` を必ず実行する
-- copy / local module / sync: `check-runner-tools.sh`、`test-copy-excludes.sh`、関連 fixture validate/build、`check-build-output.sh` を実行する
+- copy / module input / sync: `check-runner-tools.sh`、`test-copy-excludes.sh`、関連 fixture validate/build、`check-build-output.sh` を実行する
 - artifact / fallback / build output: build mode の fixture と `check-build-output.sh build` で artifact count と `.uf2` / `.bin` / `.hex` fallback を確認する
 - workflow / self-hosted: local syntax と helper tests に加え、push 後に hosted `Compatibility`、必要なら手動 `Self-hosted Build` を確認する。push していない場合は remote CI 未実行と明記する
 
@@ -363,5 +411,5 @@ root `module.yml` だけを持つ legacy repo は、build / validate の contain
 copy payload には top-level の local/generated directory (`.cache`, `.ccache`, `.vscode`, `build`,
 `dist`, `node_modules`, `out`, `tmp`, `zmk_search`) を含めません。
 
-local module overlay と west project name が一致する場合は、元 project を workspace 内に
+module input overlay と west project name が一致する場合は、元 project を workspace 内に
 backup してから overlay します。次回 build では backup から通常 checkout へ戻します。
