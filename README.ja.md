@@ -31,7 +31,7 @@ root の `boards/` または外部 module を使ってください。root の `d
 - host CPU independent: AMD64/x86_64 host でも ARM64 host でも Docker 経由で動きます。`zmk-build-arm` の `arm` は firmware toolchain の意味で、host CPU の条件ではありません。
 - explicit module override: 各 `-m <dir>` で、同名 west project の overlay と extra ZMK module 追加の両方に対応します。`local_modules/` は無視します。
 - persistent west workspace: dependency は run 間で再利用し、target config は毎回 fresh に copy します。
-- safe overlay restore: local west project override は backup して、次回 build で復元します。
+- safe overlay restore: 明示 module input の west project override は backup して、次回 build で復元します。
 - target parallel build: `--jobs N` / `ZMK_BUILD_JOBS=N` で `build.yaml` target を並列 build できます。外部 repo の full/pristine workflow では、target 並列と Ninja 内部の compile 並列が重なりすぎないように既定を 1 にします。
 - target ごとに artifact 1 個: `.uf2` を優先し、`.bin` / `.hex` fallback も扱います。
 - CI coverage: ZMK 4.1 HWMv2 の代表 board、target shape parser、明示的な module override path を確認します。
@@ -194,10 +194,10 @@ target 形状の parse は validate 専用の `.github/fixtures/target-shapes-zm
 top-level matrix、include matrix、`defaults`、`exclude`、`skip`、alias key、placeholder、
 `--settings-reset` の重複回避を、firmware build target を増やさずに確認します。
 
-local west project override は `.github/fixtures/module-override-zmk-config` で確認します。
+明示 module input の west project override は `.github/fixtures/module-override-zmk-config` で確認します。
 CI では cache 済みの `zmk-studio-messages` と `zcbor` west project を host 側に copy し、
 両方を `-m` で渡します。同時に別の extra module も `-m` で渡し、
-`Overlaying local west project` と `Adding local extra module` の両方を assert したうえで
+`Overlaying module input west project` と `Adding module input as extra module` の両方を assert したうえで
 firmware target を 1 つ build します。
 この target は studio を有効にし、`proto/zmk` のような入れ子 path も copy されることを確認します。
 次の build では記録された overlay project 群を workspace 内 backup から復元し、Docker volume 全体は

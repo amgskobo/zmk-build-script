@@ -104,10 +104,10 @@ target 形状の parser 確認は `.github/fixtures/target-shapes-zmk-config` �
 この fixture は validate 専用で、top-level matrix、include matrix、`defaults`、`exclude`、
 `skip`、alias key、placeholder、`--settings-reset` の重複回避を確認します。
 
-local west project override の確認は `.github/fixtures/module-override-zmk-config` で行います。
+明示 module input の west project override は `.github/fixtures/module-override-zmk-config` で確認します。
 CI は cache 済みの `zmk-studio-messages` と `zcbor` west project を host 側へ copy し、
 両方を `-m` で戻します。同時に別の extra module も `-m` で渡し、
-`Overlaying local west project` と `Adding local extra module` の両方を踏んだあと、
+`Overlaying module input west project` と `Adding module input as extra module` の両方を踏んだあと、
 studio 有効 target を 1 つ full build します。
 これにより `proto/zmk` のような入れ子 path が module copy で落ちないことも確認します。
 
@@ -200,8 +200,8 @@ bug は症状を消すだけで終わらせません。次の順で扱います�
   対応: `auto-build.yml` の `build_jobs` workflow_dispatch default と scheduled fallback を `1` にし、full/pristine の既定 target-level 並列を抑える。`build.sh --jobs` 自体は manual tuning 用に維持する
   確認: `bash -n ./build.sh`、全 `.sh` syntax、`.github/scripts/test-auto-build-external.sh`、`.github/scripts/check-lf.sh`、`git -c core.autocrlf=false diff --check`、manual auto build rerun で `EXTERNAL_BUILD_JOBS=1` を確認する
 - 症状: `Compatibility` workflow の `Docker validate and build` job が、module override restore build 自体は成功しているのに `Process completed with exit code 1` で失敗する
-  原因: `--pristine` が Docker cache volume を削除する仕様になった後も、restore assertion step が 2 回目の build に `--pristine` を渡していた。persistent workspace backup が消えるため `Restoring previous local overlay from backup` log が出ず、最後の `grep` だけが失敗した
-  対応: 1 回目の local west project override build は clean start のため `--pristine` のままにし、restore を検証する 2 回目の build からは `--pristine` を外す
+  原因: `--pristine` が Docker cache volume を削除する仕様になった後も、restore assertion step が 2 回目の build に `--pristine` を渡していた。persistent workspace backup が消えるため `Restoring previous module input overlay from backup` log が出ず、最後の `grep` だけが失敗した
+  対応: 1 回目の明示 module input west project override build は clean start のため `--pristine` のままにし、restore を検証する 2 回目の build からは `--pristine` を外す
   確認: `bash -n ./build.sh`、全 `.sh` syntax、`.github/scripts/check-lf.sh`、`git -c core.autocrlf=false diff --check`、`Compatibility` workflow rerun で `Docker validate and build` が restore assertion を通ることを確認する
 - 症状: Auto Build External ZMK Repos の Windows matrix job が repo build 前の `Show selected runner` で失敗し、後続 build step が skip される
   原因: `Show selected runner` step だけが全 OS 共通の `shell: bash` で、Windows self-hosted runner 用の Git Bash shell 指定に分岐していなかった

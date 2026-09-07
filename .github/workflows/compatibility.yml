@@ -208,7 +208,7 @@ jobs:
       - name: Check CI fixture build output
         run: bash .github/scripts/check-build-output.sh build
 
-      - name: Build with local west project override
+      - name: Build with explicit west project module input
         run: |
           override_parent="${RUNNER_TEMP}/module-override"
           override_name="zmk-studio-messages"
@@ -239,25 +239,25 @@ jobs:
             -m "${extra_module}" \
             --pristine |
             tee "${RUNNER_TEMP}/module-override-build.log"
-          grep -q "Overlaying local west project: ${override_name} -> modules/msgs/${override_name}" "${RUNNER_TEMP}/module-override-build.log"
-          grep -q "Overlaying local west project: ${second_override_name} -> modules/lib/${second_override_name}" "${RUNNER_TEMP}/module-override-build.log"
-          grep -q "Adding local extra module: zmk-feature-ci-extra" "${RUNNER_TEMP}/module-override-build.log"
+          grep -q "Overlaying module input west project: ${override_name} -> modules/msgs/${override_name}" "${RUNNER_TEMP}/module-override-build.log"
+          grep -q "Overlaying module input west project: ${second_override_name} -> modules/lib/${second_override_name}" "${RUNNER_TEMP}/module-override-build.log"
+          grep -q "Adding module input as extra module: zmk-feature-ci-extra" "${RUNNER_TEMP}/module-override-build.log"
 
-      - name: Check local west project override output
+      - name: Check explicit west project module input output
         run: bash .github/scripts/check-build-output.sh build
 
-      - name: Build after local west project override
+      - name: Build after explicit west project module input
         run: |
           # Do not pass --pristine here: this step verifies that the previous
           # persistent workspace backup is restored on the next build.
           ./build.sh .github/fixtures/module-override-zmk-config |
             tee "${RUNNER_TEMP}/module-override-restore-build.log"
-          grep -q "Restoring previous local overlay from backup: zcbor -> modules/lib/zcbor" \
+          grep -q "Restoring previous module input overlay from backup: zcbor -> modules/lib/zcbor" \
             "${RUNNER_TEMP}/module-override-restore-build.log"
-          grep -q "Restoring previous local overlay from backup: zmk-studio-messages -> modules/msgs/zmk-studio-messages" \
+          grep -q "Restoring previous module input overlay from backup: zmk-studio-messages -> modules/msgs/zmk-studio-messages" \
             "${RUNNER_TEMP}/module-override-restore-build.log"
 
-      - name: Check restored local west project output
+      - name: Check restored module input output
         run: bash .github/scripts/check-build-output.sh build
 
       - name: Upload firmware artifacts

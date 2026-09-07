@@ -38,7 +38,7 @@ the current root layout. The source repo is not modified.
   or be added as an extra ZMK module. `local_modules/` is ignored.
 - Persistent west workspace: dependencies are reused between runs, while the
   target config is copied fresh each time.
-- Safe overlay restore: local west project overrides are backed up and restored
+- Safe overlay restore: explicit module-input west project overrides are backed up and restored
   on the next build.
 - Target parallel build: `--jobs N` / `ZMK_BUILD_JOBS=N` can build `build.yaml`
   targets in parallel. External full/pristine workflow runs default this to 1
@@ -223,7 +223,7 @@ Local west project override is covered by
 `.github/fixtures/module-override-zmk-config`. CI copies the resolved
 `zmk-studio-messages` and `zcbor` west projects from the cache, passes both
 back with `-m`, also passes one extra module, asserts both
-`Overlaying local west project` and `Adding local extra module` paths, and
+`Overlaying module input west project` and `Adding module input as extra module` paths, and
 builds one studio-enabled firmware target so multiple `-m` inputs and nested
 paths such as `proto/zmk` stay covered. The follow-up build restores the
 recorded overlay projects from workspace-local backups instead of resetting the
