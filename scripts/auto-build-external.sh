@@ -3,8 +3,9 @@ set -euo pipefail
 
 # auto-build-external.sh - source list を解決し、source ごとに build script を別 process で起動する。
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+source "${SCRIPT_DIR}/source-common.sh"
 CALLER_DIR="$(pwd -P)"
 
 SOURCES_FILE="$REPO_ROOT/repos.txt"
@@ -31,50 +32,27 @@ CLASSIFIED_VALUE=""
 usage() {
     cat <<'EOF'
 Usage:
-  ./scripts/auto-build-external.sh [sources.txt | source ...] [--jobs N] [--source-jobs N]
-  ./scripts/auto-build-external.sh --repo <git-url> [--source-slug <slug>] [--jobs N] [--source-jobs N]
-  ./scripts/auto-build-external.sh --path <zmk-config-root> [--source-slug <slug>] [--jobs N] [--source-jobs N]
-  ./scripts/auto-build-external.sh --list [sources.txt | source ...]
-  ./scripts/auto-build-external.sh --list-json [sources.txt | source ...]
+  bash scripts/auto-build-external.sh [sources.txt | source ...] [--jobs N] [--source-jobs N]
+  bash scripts/auto-build-external.sh --repo <git-url> [--source-slug <slug>] [--jobs N] [--source-jobs N]
+  bash scripts/auto-build-external.sh --path <zmk-config-root> [--source-slug <slug>] [--jobs N] [--source-jobs N]
+  bash scripts/auto-build-external.sh --list [sources.txt | source ...]
+  bash scripts/auto-build-external.sh --list-json [sources.txt | source ...]
 
 sources.txt accepts one source per line. Each source may be a Git URL or a
 local zmk-config path. Optional prefixes are supported: repo:<url>, path:<dir>.
 Actual builds are one build-external-source.sh process per source.
 --jobs controls target-level parallelism inside each source.
 --source-jobs controls how many sources the local wrapper starts at once.
+
+Options:
+  --mode build|validate   Select firmware build or configuration validation (default: build).
+  --pristine              Reset the selected source cache before building.
+  --settings-reset        Add missing settings_reset targets.
+  -S, --snippet NAME      Append a snippet to every target; repeatable.
+  -m, --module DIR        Pass an explicit module directory; repeatable.
+
+See README.md or README.ja.md for environment variables and runner setup.
 EOF
-}
-
-trim_line() {
-    printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
-}
-
-validate_positive_int() {
-    local label="$1" value="$2"
-    case "${value}" in
-        ""|*[!0-9]*|0)
-            echo "ERROR: ${label} must be a positive integer: ${value}" >&2
-            exit 1
-            ;;
-    esac
-}
-
-is_repo_url() {
-    case "$1" in
-        http://*|https://*|ssh://*|git://*|file://*|git@*:*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
-is_absolute_path() {
-    case "$1" in
-        /*|[A-Za-z]:/*|[A-Za-z]:\\*|\\\\*)
-            return 0
-            ;;
-    esac
-    return 1
 }
 
 path_under_repo() {
@@ -123,53 +101,6 @@ resolve_list_path() {
     else
         printf '%s\n' "${resolved}"
     fi
-}
-
-sanitize_slug() {
-    local value="$1" slug
-    slug="$(
-        printf '%s' "${value}" |
-            tr '\\' '/' |
-            tr '[:upper:]' '[:lower:]' |
-            sed -e 's#/#-#g' \
-                -e 's/[^a-z0-9_.-]/-/g' \
-                -e 's/--*/-/g' \
-                -e 's/^[.-]*//' \
-                -e 's/[.-]*$//'
-    )"
-    [ -n "${slug}" ] || slug="source"
-    printf '%s\n' "${slug}"
-}
-
-repo_slug_base() {
-    local url="$1" clean path
-    clean="$(trim_line "${url}")"
-    clean="${clean%/}"
-    clean="${clean%.git}"
-    case "${clean}" in
-        git@*:*)
-            path="${clean#*:}"
-            ;;
-        *://*)
-            path="${clean#*://}"
-            path="${path#*/}"
-            ;;
-        *)
-            path="${clean}"
-            ;;
-    esac
-    path="${path%.git}"
-    sanitize_slug "${path}"
-}
-
-path_slug_base() {
-    local path="$1" normalized base
-    normalized="$(trim_line "${path}")"
-    normalized="${normalized%/}"
-    normalized="$(printf '%s' "${normalized}" | tr '\\' '/')"
-    base="${normalized##*/}"
-    [ -n "${base}" ] || base="path"
-    sanitize_slug "${base}"
 }
 
 make_unique_slug() {
@@ -408,15 +339,18 @@ run_source_processes() {
             if [ ${#pids[@]} -gt 0 ]; then
                 for j in "${!pids[@]}"; do
                     status_file="${status_files[$j]}"
-                    [ -f "${status_file}" ] || continue
                     pid="${pids[$j]}"
+                    # A killed worker cannot publish its status file. Reap it instead of waiting forever.
+                    if [ ! -f "${status_file}" ] && kill -0 "${pid}" 2>/dev/null; then
+                        continue
+                    fi
                     source_index="${pid_indexes[$j]}"
                     if wait "${pid}"; then
                         wait_status=0
                     else
                         wait_status=$?
                     fi
-                    status="$(cat "${status_file}" 2>/dev/null || printf '%s' "${wait_status}")"
+                    status="${wait_status}"
                     if [ "${status}" = "0" ]; then
                         statuses[$source_index]="success"
                     else

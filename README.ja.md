@@ -4,7 +4,8 @@
 
 現在の ZMK keyboard repository layout だけを扱う、小さい Docker + Bash build helper です。
 
-対応する layout はこれだけです。
+利用手順と runner 運用はこの README、保守契約は [AGENTS.md](AGENTS.md) に集約しています。
+入口の layout は次のとおりです。
 
 ```text
 your-zmk-config/
@@ -22,8 +23,9 @@ your-zmk-config/
 ```
 
 `config/boards` は ZMK が今も検索する compatibility path なので拒否しませんが、新規 repo は
-root の `boards/` または外部 module を使ってください。root の `dts/` や `snippets/` は
-`zephyr/module.yml` の settings で宣言されている必要があります。
+root の `boards/` または外部 module を使ってください。新規 repo は module root を
+`zephyr/module.yml` で宣言してください。明示 `-m` は strict に検証します。target repo の不足 metadata と
+legacy root `module.yml` は container 内だけで正規化し、host source は変更しません。
 
 ## 大きな特徴
 
@@ -32,6 +34,7 @@ root の `boards/` または外部 module を使ってください。root の `d
 - explicit module override: 各 `-m <dir>` で、同名 west project の overlay と extra ZMK module 追加の両方に対応します。`local_modules/` は無視します。
 - persistent west workspace: dependency は run 間で再利用し、target config は毎回 fresh に copy します。
 - safe overlay restore: 明示 module input の west project override は backup して、次回 build で復元します。
+- 再 build の高速化: compiler cache（ccache）を cache volume に永続化し、Git の working tree では Git が表示する file だけを container に copy するため、大きな ignore 済み directory が copy を遅くしません。
 - target parallel build: `--jobs N` / `ZMK_BUILD_JOBS=N` で `build.yaml` target を並列 build できます。外部 repo の full/pristine workflow では、target 並列と Ninja 内部の compile 並列が重なりすぎないように既定を 1 にします。
 - target ごとに artifact 1 個: `.uf2` を優先し、`.bin` / `.hex` fallback も扱います。
 - CI coverage: ZMK 4.1 HWMv2 の代表 board、target shape parser、明示的な module override path を確認します。
@@ -43,64 +46,32 @@ root の `boards/` または外部 module を使ってください。root の `d
 
 Windows では Git Bash を使ってください。標準的な Unix tool が使える Bash 環境を前提にします。
 
-## Windows / macOS / Linux での使い方
+## 最初の実行
 
-Docker が起動していて、コマンドを Bash で実行できれば、同じ script を 3 OS で使えます。
-
-host CPU architecture は通常 script の利用条件には含めません。AMD64/x86_64 host でも
-ARM64 host でも、Docker 経由で同じ command を実行します。`zmk-build-arm` の `arm` は
-ZMK board 向け ARM firmware toolchain の意味で、host machine が ARM である必要はありません。
-
-Docker が image platform を自動選択できない場合や、ARM64 host で amd64 image を使いたい場合は
-次のように指定できます。
+Docker の Linux engine を起動し、Windows / macOS / Linux の Bash から実行します。
 
 ```bash
-ZMK_DOCKER_PLATFORM=linux/amd64 ./build.sh ../your-zmk-config --pristine
+./build.sh validate ../your-zmk-config
+./build.sh ../your-zmk-config
 ```
 
-複数 repo を同時に build する場合は、`ZMK_DOCKER_CACHE_VOLUME` を repo ごとに変えると
-Docker 内の persistent west workspace が分離されます。通常の単体 build では既定の
-`zmk-cache` のままで問題ありません。
+Windows は Git for Windows を入れ、PowerShell からは Git Bash を明示します。
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' ./build.sh ../your-zmk-config
+```
+
+AMD64/x86_64 と ARM64 で入口は同じです。image 名は firmware toolchain の意味です。
+Docker が platform を選べない場合は `ZMK_DOCKER_PLATFORM=linux/amd64` を指定します。
+複数 repo を同時 build する場合は cache volume を分けてください。
+
+### cache と log
+
+compiler cache（ccache）は同じ volume の `/workspaces/.ccache` に保存します（`ZMK_CCACHE_DIR` で変更可能）。使い捨ての build container が消えても、再利用可能な compile 結果は残ります。`CCACHE_IGNOREOPTIONS=-specs=*` は SDK の specs file 探索による cache miss を避けるための設定です。SDK は選択した Docker image に含まれるため、image / SDK を変更する場合は別の cache または `--pristine` を使ってください。`--pristine` は west workspace と compiler cache の両方を削除します。
 
 build 中の出力は host terminal の `build.log` だけでなく、build container の log stream にも
 流します。`ZMK_KEEP_CONTAINER=1` を指定すると、失敗後に `docker logs -f <container>` や
 Docker Desktop から同じ stream を確認できます。
-
-### Windows
-
-1. Docker Desktop と Git for Windows を入れます。
-2. Docker Desktop を起動し、Linux engine が使える状態まで待ちます。
-3. Git Bash から実行します。
-
-```bash
-./build.sh ../your-zmk-config --pristine
-```
-
-PowerShell から起動する場合は、`bash` が WSL に解決されることを避けるため Git Bash を明示します。
-
-```powershell
-& 'C:\Program Files\Git\bin\bash.exe' ./build.sh ../your-zmk-config --pristine
-```
-
-### macOS
-
-1. Docker Desktop または Docker Engine を入れます。
-2. Docker を起動します。
-3. Terminal から実行します。
-
-```bash
-./build.sh ../your-zmk-config --pristine
-```
-
-### Linux
-
-1. Docker Engine または Docker Desktop を入れます。
-2. user shell から `docker ps` が通る状態にします。
-3. Bash から実行します。
-
-```bash
-./build.sh ../your-zmk-config --pristine
-```
 
 ## build
 
@@ -119,7 +90,7 @@ ZMK_BUILD_JOBS=2 ./build.sh ../your-zmk-config --pristine
 `west build` が走り、Ninja がさらに compile を並列化する場合があります。cache が冷えた
 `--pristine` build や小さい runner では `--jobs 1` を使ってください。
 
-target repository には `include:` list を持つ `build.yaml` が必要です。
+target repository には `include:` list または top-level matrix を持つ `build.yaml` が必要です。
 
 ```yaml
 include:
@@ -157,10 +128,44 @@ host 側へコピーする firmware は target ごとに 1 個だけです。優
     +-- build-summary.txt
 ```
 
-例: `.build/run-2026-05-21_20-50-31-pid-1234/`
 run directory 名は output contract の一部で、`run-YYYY-MM-DD_HH-MM-SS-pid-PID` に従います。
 output check はこの命名規則に合う run directory を sort し、
 規則外の場所に `build-summary.txt` がある場合は失敗します。
+
+## option と環境変数
+
+```text
+./build.sh <zmk-config-root> [--pristine] [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
+./build.sh validate <zmk-config-root> [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
+./build.sh clean
+```
+
+| option | 意味 |
+| --- | --- |
+| `--pristine` | `west build -p` で build し、先に Docker の cache volume 全体を削除します。compiler cache もその volume にあるため一緒に消えます。 |
+| `--settings-reset` | `settings_reset` target を持たない board ごとに追加します。 |
+| `--jobs N` | `build.yaml` の target を N 個ずつ build します（既定 1）。 |
+| `-S snippet` | 全 target に snippet を追加します。 |
+| `-m module-dir` | module を追加します（「explicit module」参照）。複数指定できます。 |
+
+| 環境変数 | 意味（既定値） |
+| --- | --- |
+| `ZMK_BUILD_IMAGE` | image 全体の上書き。 |
+| `ZMK_BUILD_IMAGE_REPOSITORY` | image repository（`zmkfirmware/zmk-build-arm`）。 |
+| `ZMK_BUILD_IMAGE_TAG` | image tag（`auto`。「Docker image」参照）。 |
+| `ZMK_DOCKER_PLATFORM` | Docker の `--platform` 値。 |
+| `ZMK_DOCKER_CACHE_VOLUME` | `/workspaces` に mount する volume（`zmk-cache`）。 |
+| `ZMK_CCACHE_DIR` | container 内の ccache directory（`/workspaces/.ccache`）。 |
+| `ZMK_COPY_IGNORED` | `1` で Git が ignore する file も copy します。 |
+| `ZMK_BUILD_JOBS` | `--jobs` と同じ（1）。 |
+| `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` の試行回数（3）。 |
+| `ZMK_FALLBACK_BINARY` | `.uf2` の次に探す firmware 拡張子（`bin`）。 |
+| `ZMK_EXTRA_MODULES` | container の `ZMK_EXTRA_MODULES` に足す module path。 |
+| `ZMK_KEEP_CONTAINER` | `1` で run 後も build container を残します。 |
+| `ZMK_CONTAINER_NAME` | container 名。 |
+
+persistent west workspace は毎回 prune され、manifest に載っていない top-level の entry は削除されます。
+同じ Docker image を使う tool や repository ごとに、別の `ZMK_DOCKER_CACHE_VOLUME` を使ってください。
 
 ## validate
 
@@ -198,7 +203,7 @@ top-level matrix、include matrix、`defaults`、`exclude`、`skip`、alias key�
 CI では cache 済みの `zmk-studio-messages` と `zcbor` west project を host 側に copy し、
 両方を `-m` で渡します。同時に別の extra module も `-m` で渡し、
 `Overlaying module input west project` と `Adding module input as extra module` の両方を assert したうえで
-firmware target を 1 つ build します。
+Studio 有効の `.bin` target と settings-reset の `.hex` target を build します。
 この target は studio を有効にし、`proto/zmk` のような入れ子 path も copy されることを確認します。
 次の build では記録された overlay project 群を workspace 内 backup から復元し、Docker volume 全体は
 reset しません。
@@ -223,12 +228,14 @@ build:
 ## explicit module
 
 ```bash
-./build.sh ../your-zmk-config -m ../zmk-input-matrix
+./build.sh ../your-zmk-config -m ../local-module
 ```
 
 `-m` で渡した module は Docker 内へ copy します。directory name が west project name と一致する場合は `west update` 後にその project を local 版で上書きします。一致しない場合は `ZMK_EXTRA_MODULES` として ZMK に渡します。すべての module は `-m` で明示し、この tool の `local_modules/` は使用しません。
 
 generated west project directory は copy 元ごとに除外するため、cache 済み dependency を避けつつ、通常 module の意図した content は保持します。
+
+target や `-m` の directory が Git working tree で `git` が使える場合は、Git が表示する file だけを copy します。tracked file と、`.gitignore` に一致しない untracked file です。`artifacts/` や `web/node_modules/` のような ignore 済みの大きな directory は host に残ります。それ以外は丸ごと copy します。ignore 済み file も copy するには `ZMK_COPY_IGNORED=1` を指定します。
 
 ## clean
 
@@ -240,10 +247,27 @@ generated west project directory は copy 元ごとに除外するため、cache
 
 ## self-hosted runner
 
-通常の release gate は hosted `Compatibility` workflow です。自分の Windows / macOS /
-Linux 実機で Docker validation を確認したい場合だけ `SELF_HOSTED_RUNNERS.ja.md` を使います。
-self-hosted Docker job には OS label (`Windows`, `macOS`, `Linux`) と `zmk-docker`、
-`zmk-docker-active` が必要です。
+通常の互換性 gate は hosted `Compatibility` です。手動の `Self-hosted Build` は自分の machine で標準 fixture を
+確認する Docker smoke test です。`platform` は `macos` / `windows` / `linux` / `all`、`mode` は `validate` / `build`。
+online runner 1 台で validate、次に build を確認し、全 OS が使える場合に `all` を使います。
+
+repository の Settings → Actions → Runners → New self-hosted runner で、GitHub が表示する最新の package / token /
+登録 command を使います。既定 OS label を保持し、runner user で Docker が動くことを確認してから custom label を付けます。
+
+| host | labels |
+| --- | --- |
+| macOS | `self-hosted`, `macOS`, `zmk-docker`, `zmk-docker-active` |
+| Windows | `self-hosted`, `Windows`, `zmk-docker`, `zmk-docker-active` |
+| Linux | `self-hosted`, `Linux`, `zmk-docker`, `zmk-docker-active` |
+
+runner user で `bash .github/scripts/check-runner-tools.sh` と「保守と検証」の共通確認を実行します。
+Windows は標準 install path の Git Bash を使います。Docker Desktop は同じ account / session からの利用を確認してから
+runner を service 化します。Linux は sudo 無しの daemon access が必要で、docker group 変更後は再 login または runner 再起動が必要です。
+
+信頼できる workflow だけを self-hosted runner で動かしてください。外部 build から host を外す場合は `zmk-docker-active` を外すか
+runner を止めます。queued のままなら online / busy / 登録先 / label を確認します。Terminal で動き Actions で失敗する場合は
+account と session を比較します。tar exclude が無い場合は通常の Bash tool と PATH を確認します。
+output check は成功 status / mode / log / summary と target ごとに 1 個の firmware を確認して upload します。
 
 ## Docker image
 
@@ -325,14 +349,72 @@ offline の場合は job が queue に残ります。`concurrency` の
 
 ## script の流れ
 
-1. target repo を Docker 内の `/root/zmk-config` へ copy
+1. target repo を Docker 内の `/root/zmk-config` へ copy（Git の working tree では Git が表示する file だけ。「explicit module」参照）
 2. top-level の `.cache`、`.ccache`、`.vscode`、`build`、`dist`、`node_modules`、`out`、`tmp`、`zmk_search` などの local/generated directory は copy しない
 3. root module content があり `module.yml` だけがある legacy repo では、container 内だけで一時的な `zephyr/module.yml` に正規化する
 4. persistent west workspace へは `config/` だけ copy
 5. `ZMK_CONFIG=/root/zmk-config/config` で build し、ZMK が `config/boards` と root `boards` の両方を見られるようにする
 6. `zephyr/module.yml` がある場合は `/root/zmk-config` を `ZMK_EXTRA_MODULES` に渡す
-7. 必要なときだけ `west update`
-8. 前回の west project overlay を backup から復元してから、明示した `-m` の module override を適用
-9. `build.yaml` から生成した各 target を、必要なら target ごとの build directory で並列 build
+7. 前回の overlay を復元し、workspace の状態から `west update` の必要性を判定
+8. dependency 解決後に今回の明示 module override を適用
+9. `build.yaml` から生成した各 target を、必要なら target ごとの build directory で並列 build（cache volume 上の compiler cache を使用）
 10. target ごとに firmware artifact 1 個だけを `.build/` へ copy
 11. `build.log` と `build-summary.txt` を保存し、失敗時は summary に error excerpt を残す
+
+## 保守と検証
+
+`build.sh` は 1 config の copy / workspace / output、`scripts/auto-build-external.sh` は source list / JSON matrix /
+slug / 上限つき queue、`scripts/build-external-source.sh` は 1 source の clone / path 選択と builder 起動を担当します。
+fixture と behavior check は `.github/` に置き、変更前に [AGENTS.md](AGENTS.md) を確認します。
+
+external wrapper も `--mode build|validate`、`--pristine`、`--settings-reset`、複数の `-S` / `-m` を扱います。既定値は次のとおりです。
+
+| Environment | Default |
+| --- | --- |
+| `ZMK_EXTERNAL_MODE` | `build` |
+| `ZMK_EXTERNAL_PRISTINE` | `0` |
+| `ZMK_EXTERNAL_SETTINGS_RESET` | `0` |
+| `ZMK_EXTERNAL_SOURCE_JOBS` | `1` |
+| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external` |
+| `ZMK_EXTERNAL_CLONE_IMAGE` | `zmkfirmware/zmk-build-arm:stable` |
+| `ZMK_EXTERNAL_CLONE_ATTEMPTS` | `3` |
+| `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh` |
+
+local と CI で同じ入口を使います。
+
+```bash
+bash .github/scripts/test.sh shell
+bash .github/scripts/test.sh docker
+bash .github/scripts/test.sh build
+# すべて順番に実行する場合:
+bash .github/scripts/test.sh all
+```
+
+| 層 | 確認する契約 |
+| --- | --- |
+| `shell` | Bash 構文、LF と実際の Git checkout、空白、成果物判定、source list / queue / 失敗、host guard / help |
+| `docker` | 実際の host copy、Git ignore / opt-out、generated dependency、metadata 正規化、parser の順序と不正 schema、ccache hit、Windows clone 名の除去と copy back |
+| `build` | 標準 firmware、明示 project overlay と extra module、pristine 無しの復元、成果物の厳密な数と依存 identity |
+
+実行ごとに新しい `.build/test-<UTC>-pid-<PID>/` を作り、command、順序を保持した raw log、case ごとの結果と時間、
+実行前後の source checksum を残します。既存記録は上書きしません。`ZMK_TEST_RESULTS` で新しい保存先、
+`ZMK_DOCKER_CACHE_VOLUME` で専用の再利用 cache を指定できます。既定は新しい cache 名で、実行後に削除します。明示指定した cache は保持します。
+`ZMK_TEST_PRISTINE=1` は標準 build 前にその cache を初期化します。復元検証は必ず cache を保持します。
+共有 production cache は指定しません。Python / PyYAML は image 内のものを使い、host への追加 install は不要です。
+output checker には各 run の保存先を明示するため、並行実行で検証対象が入れ替わりません。
+
+shell 検証には Git が必要です。production builder の Git は引き続き optional です。
+`.gitattributes` と `.editorconfig` で UTF-8 / LF を統一します。LF checker は Windows の text 変換を避けて読み、
+tracked と visible untracked text の CR を拒否します。ignored output と binary は保持し、CI でも working tree を reset しません。
+
+並列数 / retry 回数は正の十進整数で、`00` も拒否します。worker の異常終了は失敗として回収し、後続 source を進めます。
+開始済み run は host setup failure にも log / summary を残し、cleanup は自分が作成した container だけを対象にします。
+
+output check は正の target 数と target ごとに 1 個の firmware を要求します。fallback は summary に記録し、旧 summary は `bin` と解釈します。
+拡張子は先頭 dot を付けず英数字 / dot / underscore / hyphen のみです。path / glob と先頭 dot / hyphen を拒否します。
+workflow upload は `.uf2` / `.hex` / `.bin` が対象なので、別形式では pattern を追加してください。
+明示 module の root content に応じて `build.cmake` / `build.kconfig` / `build.settings.*_root` の宣言が必要です。
+
+local check と remote workflow の結果は分け、変更は明示指示まで local に保持します。
+
+module metadata は Docker 内で YAML 構造として検証し、inline map も受け入れます。Windows の予約 artifact 名は、拡張子が続く場合も拒否します。

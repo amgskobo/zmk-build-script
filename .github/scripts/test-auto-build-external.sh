@@ -29,6 +29,19 @@ assert_file_contains() {
     fail "${label}: $(cat "${file}")"
 }
 
+# Bound tests of worker death and a zero-width queue without depending on GNU timeout on the host.
+run_bounded() {
+  local child timer status
+  "$@" &
+  child=$!
+  (sleep 30; kill -TERM "${child}" 2>/dev/null || true) &
+  timer=$!
+  if wait "${child}"; then status=0; else status=$?; fi
+  kill "${timer}" 2>/dev/null || true
+  wait "${timer}" 2>/dev/null || true
+  return "${status}"
+}
+
 local_one="${tmp_dir}/local-one"
 local_two="${tmp_dir}/local-two"
 local_three="${tmp_dir}/local-three"
@@ -174,6 +187,8 @@ done
 printf 'start %s\n' "${slug}" >> "${FAKE_LOG}"
 case "${slug}" in
   slow) sleep 2 ;;
+  killed) kill -KILL "${PPID}"; exit 0 ;;
+  failed) exit 7 ;;
 esac
 printf 'end %s\n' "${slug}" >> "${FAKE_LOG}"
 EOF
@@ -184,9 +199,9 @@ ZMK_EXTERNAL_SOURCE_BUILDER="${fake_builder}" \
     --path "${local_one}" --source-slug slow \
     --path "${local_two}" --source-slug fast \
     --path "${local_three}" --source-slug third \
-    --source-jobs 2 \
+    --source-jobs 02 \
     --mode validate \
-    --jobs 1 > "${tmp_dir}/rolling.out" 2>&1
+    --jobs 01 > "${tmp_dir}/rolling.out" 2>&1
 
 third_start_line="$(grep -n '^start third$' "${fake_log}" | sed -n '1s/:.*//p')"
 slow_end_line="$(grep -n '^end slow$' "${fake_log}" | sed -n '1s/:.*//p')"
@@ -194,5 +209,70 @@ slow_end_line="$(grep -n '^end slow$' "${fake_log}" | sed -n '1s/:.*//p')"
   fail "rolling source log was incomplete: $(cat "${fake_log}")"
 [ "${third_start_line}" -lt "${slow_end_line}" ] ||
   fail "source queue waited for the slow batch instead of filling an open slot: $(cat "${fake_log}")"
+
+# All-zero decimal spellings must be rejected, including queue width and clone attempts.
+for option in --jobs --source-jobs; do
+  if run_bounded bash "${builder}" --path "${missing_path}" "${option}" 00 >"${tmp_dir}/zero.out" 2>&1; then
+    fail "${option} 00 was accepted"
+  fi
+  assert_file_contains "${tmp_dir}/zero.out" 'must be a positive integer: 00' "all-zero ${option} was not rejected"
+done
+if ZMK_EXTERNAL_CLONE_ATTEMPTS=00 bash "${source_builder}" --path "${missing_path}" >"${tmp_dir}/clone-zero.out" 2>&1; then
+  fail 'all-zero clone attempts were accepted'
+fi
+assert_file_contains "${tmp_dir}/clone-zero.out" 'clone attempts must be a positive integer: 00' 'all-zero clone attempts were not rejected'
+
+# A source worker killed before it can publish a status must fail promptly and release its queue slot.
+set +e
+ZMK_EXTERNAL_SOURCE_BUILDER="${fake_builder}" FAKE_LOG="${fake_log}" \
+  run_bounded bash "${builder}" \
+    --path "${local_one}" --source-slug killed \
+    --path "${local_two}" --source-slug failed \
+    --path "${local_three}" --source-slug after-kill \
+    --source-jobs 1 >"${tmp_dir}/killed.out" 2>&1
+killed_status=$?
+set -e
+[ "${killed_status}" -eq 1 ] || fail "worker death did not finish with failure status: ${killed_status}"
+assert_file_contains "${tmp_dir}/killed.out" 'killed: failure' 'killed source was not recorded'
+assert_file_contains "${tmp_dir}/killed.out" 'failed: failure' 'ordinary child failure was not preserved'
+assert_file_contains "${tmp_dir}/killed.out" 'after-kill: success' 'queue did not continue after worker death'
+assert_file_contains "${tmp_dir}/killed.out" '=== Done: 2 failure(s) ===' 'worker failure total was incorrect'
+
+# Clone setup must never remove a pre-existing name after create fails. Later failures
+# must remove only containers created by this process, including each failed retry.
+clone_bin="${tmp_dir}/clone-bin"
+mkdir -p "${clone_bin}"
+cat > "${clone_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CLONE_TEST_LOG}"
+case "$1" in
+  info|rm) exit 0 ;;
+  create) [ "${CLONE_TEST_PHASE}" != create ] || exit 23 ;;
+  start) [ "${CLONE_TEST_PHASE}" != start ] || exit 23 ;;
+  cp) exit 23 ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${clone_bin}/docker"
+for phase in create start copy; do
+  clone_log="${tmp_dir}/clone-${phase}.commands"
+  if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE="${phase}" \
+      ZMK_EXTERNAL_CLONE_ATTEMPTS=2 bash "${source_builder}" \
+      --repo https://example.invalid/zmk-config.git --source-slug "test-clone-${phase}-$$" >"${tmp_dir}/clone-${phase}.out" 2>&1; then
+    fail "injected clone ${phase} failure was accepted"
+  fi
+  if [ "${phase}" = create ]; then
+    if grep -q '^rm ' "${clone_log}"; then fail 'a failed clone create removed an unowned container'; fi
+  else
+    expected=2
+    [ "${phase}" != copy ] || expected=1
+    actual="$(grep -c '^rm ' "${clone_log}")"
+    [ "${actual}" -eq "${expected}" ] || fail "clone ${phase} cleanup count: expected ${expected}, got ${actual}"
+  fi
+  if [ "${phase}" != copy ]; then
+    actual="$(grep -c '^create ' "${clone_log}")"
+    [ "${actual}" -eq 2 ] || fail "clone ${phase} retry count: ${actual}"
+  fi
+done
 
 echo "[test-auto-build-external] ok"

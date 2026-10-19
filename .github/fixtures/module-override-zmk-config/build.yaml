@@ -2,5 +2,10 @@ include:
   - board: nice_nano/nrf52840/zmk
     shield: corne_left nice_view_adapter
     snippet: studio-rpc-usb-uart
-    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_SPLIT=y
+    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_SPLIT=y -DCONFIG_BUILD_OUTPUT_UF2=n -DCONFIG_BUILD_OUTPUT_BIN=y -DCONFIG_BUILD_OUTPUT_HEX=n
     artifact-name: ci_module_override_zmk_studio_messages
+
+  - board: nice_nano/nrf52840/zmk
+    shield: settings_reset
+    cmake-args: -DCONFIG_BUILD_OUTPUT_UF2=n -DCONFIG_BUILD_OUTPUT_BIN=n -DCONFIG_BUILD_OUTPUT_HEX=y
+    artifact-name: ci_module_override_reset_hex

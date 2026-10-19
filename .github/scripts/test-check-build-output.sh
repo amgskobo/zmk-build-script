@@ -191,4 +191,76 @@ EOF
 touch "${run_path}/only.uf2"
 run_fail build "lower than built target count"
 
+# Exactly one selected artifact per target, including an explicitly recorded custom extension.
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 1
+Fallback binary: img
+EOF
+touch "${run_path}/selected.img"
+run_ok build
+touch "${run_path}/unexpected.uf2"
+run_fail build "exceeds built target count"
+
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 0
+EOF
+touch "${run_path}/unexpected.bin"
+run_fail build "Built targets must be positive"
+
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 1
+Fallback binary: ../escape
+EOF
+touch "${run_path}/unexpected.bin"
+run_fail build "Invalid fallback firmware extension"
+
+# Logs and summaries are never firmware, even when their suffix is selected as fallback.
+for extension in log txt; do
+  reset_case
+  write_summary <<EOF
+Status: SUCCESS
+Mode: build
+Built targets: 1
+Fallback binary: ${extension}
+EOF
+  touch "${run_path}/selected.${extension}"
+  run_ok build
+done
+
+# Reject contradictory/duplicate summary fields instead of accepting one matching line.
+for field in Status Mode 'Built targets' 'Fallback binary'; do
+  reset_case
+  write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 1
+Fallback binary: bin
+EOF
+  touch "${run_path}/selected.bin"
+  printf '%s: conflicting\n' "${field}" >> "${run_path}/build-summary.txt"
+  run_fail build "duplicate summary field: ${field}"
+done
+
+# Dots inside a directory name are legal; only a complete parent-traversal component is rejected.
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+EOF
+old_case_root="${case_root}"
+case_root="${tmp_dir}/case..name"
+mv "${old_case_root}" "${case_root}"
+run_path="${case_root}/.build/${run_name}"
+run_ok validate "${run_path}"
+run_fail validate 'run directory' "${case_root}/../case..name/.build/${run_name}"
+
 echo "check-build-output.sh behavior tests passed."
