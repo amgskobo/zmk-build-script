@@ -33,7 +33,7 @@ legacy root `module.yml` は container 内だけで正規化し、host source �
 - host CPU independent: AMD64/x86_64 host でも ARM64 host でも Docker 経由で動きます。`zmk-build-arm` の `arm` は firmware toolchain の意味で、host CPU の条件ではありません。
 - explicit module override: 各 `-m <dir>` で、同名 west project の overlay と extra ZMK module 追加の両方に対応します。`local_modules/` は無視します。
 - persistent west workspace: dependency は run 間で再利用し、target config は毎回 fresh に copy します。
-- safe overlay restore: 明示 module input の west project override は backup して、次回 build で復元します。
+- safe overlay restore: 明示 module input の west project override は backup して、次回 build で復元します。backup からのコピーが失敗した場合は build を停止し、その project の backup と overlay 記録を復旧用に保持します。
 - 再 build の高速化: compiler cache（ccache）を cache volume に永続化し、Git の working tree では Git が表示する file だけを container に copy するため、大きな ignore 済み directory が copy を遅くしません。
 - target parallel build: `--jobs N` / `ZMK_BUILD_JOBS=N` で `build.yaml` target を並列 build できます。外部 repo の full/pristine workflow では、target 並列と Ninja 内部の compile 並列が重なりすぎないように既定を 1 にします。
 - target ごとに artifact 1 個: `.uf2` を優先し、`.bin` / `.hex` fallback も扱います。
@@ -73,6 +73,9 @@ build 中の出力は host terminal の `build.log` だけでなく、build cont
 流します。`ZMK_KEEP_CONTAINER=1` を指定すると、失敗後に `docker logs -f <container>` や
 Docker Desktop から同じ stream を確認できます。
 
+作成後の build / clone 操作と後片付けは、Docker が返した固定の container ID を使います。
+実行中に同じ名前が別 container に使われても、操作先を切り替えません。
+
 ## build
 
 ```bash
@@ -107,7 +110,7 @@ include:
 | `board` | 必須。`west build -b` に渡します。 |
 | `shield` | 任意。`-DSHIELD=...` に渡します。 |
 | `snippet` | 任意。`west build -S` に渡します。 |
-| `cmake-args` | 任意。`shlex.split` で分割します。 |
+| `cmake-args` | 任意。文字列は `shlex.split` で分割し、list の各値はそのまま1引数として渡します。空引数と、引用符内／list 値の空白を保持します。 |
 | `extra-cmake-args` | 任意。`cmake-args` の後ろに追加します。 |
 | `artifact-name` | 任意。出力 base name です。 |
 | `skip` | 任意。`include:` entry で true の場合、その target を無視します。 |
@@ -233,6 +236,9 @@ build:
 
 `-m` で渡した module は Docker 内へ copy します。directory name が west project name と一致する場合は `west update` 後にその project を local 版で上書きします。一致しない場合は `ZMK_EXTRA_MODULES` として ZMK に渡します。すべての module は `-m` で明示し、この tool の `local_modules/` は使用しません。
 
+`module/.` のような入力は directory の path を解決してから名前を扱います。
+空白を含む名前も全体を比較し、同じ directory name だけを重複として拒否します。
+
 generated west project directory は copy 元ごとに除外するため、cache 済み dependency を避けつつ、通常 module の意図した content は保持します。
 
 target や `-m` の directory が Git working tree で `git` が使える場合は、Git が表示する file だけを copy します。tracked file と、`.gitignore` に一致しない untracked file です。`artifacts/` や `web/node_modules/` のような ignore 済みの大きな directory は host に残ります。それ以外は丸ごと copy します。ignore 済み file も copy するには `ZMK_COPY_IGNORED=1` を指定します。
@@ -307,6 +313,8 @@ slug ごとに clone directory、Docker cache volume、container name、artifact
 URL source の clone も Docker container 内で行い、host へは `docker cp` で戻すため、
 host 側の追加必須依存は増やしません。URL clone は既定で 3 回 retry します。
 回数は `ZMK_EXTERNAL_CLONE_ATTEMPTS=N` で調整できます。
+host の clone 先を削除できない場合は、取得・コピーを始めず停止します。
+古い file が新しい source に混ざることを防ぎます。
 source list では
 `repo:<url>` / `path:<dir>` prefix も使えます。relative path は list file の場所からの
 相対 path として扱います。local で複数 source を回す場合、`--source-jobs N` /
@@ -355,8 +363,15 @@ offline の場合は job が queue に残ります。`concurrency` の
 4. persistent west workspace へは `config/` だけ copy
 5. `ZMK_CONFIG=/root/zmk-config/config` で build し、ZMK が `config/boards` と root `boards` の両方を見られるようにする
 6. `zephyr/module.yml` がある場合は `/root/zmk-config` を `ZMK_EXTRA_MODULES` に渡す
-7. 前回の overlay を復元し、workspace の状態から `west update` の必要性を判定
-8. dependency 解決後に今回の明示 module override を適用
+7. 前回の overlay を復元し、workspace の状態から `west update` の必要性を判定。
+   古い workspace root の削除には、完全に取得できた west project 一覧だけを使います。
+   一覧が取得不能・不完全なら cache を保持して更新し、更新失敗後も完全な一覧を確認できなければ続行しません。
+   cache の判定には west が import を解決した依存定義を使い、取り込んだ定義の変更でも更新します。
+   manifest の解決に失敗した状態は検証済みと記録しません。
+   更新全体の成功時だけ依存 cache を検証済みとし、失敗・中断時は不完全な directory が残っていても次回更新を再試行します。
+   旧形式の cache 記録も、一度更新してから再利用します。
+   local override で続行できるのは、最終試行で失敗した全 project を特定でき、それらを明示 input が満たす場合だけです。
+8. dependency 解決後に今回の明示 module override を適用。コピー開始前に復元記録を残し、中断後も元へ戻せるようにします。
 9. `build.yaml` から生成した各 target を、必要なら target ごとの build directory で並列 build（cache volume 上の compiler cache を使用）
 10. target ごとに firmware artifact 1 個だけを `.build/` へ copy
 11. `build.log` と `build-summary.txt` を保存し、失敗時は summary に error excerpt を残す
@@ -393,11 +408,13 @@ bash .github/scripts/test.sh all
 | 層 | 確認する契約 |
 | --- | --- |
 | `shell` | Bash 構文、LF と実際の Git checkout、空白、成果物判定、source list / queue / 失敗、host guard / help |
-| `docker` | 実際の host copy、Git ignore / opt-out、generated dependency、metadata 正規化、parser の順序と不正 schema、ccache hit、Windows clone 名の除去と copy back |
+| `docker` | 実際の host copy、Git ignore / opt-out、generated dependency、metadata 正規化、parser の順序と不正 schema、overlay / update の失敗と復旧、retry と stale lock、path 判定、ccache hit、Windows clone 名の除去と copy back |
 | `build` | 標準 firmware、明示 project overlay と extra module、pristine 無しの復元、成果物の厳密な数と依存 identity |
 
 実行ごとに新しい `.build/test-<UTC>-pid-<PID>/` を作り、command、順序を保持した raw log、case ごとの結果と時間、
-実行前後の source checksum を残します。既存記録は上書きしません。`ZMK_TEST_RESULTS` で新しい保存先、
+実行前後の source checksum を残します。既存記録は上書きしません。`ZMK_TEST_RESULTS` で repository の外、
+または Git が directory 全体を ignore する新しい保存先を選べます。ignore されない内部の保存先は、
+log 自体が source checksum に混ざるため検証開始前に拒否します。
 `ZMK_DOCKER_CACHE_VOLUME` で専用の再利用 cache を指定できます。既定は新しい cache 名で、実行後に削除します。明示指定した cache は保持します。
 `ZMK_TEST_PRISTINE=1` は標準 build 前にその cache を初期化します。復元検証は必ず cache を保持します。
 共有 production cache は指定しません。Python / PyYAML は image 内のものを使い、host への追加 install は不要です。
@@ -417,4 +434,4 @@ workflow upload は `.uf2` / `.hex` / `.bin` が対象なので、別形式で�
 
 local check と remote workflow の結果は分け、変更は明示指示まで local に保持します。
 
-module metadata は Docker 内で YAML 構造として検証し、inline map も受け入れます。Windows の予約 artifact 名は、拡張子が続く場合も拒否します。
+module metadata は persistent workspace の変更 / 依存更新前に Docker 内で YAML 構造として検証し、inline map も受け入れます。Windows の予約 artifact 名は、拡張子が続く場合も拒否します。

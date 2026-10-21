@@ -9,6 +9,14 @@ mkdir -p .build
 result_dir="${ZMK_TEST_RESULTS:-.build/test-$(date -u +%Y%m%dT%H%M%SZ)-pid-$$}"
 mkdir "${result_dir}" || { echo "Evidence directory must be new: ${result_dir}" >&2; exit 1; }
 result_dir="$(cd "${result_dir}" && pwd -P)"
+case "${result_dir}/" in
+  "${repo_root}/"*)
+    if ! git check-ignore -q -- "${result_dir#"${repo_root}/"}/"; then
+      echo "Evidence inside the repository must be Git-ignored: ${result_dir}" >&2
+      rmdir "${result_dir}"
+      exit 1
+    fi ;;
+esac
 export ZMK_TEST_RESULTS="${result_dir}"
 cache_supplied="${ZMK_DOCKER_CACHE_VOLUME:-}"
 cache_owned=0

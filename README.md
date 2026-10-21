@@ -41,7 +41,8 @@ the current root layout. The source repo is not modified.
 - Persistent west workspace: dependencies are reused between runs, while the
   target config is copied fresh each time.
 - Safe overlay restore: explicit module-input west project overrides are backed up and restored
-  on the next build.
+  on the next build. If copying a backup fails, the build stops and retains that
+  project's backup and overlay record for recovery.
 - Fast repeat builds: a persistent compiler cache (ccache) lives on the cache
   volume, and only the files Git shows are copied into the container, so large
   ignored directories do not slow the copy.
@@ -95,6 +96,9 @@ Build output is also mirrored into the build container's own log stream. With
 `ZMK_KEEP_CONTAINER=1`, you can inspect the same stream later with
 `docker logs -f <container>` or Docker Desktop.
 
+After creation, build and clone operations address the returned container ID,
+including cleanup. Reusing a container name cannot redirect an in-progress run.
+
 ## Build
 
 ```bash
@@ -130,7 +134,7 @@ Supported per-target keys:
 | `board` | Required. Passed to `west build -b`. |
 | `shield` | Optional. Passed as `-DSHIELD=...`. |
 | `snippet` | Optional. Passed with `west build -S`. |
-| `cmake-args` | Optional. Parsed with `shlex.split`. |
+| `cmake-args` | Optional. Strings are parsed with `shlex.split`; list entries are literal arguments. Empty strings and quoted/list whitespace are preserved. |
 | `extra-cmake-args` | Optional. Appended after `cmake-args`. |
 | `artifact-name` | Optional output base name. |
 | `skip` | Optional for `include:` entries. Skips the target when true. |
@@ -267,6 +271,10 @@ west project name, that project is overlaid after `west update`. Otherwise it is
 passed to ZMK through `ZMK_EXTRA_MODULES`. Pass every module explicitly with
 `-m`; this tool does not load `local_modules/`.
 
+Directory paths such as `module/.` are normalized before naming. Names are
+compared in full, including spaces; only identical directory names are rejected
+as duplicates.
+
 Generated west project directories are filtered per copy source, so cached
 dependencies are skipped without dropping intentional module content.
 
@@ -359,7 +367,9 @@ matrix. Each source job starts one `build.sh` process via
 cache volumes, container names, and artifact uploads. URL sources are cloned in a
 Docker container and copied back to the host with `docker cp`, so no extra
 required host dependency is added. URL clone is retried 3 times by default; set
-`ZMK_EXTERNAL_CLONE_ATTEMPTS=N` to adjust it. Source lists also support
+`ZMK_EXTERNAL_CLONE_ATTEMPTS=N` to adjust it. If the host clone destination cannot
+be cleared, the wrapper stops before cloning or copying so stale files cannot be
+merged into the new source. Source lists also support
 `repo:<url>` / `path:<dir>` prefixes. Relative paths are resolved from the
 source list file's directory. For local multi-source runs, `--source-jobs N` /
 `ZMK_EXTERNAL_SOURCE_JOBS=N` controls how many source processes may run at once;
@@ -416,7 +426,18 @@ host, remove its `zmk-docker-active` label or stop the runner.
 6. If `zephyr/module.yml` exists, passes `/root/zmk-config` through
    `ZMK_EXTRA_MODULES`.
 7. Restores previous overlays before deciding whether the workspace needs `west update`.
-8. Applies the current explicit module overrides after dependency resolution.
+   Prunes obsolete workspace roots only after obtaining a complete west project
+   list. An unavailable or partial list preserves the cache and requires an update;
+   a failed update cannot continue without a complete project list.
+   Cache validation uses west's resolved manifest, including imported dependency
+   definitions. Changes to those definitions trigger an update; an unresolved
+   manifest cannot mark the cache ready. Only a complete update verifies the cache.
+   Failed/interrupted updates are retried on the next build even if partial checkout
+   directories exist. Older cache markers trigger a fresh verification once.
+   Continuation with local overrides requires every failed project from the final
+   attempt to be identified and supplied locally.
+8. Applies the current explicit module overrides after dependency resolution,
+   recording recovery before copying so interrupted overlays can be restored.
 9. Builds each generated `build.yaml` target, optionally in parallel with one
    build directory per target, using the compiler cache on the cache volume.
 10. Copies one firmware artifact per target back to `.build/`.
@@ -458,12 +479,14 @@ bash .github/scripts/test.sh all
 | Layer | Contracts |
 | --- | --- |
 | `shell` | Bash syntax, LF and Git checkout behavior, whitespace, output validation, source lists/queue/failures, host guards and help |
-| `docker` | Actual host copy, Git ignore and opt-outs, generated dependencies, metadata normalization, exact parser traces and invalid schema, ccache hits, Windows clone pruning and copy back |
+| `docker` | Actual host copy, Git ignore and opt-outs, generated dependencies, metadata normalization, exact parser traces and invalid schema, controlled overlay/update failure and recovery, retries and stale locks, path guards, ccache hits, Windows clone pruning and copy back |
 | `build` | Standard firmware targets, explicit project overlays plus an extra module, restoration without pristine, exact output count and dependency identities |
 
 Each invocation creates `.build/test-<UTC>-pid-<PID>/` with commands, ordered raw
 logs, per-case status/timing and source checksums before/after. Existing evidence
-is never overwritten. `ZMK_TEST_RESULTS` can select a new directory;
+is never overwritten. `ZMK_TEST_RESULTS` can select a new directory outside the
+repository or inside a Git-ignored directory; visible in-tree evidence is rejected
+before testing because it would be included in source checksums.
 `ZMK_DOCKER_CACHE_VOLUME` can select a dedicated reusable test cache. The default
 is a fresh cache name, removed after the run; an explicitly supplied cache is retained. `ZMK_TEST_PRISTINE=1` resets that test cache before the
 standard build; restoration always keeps it. Never point tests at a shared
@@ -489,7 +512,8 @@ underscores and hyphens; paths, globs and leading dot/hyphen are rejected.
 Workflow uploads cover `.uf2`, `.hex`, `.bin`; add a pattern for other formats.
 Explicit module roots require `build.cmake`, `build.kconfig`, and the applicable
 `build.settings.*_root` declarations for root content. Module metadata is parsed
-as YAML inside Docker, including inline maps. Windows reserved artifact names
+as YAML inside Docker, including inline maps, before changing the persistent
+workspace or updating dependencies. Windows reserved artifact names
 are rejected even when followed by an extension.
 
 Local checks and remote workflows are separate results; changes remain local

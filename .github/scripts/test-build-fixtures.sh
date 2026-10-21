@@ -9,8 +9,15 @@ cd "${repo_root}"
 : "${ZMK_DOCKER_CACHE_VOLUME:?A dedicated cache is required}"
 scratch="$(mktemp -d "${repo_root}/.build/zmk-firmware-test.XXXXXX")"
 containers=()
+container_logs=()
 cleanup() {
-  local container
+  local container log
+  # Keep only immutable IDs actually returned by create, never a requested name.
+  for log in ${container_logs[@]+"${container_logs[@]}"}; do
+    [ -f "${log}" ] || continue
+    container="$(tr -d '\r' < "${log}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+    [ -z "${container}" ] || containers+=("${container}")
+  done
   for container in ${containers[@]+"${containers[@]}"}; do docker rm -f "${container}" >/dev/null 2>&1 || true; done
   rm -rf "${scratch}"
 }
@@ -18,6 +25,7 @@ trap cleanup EXIT
 build_case() {
   local name="$1" run
   shift
+  container_logs+=("${ZMK_TEST_RESULTS}/${name}.log")
   bash build.sh "$@" | tee "${ZMK_TEST_RESULTS}/${name}.log"
   run="$(sed $'s/\033\[[0-9;]*m//g' "${ZMK_TEST_RESULTS}/${name}.log" | tail -n 1 | tr -d '\r')"
   bash .github/scripts/check-build-output.sh build "${run}"
@@ -31,46 +39,46 @@ build_case() {
       test -f "${run}/ci_module_override_reset_hex.hex" ;;
   esac
   printf '%s\t%s\n' "${name}" "${run}" >> "${ZMK_TEST_RESULTS}/firmware-runs.tsv"
+  last_container="$(tr -d '\r' < "${ZMK_TEST_RESULTS}/${name}.log" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+  [ -n "${last_container}" ] || { echo 'build did not return a container ID' >&2; return 1; }
 }
 pristine=()
 [ "${ZMK_TEST_PRISTINE:-0}" != 1 ] || pristine+=(--pristine)
 build_case standard .github/fixtures/ci-zmk-config --jobs "${ZMK_BUILD_JOBS:-1}" ${pristine[@]+"${pristine[@]}"}
 cache_reader="zmk-test-cache-$$"
 # Record ownership only after create succeeds.
-docker create --name "${cache_reader}" -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces" \
-  "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" >/dev/null
-containers+=("${cache_reader}")
+cache_reader_id="$(docker create --name "${cache_reader}" -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces" \
+  "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" | tr -d '\r')"
+containers+=("${cache_reader_id}")
 # Use the same native host-path conversion as external clone.
 source scripts/build-external-source.sh
 host_scratch="$(docker_host_path "${scratch}")"
-docker cp "${cache_reader}:/workspaces/zmk-config/modules/msgs/zmk-studio-messages" "${host_scratch}/"
-docker cp "${cache_reader}:/workspaces/zmk-config/modules/lib/zcbor" "${host_scratch}/"
+docker cp "${cache_reader_id}:/workspaces/zmk-config/modules/msgs/zmk-studio-messages" "${host_scratch}/"
+docker cp "${cache_reader_id}:/workspaces/zmk-config/modules/lib/zcbor" "${host_scratch}/"
 touch "${scratch}/zmk-studio-messages/.ci-local-override" "${scratch}/zcbor/.ci-local-override"
 extra="${scratch}/zmk-feature-ci-extra"
 mkdir -p "${extra}/zephyr" "${extra}/boards/shields/ci-extra" "${extra}/snippets/ci-extra"
 printf 'name: zmk-feature-ci-extra\nbuild: {settings: {board_root: ., snippet_root: .}}\n' > "${extra}/zephyr/module.yml"
 printf 'name: ci-extra\n' > "${extra}/snippets/ci-extra/snippet.yml"
 overlay="zmk-test-overlay-$$"
-containers+=("${overlay}")
 ZMK_KEEP_CONTAINER=1 ZMK_CONTAINER_NAME="${overlay}" build_case overlay .github/fixtures/module-override-zmk-config \
   -m "${scratch}/zmk-studio-messages" -m "${scratch}/zcbor" -m "${extra}"
 for pair in zmk-studio-messages:msgs zcbor:lib; do
   project="${pair%:*}"; parent="${pair#*:}"
   grep -F "Overlaying module input west project: ${project} -> modules/${parent}/${project}" "${ZMK_TEST_RESULTS}/overlay.log"
-  docker exec "${overlay}" test -f "/workspaces/zmk-config/modules/${parent}/${project}/.ci-local-override"
+  docker exec "${last_container}" test -f "/workspaces/zmk-config/modules/${parent}/${project}/.ci-local-override"
 done
 grep -F 'Adding module input as extra module: zmk-feature-ci-extra' "${ZMK_TEST_RESULTS}/overlay.log"
 restore="zmk-test-restore-$$"
-containers+=("${restore}")
 # Never pass --pristine: the previous workspace is the subject of this assertion.
 ZMK_KEEP_CONTAINER=1 ZMK_CONTAINER_NAME="${restore}" build_case restore .github/fixtures/module-override-zmk-config
 for pair in zmk-studio-messages:msgs zcbor:lib; do
   project="${pair%:*}"; parent="${pair#*:}"
   grep -F "Restoring previous module input overlay from backup: ${project} -> modules/${parent}/${project}" "${ZMK_TEST_RESULTS}/restore.log"
-  docker exec "${restore}" test ! -e "/workspaces/zmk-config/modules/${parent}/${project}/.ci-local-override"
+  docker exec "${last_container}" test ! -e "/workspaces/zmk-config/modules/${parent}/${project}/.ci-local-override"
 done
-docker exec "${restore}" sh -c 'cd /workspaces/zmk-config; west list -f "{name} {revision} {path}"; west forall -c "git rev-parse HEAD"' \
+docker exec "${last_container}" sh -c 'cd /workspaces/zmk-config; west list -f "{name} {revision} {path}"; west forall -c "git rev-parse HEAD"' \
   > "${ZMK_TEST_RESULTS}/dependencies.txt"
-docker logs "${restore}" > "${ZMK_TEST_RESULTS}/container-build-stream.log" 2>&1
+docker logs "${last_container}" > "${ZMK_TEST_RESULTS}/container-build-stream.log" 2>&1
 grep -F 'Build complete: 2 target(s).'  "${ZMK_TEST_RESULTS}/container-build-stream.log"
 echo 'Firmware build/overlay/restore contracts passed.'

@@ -247,9 +247,19 @@ cat > "${clone_bin}/docker" <<'EOF'
 printf '%s\n' "$*" >> "${CLONE_TEST_LOG}"
 case "$1" in
   info|rm) exit 0 ;;
-  create) [ "${CLONE_TEST_PHASE}" != create ] || exit 23 ;;
+  create)
+    [ "${CLONE_TEST_PHASE}" != create ] || exit 23
+    counter="${CLONE_TEST_LOG}.count"
+    attempt=0
+    [ ! -f "${counter}" ] || read -r attempt < "${counter}"
+    attempt=$((attempt + 1))
+    printf '%s\n' "${attempt}" > "${counter}"
+    printf '%064d\n' "${attempt}" ;;
   start) [ "${CLONE_TEST_PHASE}" != start ] || exit 23 ;;
-  cp) exit 23 ;;
+  cp)
+    [ "${CLONE_TEST_PHASE}" = success ] || exit 23
+    mkdir -p "$3"
+    printf 'fresh source\n' > "$3/fresh.txt" ;;
   *) exit 99 ;;
 esac
 EOF
@@ -268,11 +278,69 @@ for phase in create start copy; do
     [ "${phase}" != copy ] || expected=1
     actual="$(grep -c '^rm ' "${clone_log}")"
     [ "${actual}" -eq "${expected}" ] || fail "clone ${phase} cleanup count: expected ${expected}, got ${actual}"
+    for ((attempt=1; attempt<=expected; attempt++)); do
+      expected_id="$(printf '%064d' "${attempt}")"
+      grep -qx "rm -f ${expected_id}" "${clone_log}" || fail "clone ${phase} cleanup used a replaceable name: $(cat "${clone_log}")"
+      grep -qx "start -a ${expected_id}" "${clone_log}" || fail "clone ${phase} start used a replaceable name: $(cat "${clone_log}")"
+    done
+    if [ "${phase}" = copy ]; then
+      grep -q "^cp ${expected_id}:/tmp/source/\. " "${clone_log}" || fail "clone copy used a replaceable name: $(cat "${clone_log}")"
+    fi
   fi
   if [ "${phase}" != copy ]; then
     actual="$(grep -c '^create ' "${clone_log}")"
     [ "${actual}" -eq 2 ] || fail "clone ${phase} retry count: ${actual}"
   fi
 done
+
+# A failed removal must not merge a fresh clone into stale host content.
+clone_parent="${tmp_dir}/clone-clear"
+clone_target="${clone_parent}/blocked"
+mkdir -p "${clone_target}"
+printf 'stale source\n' > "${clone_target}/stale.txt"
+clone_real_rm="$(command -v rm)"
+cat > "${clone_bin}/rm" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "${arg}" = "${CLONE_FAIL_RM_TARGET}" ]; then
+    echo 'injected clone cleanup failure' >&2
+    exit 23
+  fi
+done
+exec "${CLONE_REAL_RM}" "$@"
+EOF
+chmod +x "${clone_bin}/rm"
+clone_log="${tmp_dir}/clone-clear.commands"
+if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=copy \
+    CLONE_FAIL_RM_TARGET="${clone_target}" CLONE_REAL_RM="${clone_real_rm}" \
+    bash -c 'source "$1"; WORK_DIR="$2"; main --repo https://example.invalid/config.git --source-slug blocked' \
+    _ "${source_builder}" "${clone_parent}" >"${tmp_dir}/clone-clear.out" 2>&1; then
+  fail 'failed clone destination cleanup was accepted'
+fi
+assert_file_contains "${tmp_dir}/clone-clear.out" 'injected clone cleanup failure' 'cleanup injection did not run'
+[ -f "${clone_target}/stale.txt" ] || fail 'cleanup injection did not preserve stale source'
+if grep -q '^create ' "${clone_log}"; then
+  fail "clone started after destination cleanup failed: $(cat "${clone_log}")"
+fi
+
+# Once cleanup works again, no stale file may reach the builder.
+rm "${clone_bin}/rm"
+clone_probe="${tmp_dir}/clone-probe.sh"
+cat > "${clone_probe}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ ! -e "$1/stale.txt" ]
+grep -qx 'fresh source' "$1/fresh.txt"
+EOF
+chmod +x "${clone_probe}"
+if ! PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=success \
+    bash -c 'source "$1"; WORK_DIR="$2"; BUILD_SCRIPT="$3"; main --repo https://example.invalid/config.git --source-slug blocked --mode build' \
+    _ "${source_builder}" "${clone_parent}" "${clone_probe}" >"${tmp_dir}/clone-recovered.out" 2>&1; then
+  fail "clone did not recover after destination cleanup was repaired: $(cat "${tmp_dir}/clone-recovered.out")"
+fi
+[ ! -e "${clone_target}" ] || fail 'successful clone left its host copy behind'
+[ "$(grep -c '^create ' "${clone_log}")" = 1 ] || fail 'failed cleanup started an extra clone'
+expected_id="$(printf '%064d' 1)"
+grep -qx "rm -f ${expected_id}" "${clone_log}" || fail 'recovered clone lost container ownership'
 
 echo "[test-auto-build-external] ok"

@@ -168,8 +168,9 @@ write_github_step_summary() {
 
 cleanup_clone_container() {
     [ "${clone_container_created:-0}" = 1 ] || return 0
-    docker_no_pathconv rm -f "${clone_container_name}" >/dev/null 2>&1 || true
+    docker_no_pathconv rm -f "${clone_container_id}" >/dev/null 2>&1 || true
     clone_container_created=0
+    clone_container_id=""
 }
 
 clone_repo_with_docker() {
@@ -180,6 +181,7 @@ clone_repo_with_docker() {
     mkdir -p "${clone_parent}"
     clone_container_name="zmk-source-clone-${slug:0:80}-pid-$$"
     clone_container_created=0
+    clone_container_id=""
     trap cleanup_clone_container EXIT
     host_is_windows && prune_clone_paths=1
 
@@ -187,21 +189,37 @@ clone_repo_with_docker() {
     echo "[source:${slug}] Cloning: ${source}"
     attempt=1
     while [ "${attempt}" -le "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; do
-        rm -rf "${clone_dir}"
-        if docker_no_pathconv create --name "${clone_container_name}" \
+        if ! rm -rf "${clone_dir}"; then
+            echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
+            clone_container_name=""
+            trap - EXIT
+            return 1
+        fi
+        if clone_container_id="$(docker_no_pathconv create --name "${clone_container_name}" \
             "${ZMK_EXTERNAL_CLONE_IMAGE}" \
             /bin/bash -lc "$(declare -f prune_windows_clone_paths)"'
                 git clone --depth=1 "$1" /tmp/source || exit "$?"
                 [ "$2" != 1 ] || prune_windows_clone_paths /tmp/source "$3"
             ' \
-            _ "${source}" "${prune_clone_paths}" "${slug}" >/dev/null; then
+            _ "${source}" "${prune_clone_paths}" "${slug}" | tr -d '\r')"; then
+            if [ "${#clone_container_id}" -ne 64 ] || [[ "${clone_container_id}" == *[!0-9a-f]* ]]; then
+                echo "ERROR: Docker create did not return a clone container ID" >&2
+                clone_container_id=""
+                trap - EXIT
+                return 1
+            fi
             clone_container_created=1
-            if docker_no_pathconv start -a "${clone_container_name}"; then
+            if docker_no_pathconv start -a "${clone_container_id}"; then
                 break
             fi
         fi
         cleanup_clone_container
-        rm -rf "${clone_dir}"
+        if ! rm -rf "${clone_dir}"; then
+            echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
+            clone_container_name=""
+            trap - EXIT
+            return 1
+        fi
         if [ "${attempt}" -ge "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; then
             clone_container_name=""
             trap - EXIT
@@ -212,7 +230,7 @@ clone_repo_with_docker() {
     done
     mkdir -p "${clone_dir}"
     clone_dir_for_docker="$(docker_host_path "${clone_dir}")"
-    if ! docker_no_pathconv cp "${clone_container_name}:/tmp/source/." "${clone_dir_for_docker}"; then
+    if ! docker_no_pathconv cp "${clone_container_id}:/tmp/source/." "${clone_dir_for_docker}"; then
         cleanup_clone_container
         clone_container_name=""
         trap - EXIT

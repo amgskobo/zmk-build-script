@@ -12,13 +12,17 @@ mkdir -p "${tmp_parent}"
 tmp_dir="$(mktemp -d "${tmp_parent}/zmk-build-tests.XXXXXX")"
 tool_root="${tmp_dir}/tool-root"
 fixture="${tool_root}/.github/fixtures/ci-zmk-config"
-containers=()
+container_logs=()
 last_container=""
 
 cleanup() {
-  local container
-  for container in ${containers[@]+"${containers[@]}"}; do
-    docker rm -f "${container}" >/dev/null 2>&1 || true
+  local container log
+  # Docker create writes its immutable ID to stdout. A name collision writes no ID.
+  # Read only logs registered for our validate calls, including calls that later fail.
+  for log in ${container_logs[@]+"${container_logs[@]}"}; do
+    [ -f "${log}" ] || continue
+    container="$(tr -d '\r' < "${log}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+    [ -z "${container}" ] || docker rm -f "${container}" >/dev/null 2>&1 || true
   done
   if [ -n "${ZMK_TEST_ARTIFACT_DIR:-}" ]; then
     mkdir -p "${ZMK_TEST_ARTIFACT_DIR}/runs"
@@ -88,25 +92,26 @@ run_validate() {
   local modules=()
   for module in "$@"; do modules+=(-m "${module}"); done
   local container="zmk-copy-excludes-${scenario}-$$"
-  containers+=("${container}")
-  last_container="${container}"
   log_path="${tmp_dir}/${scenario}.log"
+  container_logs+=("${log_path}")
 
   echo "[build-contract] ${scenario}"
-  ZMK_COPY_IGNORED="${copy_ignored:-}" ZMK_CCACHE_DIR="${ccache_dir:-}" \
+  ZMK_WEST_UPDATE_ATTEMPTS=2 ZMK_COPY_IGNORED="${copy_ignored:-}" ZMK_CCACHE_DIR="${ccache_dir:-}" \
     ZMK_KEEP_CONTAINER=1 ZMK_CONTAINER_NAME="${container}" \
     bash "${tool_root}/build.sh" validate "${target}" --settings-reset ${modules[@]+"${modules[@]}"} >"${log_path}" 2>&1 ||
     { tail -n 120 "${log_path}" >&2; return 1; }
   local run
   run="$(sed $'s/\033\[[0-9;]*m//g' "${log_path}" | tail -n 1 | tr -d '\r')"
   bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${run}"
+  last_container="$(tr -d '\r' < "${log_path}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+  [ -n "${last_container}" ] || { echo 'validate did not return a container ID' >&2; return 1; }
 }
 
 run_validate_fail() {
   local scenario="$1" target="$2" expected="$3" module_arg="${4:-}" log_path
   local container="zmk-copy-excludes-${scenario}-$$"
-  containers+=("${container}")
   log_path="${tmp_dir}/${scenario}.log"
+  container_logs+=("${log_path}")
 
   echo "[build-contract] ${scenario}"
   set +e
@@ -230,6 +235,7 @@ case "$1" in
       echo "injected ${FAKE_FAILURE} failure" >&2
       exit 23
     fi
+    [ "$1" != create ] || printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     exit 0
     ;;
   exec)
@@ -275,13 +281,15 @@ fi
 EOF
 chmod +x "${fake_bin}/tar"
 
+create_tmp="${tmp_dir}/create-temporaries"
+mkdir -p "${create_tmp}"
 for phase in create start copy; do
   case "${phase}" in
     create) reason='container creation failed' ;;
     start) reason='container start failed' ;;
     copy) reason='source copy failed' ;;
   esac
-  if ZMK_TEST_REAL_TAR="${real_tar}" PATH="${fake_bin}:${PATH}" FAKE_FAILURE="${phase}" \
+  if TMPDIR="${create_tmp}" ZMK_TEST_REAL_TAR="${real_tar}" PATH="${fake_bin}:${PATH}" FAKE_FAILURE="${phase}" \
       bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/host-${phase}.log" 2>&1; then
     echo "injected host ${phase} failure was accepted" >&2
     exit 1
@@ -292,8 +300,70 @@ for phase in create start copy; do
   grep -qx "Reason: ${reason}" "${summary}"
   grep -q 'injected .* failure' "${summary%/*}/build.log"
   grep -q 'Failure excerpt' "${summary}"
+  [ "$(find "${create_tmp}" -type f | wc -l | tr -d '[:space:]')" = 0 ]
 done
 rm "${fake_bin}/tar"
+
+# Every operation after create must retain the returned identity if a name is reused.
+# This daemon model deliberately accepts either address; assertions inspect the calls.
+identity_failed=0
+cat > "${fake_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${IDENTITY_COMMANDS}"
+case "$1" in
+  create) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  start)
+    [ "${IDENTITY_PHASE}" != start ] || { echo 'injected start failure' >&2; exit 23; } ;;
+  exec)
+    case "$*" in
+      *'tar -C /root/zmk-config/.build'*) echo 'injected artifact failure' >&2; exit 23 ;;
+      *'tar --no-same-owner'*)
+        cat >/dev/null
+        [ "${IDENTITY_PHASE}" != copy ] || { echo 'injected copy failure' >&2; exit 23; } ;;
+      *'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
+      *'./build.sh validate'*) echo "injected ${IDENTITY_PHASE} failure" >&2; exit 23 ;;
+      *'./build.sh build'*) echo 'Build complete: 1 target(s).' ;;
+      *'mkdir -p /root/zmk-config'*) ;;
+      *) exit 99 ;;
+    esac ;;
+  rm) ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${fake_bin}/docker"
+dot_module="$(make_module dot-module none)"
+for phase in start copy validate artifact module; do
+  commands="${tmp_dir}/identity-${phase}.commands.log"
+  invocation=(validate "${fixture}")
+  [ "${phase}" != artifact ] || invocation=("${fixture}")
+  [ "${phase}" != module ] || invocation=(validate "${fixture}" -m "${dot_module}/.")
+  if PATH="${fake_bin}:${PATH}" IDENTITY_PHASE="${phase}" IDENTITY_COMMANDS="${commands}" \
+      ZMK_CONTAINER_NAME=replaceable-test-name bash "${tool_root}/build.sh" "${invocation[@]}" \
+      >"${tmp_dir}/identity-${phase}.log" 2>&1; then
+    echo "injected identity ${phase} failure was accepted" >&2; identity_failed=1
+  fi
+  if ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"; then
+    echo "identity ${phase}: cleanup addressed a replaceable container name" >&2; identity_failed=1
+  fi
+  if grep -v '^create ' "${commands}" | grep -q 'replaceable-test-name'; then
+    echo "identity ${phase}: an operation addressed a replaceable container name" >&2; identity_failed=1
+  fi
+  grep -q "injected ${phase} failure" "${tmp_dir}/identity-${phase}.log"
+  if [ "${phase}" = module ]; then
+    if ! grep '/root/external_modules' "${commands}" | grep -q '_ dot-module$'; then
+      echo 'module path ending in /. was copied under the wrong name' >&2; identity_failed=1
+    fi
+  fi
+  case "${phase}" in
+    start) reason='container start failed' ;;
+    copy) reason='source copy failed' ;;
+    validate|module) reason='validation failed' ;;
+    artifact) reason='artifact copy failed' ;;
+  esac
+  summary="$(find "${tool_root}/.build" -name build-summary.txt -print | sort | tail -n 1)"
+  grep -qx 'Status: FAILED' "${summary}"
+  grep -qx "Reason: ${reason}" "${summary}"
+done
 
 fake_bin="${tmp_dir}/fake-bin"
 mkdir -p "${fake_bin}"
@@ -304,6 +374,29 @@ echo "fake docker reached" >&2
 exit 42
 EOF
 chmod +x "${fake_bin}/docker"
+
+# Distinct basenames remain distinct even when one includes the other's name as a word.
+module_names_failed=0
+spaced="$(make_module 'alpha beta' none)"
+short="$(make_module beta none)"
+for order in forward reverse; do
+  module_args=(-m "${spaced}" -m "${short}")
+  [ "${order}" != reverse ] || module_args=(-m "${short}" -m "${spaced}")
+  if PATH="${fake_bin}:${PATH}" bash "${tool_root}/build.sh" validate "${fixture}" "${module_args[@]}" \
+      >"${tmp_dir}/module-names-${order}.log" 2>&1; then :; fi
+  if ! grep -q 'fake docker reached' "${tmp_dir}/module-names-${order}.log"; then
+    echo "distinct module names were rejected: ${order}" >&2; module_names_failed=1
+  fi
+done
+same="$(make_module beta none "${tmp_dir}/other-parent")"
+if PATH="${fake_bin}:${PATH}" bash "${tool_root}/build.sh" validate "${fixture}" -m "${short}" -m "${same}" \
+    >"${tmp_dir}/module-names-duplicate.log" 2>&1; then
+  echo 'duplicate module basename was accepted' >&2; module_names_failed=1
+fi
+grep -q 'duplicate module input name: beta' "${tmp_dir}/module-names-duplicate.log"
+if grep -q 'fake docker reached' "${tmp_dir}/module-names-duplicate.log"; then
+  echo 'duplicate module basename reached Docker' >&2; module_names_failed=1
+fi
 
 compat_dir="${tmp_dir}/compat-zmk-config"
 mkdir -p "${compat_dir}/config/boards"
@@ -342,6 +435,11 @@ for value in 0 00 -1 1.5 bad; do
     echo "invalid jobs accepted: ${value}" >&2; exit 1
   fi
   grep -q 'positive integer' "${tmp_dir}/jobs-${value}.log"
+  if PATH="${fake_bin}:${PATH}" ZMK_WEST_UPDATE_ATTEMPTS="${value}" \
+      bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/attempts-${value}.log" 2>&1; then
+    echo "invalid update attempts accepted: ${value}" >&2; exit 1
+  fi
+  grep -q 'ZMK_WEST_UPDATE_ATTEMPTS must be a positive integer' "${tmp_dir}/attempts-${value}.log"
 done
 for value in .bin -bin '../bin' 'bad*'; do
   if ZMK_FALLBACK_BINARY="${value}" bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/extension.log" 2>&1; then
@@ -349,6 +447,70 @@ for value in .bin -bin '../bin' 'bad*'; do
   fi
   grep -q 'invalid firmware extension' "${tmp_dir}/extension.log"
 done
+# The harness must also respect ownership when its first validate cannot start.
+# A failed create owns nothing; a later start failure still owns the returned ID.
+cat > "${fake_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${HARNESS_DOCKER_LOG}"
+case "$1" in
+  create)
+    if [ "${HARNESS_FAILURE}" = create ]; then
+      echo 'injected existing-name collision' >&2; exit 23
+    fi
+    printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  start)
+    [ "${HARNESS_FAILURE}" != start ] || { echo 'injected start failure' >&2; exit 23; } ;;
+  exec)
+    case "$*" in
+      *'mkdir -p /root/zmk-config'*) ;;
+      *'tar --no-same-owner'*|*'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
+      *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
+      *) echo 'injected payload query failure' >&2; exit 23 ;;
+    esac ;;
+  rm) exit 0 ;;
+  *) echo 'unexpected fake daemon call' >&2; exit 99 ;;
+esac
+EOF
+chmod +x "${fake_bin}/docker"
+for phase in create start probe; do
+  commands="${tmp_dir}/harness-${phase}-commands.log"
+  : > "${commands}"
+  if PATH="${fake_bin}:${PATH}" HARNESS_FAILURE="${phase}" HARNESS_DOCKER_LOG="${commands}" \
+      ZMK_TEST_ARTIFACT_DIR="${ZMK_TEST_ARTIFACT_DIR:-${tmp_dir}}/harness-${phase}" \
+      bash "${repo_root}/.github/scripts/test-build.sh" docker >"${tmp_dir}/harness-${phase}.log" 2>&1; then
+    echo "harness accepted injected ${phase} failure" >&2; exit 1
+  fi
+  grep -q '^create ' "${commands}"
+  if [ "${phase}" = create ]; then
+    grep -q 'injected existing-name collision' "${tmp_dir}/harness-${phase}.log"
+    if grep -q '^rm ' "${commands}"; then
+      echo 'harness removed a container it did not create' >&2; exit 1
+    fi
+  else
+    if [ "${phase}" = start ]; then
+      grep -q 'injected start failure' "${tmp_dir}/harness-${phase}.log"
+    else
+      grep -q 'injected payload query failure' "${tmp_dir}/harness-${phase}.log"
+      if grep -v '^create ' "${commands}" | grep -q 'zmk-copy-excludes-'; then
+        echo 'harness queried a replaceable container name' >&2; exit 1
+      fi
+    fi
+    grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"
+  fi
+done
+
+# Visible evidence would checksum itself and turn log writes into false source drift.
+runner_fixture="${tmp_dir}/runner-fixture"
+mkdir -p "${runner_fixture}/.github/scripts"
+cp "${repo_root}/.github/scripts/test.sh" "${runner_fixture}/.github/scripts/test.sh"
+git_in "${runner_fixture}" init -q
+if (cd "${runner_fixture}"; ZMK_TEST_RESULTS=visible-results bash .github/scripts/test.sh shell) \
+    >"${tmp_dir}/visible-results.log" 2>&1; then
+  echo 'visible in-tree evidence was accepted' >&2; exit 1
+fi
+grep -q 'inside the repository must be Git-ignored' "${tmp_dir}/visible-results.log"
+[ ! -d "${runner_fixture}/visible-results" ]
+[ "${identity_failed}" = 0 ] && [ "${module_names_failed}" = 0 ] || exit 1
 echo '[host-contract] passed'
   exit 0
 fi
@@ -360,7 +522,13 @@ external_west="$(make_module external-west west)"
 mkdir -p "${external_west}/zephyr" "${external_west}/boards"
 touch "${external_west}/CMakeLists.txt"
 printf 'build: {cmake: ., settings: {board_root: .}}\n' >"${external_west}/zephyr/module.yml"
-run_validate whole-copy "${target_no_west}" "${external_no_west}" "${external_west}"
+spaced_module="$(make_module 'alpha beta' none)"
+short_module="$(make_module beta none)"
+dot_module="$(make_module dot-module none)"
+run_validate whole-copy "${target_no_west}" "${external_no_west}" "${external_west}" "${spaced_module}" "${short_module}" "${dot_module}/."
+assert_payload "${last_container}" '/root/external_modules/alpha beta' keep
+assert_payload "${last_container}" /root/external_modules/beta keep
+assert_payload "${last_container}" /root/external_modules/dot-module keep
 assert_payload "${last_container}" /root/zmk-config keep
 assert_payload "${last_container}" /root/external_modules/external-no-west keep
 assert_payload "${last_container}" /root/external_modules/external-west keep
@@ -433,7 +601,7 @@ ccache_dir=
 docker exec -i "${last_container}" sh -c 'cat > /tmp/test-build-container.py' < "${repo_root}/.github/scripts/test-build-container.py"
 docker exec -i "${last_container}" sh -c 'cat > /tmp/target-shapes.yaml' < "${repo_root}/.github/fixtures/target-shapes-zmk-config/build.yaml"
 docker exec -i "${last_container}" sh -c 'cat > /tmp/source-common.sh' < "${repo_root}/scripts/source-common.sh"
-docker exec "${last_container}" python3 /tmp/test-build-container.py /tmp/target-shapes.yaml
+docker exec "${last_container}" python3 -u /tmp/test-build-container.py /tmp/target-shapes.yaml
 
 # Round-trip the actual pruned Linux tree through the same host-path helper as external clone.
 (
