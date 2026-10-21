@@ -3,8 +3,9 @@ set -euo pipefail
 
 # build-external-source.sh - URL または local path 1 件を単体 build.sh process へ渡す。
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+source "${SCRIPT_DIR}/source-common.sh"
 
 BUILD_SCRIPT="$REPO_ROOT/build.sh"
 WORK_DIR="$REPO_ROOT/.build/external"
@@ -26,92 +27,22 @@ positionals=()
 usage() {
     cat <<'EOF'
 Usage:
-  ./scripts/build-external-source.sh --repo <git-url> [--source-slug <slug>] [--jobs N]
-  ./scripts/build-external-source.sh --path <zmk-config-root> [--source-slug <slug>] [--jobs N]
-  ./scripts/build-external-source.sh <git-url-or-path> [--jobs N]
+  bash scripts/build-external-source.sh --repo <git-url> [--source-slug <slug>] [--jobs N]
+  bash scripts/build-external-source.sh --path <zmk-config-root> [--source-slug <slug>] [--jobs N]
+  bash scripts/build-external-source.sh <git-url-or-path> [--jobs N]
 
 Runs exactly one source build. Use auto-build-external.sh or GitHub Actions
 matrix to start multiple copies in parallel.
+
+Options:
+  --mode build|validate   Select firmware build or configuration validation (default: build).
+  --pristine              Reset the selected source cache before building.
+  --settings-reset        Add missing settings_reset targets.
+  -S, --snippet NAME      Append a snippet to every target; repeatable.
+  -m, --module DIR        Pass an explicit module directory; repeatable.
+
+See README.md or README.ja.md for environment variables and runner setup.
 EOF
-}
-
-trim_line() {
-    printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
-}
-
-validate_positive_int() {
-    local label="$1" value="$2"
-    case "${value}" in
-        ""|*[!0-9]*|0)
-            echo "ERROR: ${label} must be a positive integer: ${value}" >&2
-            exit 1
-            ;;
-    esac
-}
-
-is_repo_url() {
-    case "$1" in
-        http://*|https://*|ssh://*|git://*|file://*|git@*:*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
-is_absolute_path() {
-    case "$1" in
-        /*|[A-Za-z]:/*|[A-Za-z]:\\*|\\\\*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
-sanitize_slug() {
-    local value="$1" slug
-    slug="$(
-        printf '%s' "${value}" |
-            tr '\\' '/' |
-            tr '[:upper:]' '[:lower:]' |
-            sed -e 's#/#-#g' \
-                -e 's/[^a-z0-9_.-]/-/g' \
-                -e 's/--*/-/g' \
-                -e 's/^[.-]*//' \
-                -e 's/[.-]*$//'
-    )"
-    [ -n "${slug}" ] || slug="source"
-    printf '%s\n' "${slug}"
-}
-
-repo_slug_base() {
-    local url="$1" clean path
-    clean="$(trim_line "${url}")"
-    clean="${clean%/}"
-    clean="${clean%.git}"
-    case "${clean}" in
-        git@*:*)
-            path="${clean#*:}"
-            ;;
-        *://*)
-            path="${clean#*://}"
-            path="${path#*/}"
-            ;;
-        *)
-            path="${clean}"
-            ;;
-    esac
-    path="${path%.git}"
-    sanitize_slug "${path}"
-}
-
-path_slug_base() {
-    local path="$1" normalized base
-    normalized="$(trim_line "${path}")"
-    normalized="${normalized%/}"
-    normalized="$(printf '%s' "${normalized}" | tr '\\' '/')"
-    base="${normalized##*/}"
-    [ -n "${base}" ] || base="path"
-    sanitize_slug "${base}"
 }
 
 classify_source() {
@@ -236,8 +167,10 @@ write_github_step_summary() {
 }
 
 cleanup_clone_container() {
-    [ -n "${clone_container_name:-}" ] || return 0
-    docker_no_pathconv rm -f "${clone_container_name}" >/dev/null 2>&1 || true
+    [ "${clone_container_created:-0}" = 1 ] || return 0
+    docker_no_pathconv rm -f "${clone_container_id}" >/dev/null 2>&1 || true
+    clone_container_created=0
+    clone_container_id=""
 }
 
 clone_repo_with_docker() {
@@ -247,6 +180,8 @@ clone_repo_with_docker() {
     clone_parent="$(dirname "${clone_dir}")"
     mkdir -p "${clone_parent}"
     clone_container_name="zmk-source-clone-${slug:0:80}-pid-$$"
+    clone_container_created=0
+    clone_container_id=""
     trap cleanup_clone_container EXIT
     host_is_windows && prune_clone_paths=1
 
@@ -254,47 +189,37 @@ clone_repo_with_docker() {
     echo "[source:${slug}] Cloning: ${source}"
     attempt=1
     while [ "${attempt}" -le "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; do
-        rm -rf "${clone_dir}"
-        docker_no_pathconv rm -f "${clone_container_name}" >/dev/null 2>&1 || true
-        if docker_no_pathconv create --name "${clone_container_name}" \
+        if ! rm -rf "${clone_dir}"; then
+            echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
+            clone_container_name=""
+            trap - EXIT
+            return 1
+        fi
+        if clone_container_id="$(docker_no_pathconv create --name "${clone_container_name}" \
             "${ZMK_EXTERNAL_CLONE_IMAGE}" \
-            /bin/sh -lc '
+            /bin/bash -lc "$(declare -f prune_windows_clone_paths)"'
                 git clone --depth=1 "$1" /tmp/source || exit "$?"
-                [ "$2" = "1" ] || exit 0
-                pruned_file="$(mktemp)"
-                find /tmp/source -depth -print | while IFS= read -r path; do
-                    [ "${path}" != /tmp/source ] || continue
-                    base="${path##*/}"
-                    bad=0
-                    case "${base}" in
-                        *[[:space:]]|*.) bad=1 ;;
-                    esac
-                    if printf '%s\n' "${base}" | grep -Eq "[<>:\"\\\\|?*]"; then
-                        bad=1
-                    fi
-                    stem="${base%%.*}"
-                    upper="$(printf '%s' "${stem}" | tr '[:lower:]' '[:upper:]')"
-                    case "${upper}" in
-                        CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) bad=1 ;;
-                    esac
-                    [ "${bad}" = "1" ] && printf '%s\n' "${path}"
-                done > "${pruned_file}"
-                if [ -s "${pruned_file}" ]; then
-                    echo "[source:$3] Removed Windows-incompatible clone path(s) before docker cp:" >&2
-                    while IFS= read -r path; do
-                        display="${path#/tmp/source/}"
-                        rm -rf -- "${path}"
-                        echo "[source:$3]   - ${display}" >&2
-                    done < "${pruned_file}"
-                fi
-                rm -f "${pruned_file}"
+                [ "$2" != 1 ] || prune_windows_clone_paths /tmp/source "$3"
             ' \
-            _ "${source}" "${prune_clone_paths}" "${slug}" >/dev/null &&
-            docker_no_pathconv start -a "${clone_container_name}"; then
-            break
+            _ "${source}" "${prune_clone_paths}" "${slug}" | tr -d '\r')"; then
+            if [ "${#clone_container_id}" -ne 64 ] || [[ "${clone_container_id}" == *[!0-9a-f]* ]]; then
+                echo "ERROR: Docker create did not return a clone container ID" >&2
+                clone_container_id=""
+                trap - EXIT
+                return 1
+            fi
+            clone_container_created=1
+            if docker_no_pathconv start -a "${clone_container_id}"; then
+                break
+            fi
         fi
         cleanup_clone_container
-        rm -rf "${clone_dir}"
+        if ! rm -rf "${clone_dir}"; then
+            echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
+            clone_container_name=""
+            trap - EXIT
+            return 1
+        fi
         if [ "${attempt}" -ge "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; then
             clone_container_name=""
             trap - EXIT
@@ -305,7 +230,7 @@ clone_repo_with_docker() {
     done
     mkdir -p "${clone_dir}"
     clone_dir_for_docker="$(docker_host_path "${clone_dir}")"
-    if ! docker_no_pathconv cp "${clone_container_name}:/tmp/source/." "${clone_dir_for_docker}"; then
+    if ! docker_no_pathconv cp "${clone_container_id}:/tmp/source/." "${clone_dir_for_docker}"; then
         cleanup_clone_container
         clone_container_name=""
         trap - EXIT
@@ -404,94 +329,98 @@ build_single_source() {
     return 1
 }
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --repo)
-            [ "$#" -ge 2 ] || { echo "ERROR: --repo requires a value" >&2; exit 1; }
-            SOURCE_TYPE="repo"
-            SOURCE_VALUE="$2"
-            shift
-            ;;
-        --path)
-            [ "$#" -ge 2 ] || { echo "ERROR: --path requires a value" >&2; exit 1; }
-            SOURCE_TYPE="path"
-            SOURCE_VALUE="$2"
-            shift
-            ;;
-        --repo-slug|--source-slug)
-            [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
-            SOURCE_SLUG="$(sanitize_slug "$2")"
-            shift
-            ;;
-        --mode)
-            [ "$#" -ge 2 ] || { echo "ERROR: --mode requires a value" >&2; exit 1; }
-            ZMK_EXTERNAL_MODE="$2"
-            shift
-            ;;
-        -j|--jobs)
-            [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
-            BUILD_JOBS="$2"
-            shift
-            ;;
-        --pristine)
-            ZMK_EXTERNAL_PRISTINE=1
-            ;;
-        --settings-reset)
-            ZMK_EXTERNAL_SETTINGS_RESET=1
-            ;;
-        -S|--snippet)
-            [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
-            build_snippets+=("$2")
-            shift
-            ;;
-        -m|--module)
-            [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
-            build_modules+=("$2")
-            shift
-            ;;
-        --help|-h|help)
-            usage
-            exit 0
-            ;;
-        -*)
-            echo "ERROR: unknown option: $1" >&2
+main() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo)
+                [ "$#" -ge 2 ] || { echo "ERROR: --repo requires a value" >&2; exit 1; }
+                SOURCE_TYPE="repo"
+                SOURCE_VALUE="$2"
+                shift
+                ;;
+            --path)
+                [ "$#" -ge 2 ] || { echo "ERROR: --path requires a value" >&2; exit 1; }
+                SOURCE_TYPE="path"
+                SOURCE_VALUE="$2"
+                shift
+                ;;
+            --repo-slug|--source-slug)
+                [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+                SOURCE_SLUG="$(sanitize_slug "$2")"
+                shift
+                ;;
+            --mode)
+                [ "$#" -ge 2 ] || { echo "ERROR: --mode requires a value" >&2; exit 1; }
+                ZMK_EXTERNAL_MODE="$2"
+                shift
+                ;;
+            -j|--jobs)
+                [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+                BUILD_JOBS="$2"
+                shift
+                ;;
+            --pristine)
+                ZMK_EXTERNAL_PRISTINE=1
+                ;;
+            --settings-reset)
+                ZMK_EXTERNAL_SETTINGS_RESET=1
+                ;;
+            -S|--snippet)
+                [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+                build_snippets+=("$2")
+                shift
+                ;;
+            -m|--module)
+                [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+                build_modules+=("$2")
+                shift
+                ;;
+            --help|-h|help)
+                usage
+                exit 0
+                ;;
+            -*)
+                echo "ERROR: unknown option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+            *)
+                positionals+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "${SOURCE_VALUE}" ]; then
+        if [ ${#positionals[@]} -ne 1 ]; then
+            echo "ERROR: exactly one source is required" >&2
             usage >&2
             exit 1
-            ;;
-        *)
-            positionals+=("$1")
-            ;;
-    esac
-    shift
-done
-
-if [ -z "${SOURCE_VALUE}" ]; then
-    if [ ${#positionals[@]} -ne 1 ]; then
-        echo "ERROR: exactly one source is required" >&2
+        fi
+        classify_source "${positionals[0]}"
+    elif [ ${#positionals[@]} -gt 0 ]; then
+        echo "ERROR: source was specified more than once" >&2
         usage >&2
         exit 1
     fi
-    classify_source "${positionals[0]}"
-elif [ ${#positionals[@]} -gt 0 ]; then
-    echo "ERROR: source was specified more than once" >&2
-    usage >&2
-    exit 1
-fi
 
-if [ -z "${SOURCE_SLUG}" ]; then
-    if [ "${SOURCE_TYPE}" = "repo" ]; then
-        SOURCE_SLUG="$(repo_slug_base "${SOURCE_VALUE}")"
-    else
-        SOURCE_SLUG="$(path_slug_base "${SOURCE_VALUE}")"
+    if [ -z "${SOURCE_SLUG}" ]; then
+        if [ "${SOURCE_TYPE}" = "repo" ]; then
+            SOURCE_SLUG="$(repo_slug_base "${SOURCE_VALUE}")"
+        else
+            SOURCE_SLUG="$(path_slug_base "${SOURCE_VALUE}")"
+        fi
     fi
-fi
 
-case "${SOURCE_TYPE}" in
-    repo|path) ;;
-    *)
-        echo "ERROR: source type must be repo or path" >&2
-        exit 1
-        ;;
-esac
+    case "${SOURCE_TYPE}" in
+        repo|path) ;;
+        *)
+            echo "ERROR: source type must be repo or path" >&2
+            exit 1
+            ;;
+    esac
 
-build_single_source
+    build_single_source
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

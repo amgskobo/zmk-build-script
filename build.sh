@@ -49,19 +49,41 @@ Environment:
   ZMK_BUILD_IMAGE_TAG        Docker image tag (default: auto; main -> stable, v0.3 -> 3.5-branch, 4.1 -> 4.1-branch).
   ZMK_DOCKER_PLATFORM        Optional docker --platform value.
   ZMK_DOCKER_CACHE_VOLUME    Docker volume mounted at /workspaces (default: zmk-cache).
+  ZMK_CCACHE_DIR             ccache directory inside the container (default: /workspaces/.ccache, on the cache volume).
   ZMK_BUILD_JOBS             Number of build.yaml targets to build in parallel (default: 1).
   ZMK_WEST_UPDATE_ATTEMPTS   Number of west update attempts before failing (default: 3).
   ZMK_FALLBACK_BINARY        Fallback firmware extension after uf2 (default: bin).
+  ZMK_COPY_IGNORED           Set to 1 to copy files that Git ignores too (default: skipped in a Git working tree).
 EOF
 }
 
 validate_positive_int() {
     local label="$1" value="$2"
     case "${value}" in
-        ""|*[!0-9]*|0)
-            die "${label} must be a positive integer: ${value}"
-            ;;
+        ""|*[!0-9]*) ;;
+        *[1-9]*) return 0 ;;
     esac
+    die "${label} must be a positive integer: ${value}"
+}
+
+validate_firmware_extension() {
+    case "$1" in
+        ""|.*|-*|*[!A-Za-z0-9._-]*) die "invalid firmware extension: $1" ;;
+    esac
+}
+
+firmware_files() {
+    find "$1" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \
+        -o -name "*.${ZMK_FALLBACK_BINARY:-bin}" \) ! -iname build.log ! -iname build-summary.txt -print
+}
+
+name_in() {
+    local wanted="$1" candidate
+    shift
+    for candidate in "$@"; do
+        [ "${candidate}" != "${wanted}" ] || return 0
+    done
+    return 1
 }
 
 if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
@@ -74,7 +96,6 @@ if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
     OUTPUT_DIR="${OUTPUT_DIR:-${SOURCE_DIR}/.build}"
     CONFIG_DIR="${CONFIG_DIR:-config}"
     BUILD_YAML="${BUILD_YAML:-build.yaml}"
-    MANIFEST_FILE="${WORK_DIR}/${CONFIG_DIR}/west.yml"
     MANIFEST_STAMP="${WORK_DIR}/.west/manifest.sha256"
     LOCAL_OVERLAY_STAMP="${WORK_DIR}/.west/local-overlays.tsv"
     LOCAL_OVERLAY_BACKUP_DIR="${WORK_DIR}/.west/local-overlay-backups"
@@ -90,7 +111,6 @@ if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
     EXTRA_MODULE_PATHS=()
     WEST_UPDATE_FAILED=0
     WEST_UPDATE_FAILED_PROJECTS=""
-    WEST_UPDATE_MISSING_PROJECTS=""
 
     ensure_zmk_layout() {
         [ -f "${SOURCE_DIR}/${CONFIG_DIR}/west.yml" ] ||
@@ -151,7 +171,8 @@ module_yml, legacy_module_yml, cmake_path, kconfig_path, board_root, dts_root, s
 source_yml = module_yml if os.path.exists(module_yml) else legacy_module_yml
 if os.path.exists(source_yml):
     with open(source_yml, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+        data = yaml.safe_load(f)
+    data = {} if data is None else data
 else:
     data = {}
 
@@ -243,18 +264,21 @@ required_settings = [name for name in settings_arg.split() if name]
 required_build_keys = [name for name in build_keys_arg.split() if name]
 
 with open(module_yml, "r", encoding="utf-8") as f:
-    data = yaml.safe_load(f) or {}
+    data = yaml.safe_load(f)
+data = {} if data is None else data
 
 if not isinstance(data, dict):
     print(f"{label}: zephyr/module.yml must be a map.", file=sys.stderr)
     sys.exit(1)
 
-build = data.get("build") or {}
+build = data.get("build")
+build = {} if build is None else build
 if not isinstance(build, dict):
     print(f"{label}: zephyr/module.yml build must be a map.", file=sys.stderr)
     sys.exit(1)
 
-settings = build.get("settings") or {}
+settings = build.get("settings")
+settings = {} if settings is None else settings
 if not isinstance(settings, dict):
     print(f"{label}: zephyr/module.yml build.settings must be a map.", file=sys.stderr)
     sys.exit(1)
@@ -274,30 +298,25 @@ PY
         local dir="$1" entry
         shopt -s nullglob dotglob
         for entry in "${dir:?}"/*; do
-            rm -rf "${entry}"
+            if ! rm -rf "${entry}"; then
+                shopt -u nullglob dotglob
+                return 1
+            fi
         done
         shopt -u nullglob dotglob
     }
 
     copy_tree() {
-        local src="$1" dst="$2"
-        mkdir -p "${dst}"
+        local src="$1" dst="$2" exclude
+        local excludes=()
+        shift 2
+        for exclude in "$@"; do excludes+=(--exclude "${exclude}"); done
+        mkdir -p "${dst}" || return
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete "${src}/" "${dst}/"
+            rsync -a --delete ${excludes[@]+"${excludes[@]}"} "${src}/" "${dst}/"
         else
-            clear_dir "${dst}"
-            (cd "${src}" && tar cf - .) | (cd "${dst}" && tar xf -)
-        fi
-    }
-
-    copy_module_tree() {
-        local src="$1" dst="$2"
-        mkdir -p "${dst}"
-        if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete --exclude .git --exclude .build "${src}/" "${dst}/"
-        else
-            clear_dir "${dst}"
-            (cd "${src}" && tar cf - --exclude .git --exclude .build .) | (cd "${dst}" && tar xf -)
+            clear_dir "${dst}" || return
+            (cd "${src}" && tar cf - ${excludes[@]+"${excludes[@]}"} .) | (cd "${dst}" && tar xf -)
         fi
     }
 
@@ -308,61 +327,86 @@ PY
     }
 
     manifest_digest() {
+        local resolved
+        # Resolve with west so local and project imports share west's own semantics.
+        resolved="$(west manifest --resolve)" || return 1
         if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${MANIFEST_FILE}" | awk '{print $1}'
+            printf '%s\n' "${resolved}" | sha256sum | awk '{print $1}'
         else
-            cksum "${MANIFEST_FILE}" | awk '{print $1":"$2}'
+            printf '%s\n' "${resolved}" | cksum | awk '{print $1":"$2}'
         fi
+    }
+
+    manifest_stamp_value() {
+        local digest
+        digest="$(manifest_digest)" || return 1
+        printf 'complete-resolved:%s\n' "${digest}"
     }
 
     manifest_changed() {
-        [ ! -f "${MANIFEST_STAMP}" ] || [ "$(manifest_digest)" != "$(cat "${MANIFEST_STAMP}")" ]
+        local current
+        [ -f "${MANIFEST_STAMP}" ] || return 0
+        current="$(manifest_stamp_value)" || return 0
+        [ "${current}" != "$(cat "${MANIFEST_STAMP}")" ]
     }
 
     stamp_manifest() {
+        local current
+        current="$(manifest_stamp_value)" || fail "failed to resolve west manifest after dependency update"
         mkdir -p "$(dirname "${MANIFEST_STAMP}")"
-        manifest_digest > "${MANIFEST_STAMP}"
+        printf '%s\n' "${current}" > "${MANIFEST_STAMP}"
+    }
+
+    workspace_project_list() {
+        local projects
+        if ! projects="$(cd "${WORK_DIR}" && west list -f $'{name}\t{path}')"; then
+            # Preserve partial diagnostics, but never use partial output as a project set.
+            [ -z "${projects}" ] || printf '%s\n' "${projects}" >&2
+            return 1
+        fi
+        printf '%s\n' "${projects}"
     }
 
     prune_workspace_roots() {
-        cd "${WORK_DIR}"
-        local keep=" .west .build ${CONFIG_DIR} "
-        local name path root entry
-
-        if [ -d .west ] && west list >/dev/null 2>&1; then
-            while IFS=$'\t' read -r name path; do
-                [ "${name}" = "manifest" ] && continue
-                root="${path%%/*}"
-                [ -n "${root}" ] && keep="${keep}${root} "
-            done < <(west list -f $'{name}\t{path}')
+        local keep=(.west .build "${CONFIG_DIR}")
+        local projects name path root entry
+        if ! projects="$(workspace_project_list)"; then
+            log "Skipping workspace pruning because the west project list is unavailable"
+            return 1
         fi
+        while IFS=$'\t' read -r name path; do
+            [ "${name}" = "manifest" ] && continue
+            root="${path%%/*}"
+            [ -z "${root}" ] || keep+=("${root}")
+        done <<< "${projects}"
 
         shopt -s nullglob dotglob
-        for entry in "${WORK_DIR}"/* "${WORK_DIR}"/.*; do
+        for entry in "${WORK_DIR}"/*; do
             name="$(basename "${entry}")"
-            case "${name}" in
-                .|..) continue ;;
-            esac
-            [[ "${keep}" == *" ${name} "* ]] && continue
+            case "${name}" in .|..) continue ;; esac
+            name_in "${name}" "${keep[@]}" && continue
             log "Removing stale workspace entry: ${name}"
-            rm -rf "${entry}"
+            rm -rf "${entry}" || fail "failed to prune workspace entry: ${name}"
         done
         shopt -u nullglob dotglob
     }
 
     missing_workspace_projects() {
-        local name path
-        cd "${WORK_DIR}"
+        local projects name path
+        projects="$(workspace_project_list)" || return 1
         while IFS=$'\t' read -r name path; do
             [ "${name}" = "manifest" ] && continue
+            [ -n "${path}" ] || continue
             if [ ! -d "${WORK_DIR}/${path}" ] || [ -z "$(ls -A "${WORK_DIR}/${path}" 2>/dev/null)" ]; then
                 printf '%s\t%s\n' "${name}" "${path}"
             fi
-        done < <(west list -f $'{name}\t{path}')
+        done <<< "${projects}"
     }
 
     workspace_projects_missing() {
-        [ -n "$(missing_workspace_projects)" ]
+        local missing
+        missing="$(missing_workspace_projects)" || return 0
+        [ -n "${missing}" ]
     }
 
     west_update_failed_projects() {
@@ -379,7 +423,8 @@ PY
         [ "${WEST_UPDATE_FAILED:-0}" = "1" ] || return 0
 
         local missing_after missing_list="" name path failed_projects unresolved="" supplied=""
-        missing_after="$(missing_workspace_projects || true)"
+        missing_after="$(missing_workspace_projects)" ||
+            fail "cannot verify workspace project list after west update failure"
         if [ -n "${missing_after}" ]; then
             while IFS=$'\t' read -r name path; do
                 [ -n "${name}" ] || continue
@@ -389,9 +434,6 @@ PY
         fi
 
         failed_projects="${WEST_UPDATE_FAILED_PROJECTS}"
-        if [ -z "${failed_projects}" ] && [ -n "${WEST_UPDATE_MISSING_PROJECTS}" ]; then
-            failed_projects="$(printf '%s\n' "${WEST_UPDATE_MISSING_PROJECTS}" | awk -F '\t' '{print $1}')"
-        fi
         [ -n "${failed_projects}" ] ||
             fail "west update failed; refusing to continue with potentially stale dependencies"
 
@@ -407,8 +449,8 @@ PY
         [ -z "${unresolved}" ] ||
             fail "west update failed for project(s) without local override: ${unresolved}"
 
+        # Local inputs permit this build, but do not verify failed upstream checkouts.
         log "Continuing after west update failure because failed project(s) were supplied locally: ${supplied}"
-        stamp_manifest
     }
 
     clear_local_overlay_projects() {
@@ -429,23 +471,26 @@ PY
 
         while IFS=$'\t' read -r name project_path; do
             [ -n "${project_path}" ] || continue
-            case "${project_path}" in
-                /*|*..*) fail "invalid recorded module input overlay path: ${project_path}" ;;
+            case "/${project_path}/" in
+                //*|*/../*) fail "invalid recorded module input overlay path: ${project_path}" ;;
             esac
             backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
             if [ -d "${backup_path}" ]; then
                 log "Restoring previous module input overlay from backup: ${name} -> ${project_path}"
-                copy_tree "${backup_path}" "${WORK_DIR}/${project_path}"
-                rm -rf "${backup_path}"
+                # This function runs in an if condition, which disables implicit errexit.
+                # Stop before discarding recovery state when either copy backend fails.
+                copy_tree "${backup_path}" "${WORK_DIR}/${project_path}" ||
+                    fail "failed to restore module input overlay: ${name} -> ${project_path}"
+                rm -rf "${backup_path}" || fail "failed to remove restored overlay backup: ${name}"
             elif [ -e "${WORK_DIR}/${project_path}" ]; then
                 log "Clearing previous module input overlay: ${name} -> ${project_path}"
-                rm -rf "${WORK_DIR:?}/${project_path}"
+                rm -rf "${WORK_DIR:?}/${project_path}" || fail "failed to clear previous module input overlay: ${name}"
                 need_update=0
             else
                 need_update=0
             fi
         done < "${LOCAL_OVERLAY_STAMP}"
-        rm -f "${LOCAL_OVERLAY_STAMP}"
+        rm -f "${LOCAL_OVERLAY_STAMP}" || fail "failed to clear module input overlay records"
         return "${need_update}"
     }
 
@@ -485,8 +530,10 @@ PY
             need_full_update=1
         fi
 
-        prune_workspace_roots
         if clear_recorded_local_overlays; then
+            need_full_update=1
+        fi
+        if ! prune_workspace_roots; then
             need_full_update=1
         fi
         clear_local_overlay_projects
@@ -498,9 +545,10 @@ PY
         if [ "${need_full_update}" = "1" ]; then
             log "Updating west dependencies"
             validate_positive_int "ZMK_WEST_UPDATE_ATTEMPTS" "${WEST_UPDATE_ATTEMPTS}"
+            # A failed/interrupted update must never leave an old ready marker in place.
+            rm -f "${MANIFEST_STAMP}" || fail "failed to invalidate dependency update marker"
             WEST_UPDATE_FAILED=0
             WEST_UPDATE_FAILED_PROJECTS=""
-            WEST_UPDATE_MISSING_PROJECTS=""
             west_update_log="$(mktemp)"
             : > "${west_update_log}"
             for west_update_attempt in $(seq 1 "${WEST_UPDATE_ATTEMPTS}"); do
@@ -511,7 +559,7 @@ PY
                     log "Removing stale git index.lock files"
                     find "${WORK_DIR}" -path '*/.git/index.lock' -type f -exec rm -f -- {} +
                 fi
-                if west update --fetch-opt=--filter=tree:0 2>&1 | tee -a "${west_update_log}"; then
+                if west update --fetch-opt=--filter=tree:0 2>&1 | tee "${west_update_log}"; then
                     WEST_UPDATE_FAILED=0
                     break
                 fi
@@ -519,12 +567,14 @@ PY
             done
             if [ "${WEST_UPDATE_FAILED}" = "1" ]; then
                 WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
-                WEST_UPDATE_MISSING_PROJECTS="$(missing_workspace_projects || true)"
                 log "west update failed after ${WEST_UPDATE_ATTEMPTS} attempt(s); checking explicit module inputs before continuing"
             fi
             rm -f "${west_update_log}"
             west zephyr-export || true
-            [ "${WEST_UPDATE_FAILED}" = "1" ] || stamp_manifest
+            if [ "${WEST_UPDATE_FAILED}" != "1" ]; then
+                prune_workspace_roots || fail "cannot verify workspace project list after dependency update"
+                stamp_manifest
+            fi
         fi
     }
 
@@ -549,39 +599,35 @@ EOF
     }
 
     validate_module_inputs() {
-        local mod name seen=" "
+        local mod name seen=()
         while IFS= read -r mod; do
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
-            case "${seen}" in
-                *" ${name} "*) fail "duplicate module input name: ${name}" ;;
-            esac
-            seen="${seen}${name} "
+            if name_in "${name}" ${seen[@]+"${seen[@]}"}; then
+                fail "duplicate module input name: ${name}"
+            fi
+            seen+=("${name}")
             validate_module_roots "${mod}" "module input ${name}" "module"
         done < <(module_input_dirs)
     }
 
     sync_module_inputs() {
-        local mod name project_path extra_path seen=" "
+        local mod name project_path extra_path
         EXTRA_MODULE_PATHS=()
 
         while IFS= read -r mod; do
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
-            case "${seen}" in
-                *" ${name} "*) fail "duplicate module input name: ${name}" ;;
-            esac
-            seen="${seen}${name} "
-            validate_module_roots "${mod}" "module input ${name}" "module"
             if project_path="$(project_path_for_name "${name}")"; then
                 log "Overlaying module input west project: ${name} -> ${project_path}"
                 backup_module_input_overlay_project "${name}" "${project_path}"
-                copy_module_tree "${mod}" "${WORK_DIR}/${project_path}"
+                # Record recovery before the first destination mutation, including partial copy failures.
                 record_module_input_overlay "${name}" "${project_path}"
+                copy_tree "${mod}" "${WORK_DIR}/${project_path}" .git .build
             else
                 extra_path="/workspaces/module-inputs/${name}"
                 log "Adding module input as extra module: ${name}"
-                copy_module_tree "${mod}" "${extra_path}"
+                copy_tree "${mod}" "${extra_path}" .git .build
                 EXTRA_MODULE_PATHS+=("${extra_path}")
             fi
         done < <(module_input_dirs)
@@ -589,23 +635,25 @@ EOF
 
     parse_build_yaml() {
         local host_snippets="${1:-}"
-        python3 - "${SOURCE_DIR}/${BUILD_YAML}" "${host_snippets}" "${SETTINGS_RESET}" <<'PY'
+        python3 - "${SOURCE_DIR}/${BUILD_YAML}" "${host_snippets}" "${SETTINGS_RESET}" "${ZMK_FALLBACK_BINARY}" <<'PY'
 from itertools import product
 import re
 import shlex
 import sys
 import yaml
 
-yaml_path, host_snippets, settings_reset = sys.argv[1], sys.argv[2], sys.argv[3]
+yaml_path, host_snippets, settings_reset, fallback = sys.argv[1:]
 
 with open(yaml_path, "r", encoding="utf-8") as f:
-    data = yaml.safe_load(f) or {}
+    data = yaml.safe_load(f)
+data = {} if data is None else data
 
 if not isinstance(data, dict):
     print("ERROR: build.yaml must be a map.", file=sys.stderr)
     sys.exit(2)
 
-defaults = data.get("defaults") or {}
+defaults = data.get("defaults")
+defaults = {} if defaults is None else defaults
 if not isinstance(defaults, dict):
     print("ERROR: build.yaml defaults must be a map.", file=sys.stderr)
     sys.exit(2)
@@ -633,7 +681,7 @@ def raw_with_default(mapping, key):
     return raw(defaults, key)
 
 def scalar(value, key, allow_empty=False):
-    if value is None:
+    if value is None and allow_empty:
         return ""
     if isinstance(value, (str, int, float, bool)):
         text = str(value).strip()
@@ -656,7 +704,10 @@ def joined(value, key):
     if value is None:
         return ""
     if isinstance(value, list):
-        return " ".join(shlex.quote(str(item).strip()) for item in value if str(item).strip())
+        # CMake lists contain literal argv entries, including empty/padded strings.
+        items = [item if key in {"cmake-args", "extra-cmake-args"} and isinstance(item, str)
+                 else scalar(item, key) for item in value]
+        return " ".join(shlex.quote(item) for item in items)
     return scalar(value, key, allow_empty=True)
 
 def truthy(value):
@@ -671,7 +722,7 @@ def safe_name(value):
     if not value or value in {".", ".."}:
         print("ERROR: artifact-name is empty or unsafe.", file=sys.stderr)
         sys.exit(2)
-    if value.upper() in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}:
+    if value.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}:
         print(f"ERROR: artifact-name uses a Windows reserved name: {value}", file=sys.stderr)
         sys.exit(2)
     return value
@@ -729,7 +780,8 @@ targets = []
 if raw(data, "board") is not None:
     targets.extend(add_matrix_targets(data, require_board=False))
 
-entries = data.get("include") or []
+entries = data.get("include")
+entries = [] if entries is None else entries
 if not isinstance(entries, list):
     print("ERROR: build.yaml include must be a list.", file=sys.stderr)
     sys.exit(2)
@@ -740,15 +792,18 @@ for item in entries:
         sys.exit(2)
     targets.extend(add_matrix_targets(item, require_board=True))
 
-exclusions = data.get("exclude") or []
+exclusions = data.get("exclude")
+exclusions = [] if exclusions is None else exclusions
 if not isinstance(exclusions, list):
     print("ERROR: build.yaml exclude must be a list.", file=sys.stderr)
     sys.exit(2)
 
-def exclusion_matches(exclusion, target):
+for exclusion in exclusions:
     if not isinstance(exclusion, dict):
         print("ERROR: each exclude entry must be a map.", file=sys.stderr)
         sys.exit(2)
+
+def exclusion_matches(exclusion, target):
     compared = False
     for key in ("board", "shield", "snippet", "artifact-name"):
         value = raw(exclusion, key)
@@ -795,14 +850,22 @@ for target in targets:
     cmake_args = target["cmake-args"]
     artifact = target["artifact-name"]
     key = artifact.lower()
+    if f"{artifact}.{fallback}".lower() in {"build.log", "build-summary.txt"}:
+        print(f"ERROR: artifact-name collides with build log or summary: {artifact}", file=sys.stderr)
+        sys.exit(2)
     if key in seen:
         print(f"ERROR: duplicate artifact-name after normalization: {artifact}", file=sys.stderr)
         sys.exit(2)
     seen.add(key)
+    try:
+        shlex.split(cmake_args)
+    except ValueError as error:
+        print(f"ERROR: invalid cmake-args: {error}", file=sys.stderr)
+        sys.exit(2)
 
     fields = [board, shield, snippet, cmake_args, artifact]
     for field in fields:
-        if "\x1f" in field or "\n" in field or "\r" in field:
+        if any(char in field for char in "\0\x1f\n\r"):
             print("ERROR: build.yaml values may not contain control separators or newlines.", file=sys.stderr)
             sys.exit(2)
     print("\x1f".join(fields))
@@ -834,20 +897,24 @@ PY
         local decoded arg
         [ -n "${cmake_args}" ] || return 0
 
-        if ! decoded="$(python3 - "${cmake_args}" <<'PY'
+        # A NUL stream preserves empty arguments without command-substitution trimming.
+        decoded="$(mktemp)"
+        if ! python3 - "${cmake_args}" > "${decoded}" <<'PY'
 import shlex
 import sys
 
 for arg in shlex.split(sys.argv[1]):
-    print(arg)
+    sys.stdout.buffer.write(arg.encode("utf-8") + b"\0")
 PY
-)"; then
+        then
+            rm -f "${decoded}"
             fail "failed to parse cmake-args"
         fi
 
-        while IFS= read -r arg || [ -n "${arg}" ]; do
-            [ -n "${arg}" ] && build_cmd+=("${arg}")
-        done <<< "${decoded}"
+        while IFS= read -r -d '' arg; do
+            build_cmd+=("${arg}")
+        done < "${decoded}"
+        rm -f "${decoded}"
     }
 
     extra_modules_arg() {
@@ -869,7 +936,7 @@ PY
         if [ -f "${SOURCE_DIR}/zephyr/module.yml" ]; then
             append_extra_module_path "${SOURCE_DIR}"
         fi
-        for path in "${EXTRA_MODULE_PATHS[@]}"; do
+        for path in ${EXTRA_MODULE_PATHS[@]+"${EXTRA_MODULE_PATHS[@]}"}; do
             append_extra_module_path "${path}"
         done
         printf '%s' "${joined}"
@@ -950,7 +1017,8 @@ PY
         BUILD_PIDS=()
         BUILD_LOGS=()
         BUILD_ARTIFACTS=()
-        return "${failed}"
+        # Shell exit statuses wrap at 256; keep the full count as data.
+        BUILD_BATCH_FAILURES="${failed}"
     }
 
     container_validate() {
@@ -968,11 +1036,12 @@ PY
 
     container_build() {
         local host_snippets="${1:-}"
-        local targets board shield snippet cmake_args artifact built failed batch_failed target_log_dir target_log
+        local targets board shield snippet cmake_args artifact built failed target_log_dir target_log
 
         ensure_zmk_layout
         [ -f "${SOURCE_DIR}/${BUILD_YAML}" ] || fail "build.yaml not found"
         validate_positive_int "BUILD_JOBS" "${BUILD_JOBS}"
+        validate_module_inputs
         rm -rf "${OUTPUT_DIR}"
         mkdir -p "${OUTPUT_DIR}"
 
@@ -1005,22 +1074,14 @@ PY
                 BUILD_ARTIFACTS+=("${artifact}")
                 built=$((built + 1))
                 if [ ${#BUILD_PIDS[@]} -ge "${BUILD_JOBS}" ]; then
-                    if wait_for_build_batch; then
-                        batch_failed=0
-                    else
-                        batch_failed=$?
-                    fi
-                    failed=$((failed + batch_failed))
+                    wait_for_build_batch
+                    failed=$((failed + BUILD_BATCH_FAILURES))
                     [ "${failed}" = "0" ] || break
                 fi
             done < "${targets}"
             if [ "${failed}" = "0" ] && [ ${#BUILD_PIDS[@]} -gt 0 ]; then
-                if wait_for_build_batch; then
-                    batch_failed=0
-                else
-                    batch_failed=$?
-                fi
-                failed=$((failed + batch_failed))
+                wait_for_build_batch
+                failed=$((failed + BUILD_BATCH_FAILURES))
             fi
             rm -rf "${target_log_dir}"
         else
@@ -1137,17 +1198,6 @@ validate_host_layout() {
     [ -f "${TARGET_DIR}/build.yaml" ] || die "build.yaml not found"
 }
 
-module_yml_mentions_root_setting() {
-    local module_yml="$1" setting="$2"
-    grep -Eq "^[[:space:]]*${setting}:[[:space:]]*\"?\\./?\"?[[:space:]]*(#.*)?$" "${module_yml}" ||
-        grep -Eq "^[[:space:]]*${setting}:[[:space:]]*'?\\./?'?[[:space:]]*(#.*)?$" "${module_yml}"
-}
-
-module_yml_mentions_build_key() {
-    local module_yml="$1" key="$2"
-    grep -Eq "^[[:space:]]*${key}:[[:space:]]*[^[:space:]#]+" "${module_yml}"
-}
-
 validate_host_module_roots() {
     local root="$1" label="$2" kind="$3"
     local settings=() build_keys=()
@@ -1172,15 +1222,8 @@ validate_host_module_roots() {
     [ -f "${module_yml}" ] ||
         die "${label}: root module content requires zephyr/module.yml"
 
-    local setting build_key
-    for setting in "${settings[@]}"; do
-        module_yml_mentions_root_setting "${module_yml}" "${setting}" ||
-            die "${label}: root module content requires build.settings.${setting}: ."
-    done
-    for build_key in "${build_keys[@]}"; do
-        module_yml_mentions_build_key "${module_yml}" "${build_key}" ||
-            die "${label}: root module content requires build.${build_key}"
-    done
+    # YAML layout and required keys are checked structurally in the container. Grepping
+    # host-side text would reject valid inline maps and quoted keys.
 }
 
 require_host_commands() {
@@ -1195,27 +1238,30 @@ require_host_commands() {
 }
 
 require_tar_exclude() {
-    tar --help 2>&1 | grep -q -- '--exclude' ||
+    tar cf - --exclude 'zmk-capability-probe' -T /dev/null >/dev/null 2>&1 ||
         die "tar must support --exclude"
 }
 
 validate_one_module_input() {
-    local mod="$1" label_prefix="$2" name seen_ref
+    local mod="$1" label_prefix="$2" name
     [ -d "${mod}" ] || die "module input directory not found: ${mod}"
     name="$(basename "${mod}")"
-    seen_ref=" ${VALIDATED_MODULE_NAMES} "
-    case "${seen_ref}" in
-        *" ${name} "*) die "duplicate module input name: ${name}" ;;
-    esac
+    if name_in "${name}" ${VALIDATED_MODULE_NAMES[@]+"${VALIDATED_MODULE_NAMES[@]}"}; then
+        die "duplicate module input name: ${name}"
+    fi
     validate_host_module_roots "${mod}" "${label_prefix} ${name}" "module"
-    VALIDATED_MODULE_NAMES="${VALIDATED_MODULE_NAMES}${VALIDATED_MODULE_NAMES:+ }${name}"
+    VALIDATED_MODULE_NAMES+=("${name}")
 }
 
 validate_module_inputs() {
-    local mod
-    VALIDATED_MODULE_NAMES=""
-    for mod in "${MODULES[@]}"; do
+    local mod index=0
+    VALIDATED_MODULE_NAMES=()
+    for mod in ${MODULES[@]+"${MODULES[@]}"}; do
+        [ -d "${mod}" ] || die "module input directory not found: ${mod}"
+        mod="$(cd -- "${mod}" && pwd)"
         validate_one_module_input "${mod}" "module input"
+        MODULES[${index}]="${mod}"
+        index=$((index + 1))
     done
 }
 
@@ -1292,13 +1338,24 @@ run_id="run-$(date +%Y-%m-%d_%H-%M-%S)-pid-$$"
 container_name="zmk-build-${run_id}"
 container_name="${ZMK_CONTAINER_NAME:-${container_name}}"
 container_created=0
+container_id=""
+container_create_output=""
 
 cleanup_container() {
     if [ "${container_created}" = "1" ] && [ "${ZMK_KEEP_CONTAINER:-0}" != "1" ]; then
-        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+        docker rm -f "${container_id}" >/dev/null 2>&1 || true
     fi
 }
-trap cleanup_container EXIT
+finish_run() {
+    local status="$?"
+    if [ "${status}" -ne 0 ] && [ -n "${artifact_dir:-}" ] && [ "${SUMMARY_WRITTEN:-0}" != "1" ]; then
+        write_summary "FAILED" "${RUN_FAILURE_REASON:-host setup failed}" || true
+    fi
+    cleanup_container
+    [ -z "${container_create_output}" ] || rm -f "${container_create_output}"
+    return "${status}"
+}
+trap finish_run EXIT
 
 is_generated_dependency_tree() {
     local path="$1"
@@ -1309,60 +1366,108 @@ is_generated_dependency_tree() {
 
 build_tar_excludes() {
     local source_dir="${1:-${TARGET_DIR}}" generated_dir
-    SOURCE_TAR_EXCLUDES=(
-        --exclude .git
-        --exclude .west
-        --exclude './.zmk'
-        --exclude './.build'
-        --exclude './.cache'
-        --exclude './.ccache'
-        --exclude './.vscode'
-        --exclude __pycache__
-        --exclude './build'
-        --exclude './dist'
-        --exclude './node_modules'
-        --exclude './out'
-        --exclude './tmp'
-        --exclude './zmk_search'
-    )
+    # Nested VCS/cache markers are excluded at every depth. Select root entries explicitly:
+    # BSD tar treats even "./build" as an unanchored pattern and would also remove nested/build.
+    SOURCE_TAR_EXCLUDES=(--exclude .git --exclude .west --exclude __pycache__)
+    SOURCE_ROOT_EXCLUDES=(.zmk .build .cache .ccache .vscode build dist node_modules out tmp zmk_search)
     if [ -d "${source_dir}/.west" ]; then
         for generated_dir in zmk modules tools bootloader optional; do
             if is_generated_dependency_tree "${source_dir}/${generated_dir}"; then
-                SOURCE_TAR_EXCLUDES+=(--exclude "./${generated_dir}")
+                SOURCE_ROOT_EXCLUDES+=("${generated_dir}")
             fi
         done
     fi
 }
 
+is_excluded_source_root() {
+    local path="${1#./}" excluded
+    path="${path%%/*}"
+    for excluded in "${SOURCE_ROOT_EXCLUDES[@]}"; do
+        [ "${path}" != "${excluded}" ] || return 0
+    done
+    return 1
+}
+
+# Write the files of ${dir} that Git shows (tracked, plus untracked and not ignored) as a NUL-separated "./path" list.
+# Returns 1 when the list cannot be used, so that the caller copies the whole directory: ZMK_COPY_IGNORED=1, no git,
+# not a Git working tree, git failing (for example "dubious ownership"), or no file left.
+git_visible_file_list() {
+    local dir="$1" out="$2" raw file
+    [ "${ZMK_COPY_IGNORED:-0}" != "1" ] || return 1
+    command -v git >/dev/null 2>&1 || return 1
+    # BSD tar supports --null but omits it from its short help; probe an empty file list instead.
+    tar cf - --null -T /dev/null >/dev/null 2>&1 || return 1
+    raw="${out}.raw"
+    # Native git.exe does not understand MSYS paths while path conversion is off, so enter the directory first.
+    if ! (cd "${dir}" && git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+        git ls-files -z --cached --others --exclude-standard) >"${raw}" 2>/dev/null; then
+        rm -f "${raw}"
+        return 1
+    fi
+    # A tracked file deleted from the work tree is still listed; tar would fail on it.
+    while IFS= read -r -d '' file; do
+        if ! is_excluded_source_root "${file}" && { [ -e "${dir}/${file}" ] || [ -L "${dir}/${file}" ]; }; then
+            printf './%s\0' "${file}"
+        fi
+    done <"${raw}" >"${out}"
+    rm -f "${raw}"
+    [ -s "${out}" ]
+}
+
+# Write ${dir} as a tar stream. A Git working tree is copied without the files its ignore rules match (artifacts/,
+# web/node_modules/ ...), which can be gigabytes; anything else is copied whole. SOURCE_TAR_EXCLUDES apply to both.
+tar_source_dir() {
+    local dir="$1" list path name status=0
+    local entries=()
+    build_tar_excludes "${dir}"
+    list="$(mktemp "${TMPDIR:-/tmp}/zmk-source-list.XXXXXX")"
+    if git_visible_file_list "${dir}" "${list}"; then
+        echo "Copying only the files Git shows for ${dir} (ZMK_COPY_IGNORED=1 copies ignored files too)" >&2
+        (cd "${dir}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" --null -T "${list}") || status=$?
+    else
+        for path in "${dir}"/* "${dir}"/.[!.]* "${dir}"/..?*; do
+            [ -e "${path}" ] || [ -L "${path}" ] || continue
+            name="${path##*/}"
+            is_excluded_source_root "${name}" && continue
+            entries+=("./${name}")
+        done
+        if [ "${#entries[@]}" -gt 0 ]; then
+            (cd "${dir}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" "${entries[@]}") || status=$?
+        else
+            (cd "${dir}" && tar cf - --exclude '*' .) || status=$?
+        fi
+    fi
+    rm -f "${list}" "${list}.raw"
+    return "${status}"
+}
+
 copy_target_to_container() {
-    docker exec "${container_name}" mkdir -p /root/zmk-config
-    build_tar_excludes "${TARGET_DIR}"
-    (cd "${TARGET_DIR}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
-        docker exec -i "${container_name}" tar --no-same-owner -xf - -C /root/zmk-config
+    docker exec "${container_id}" mkdir -p /root/zmk-config
+    tar_source_dir "${TARGET_DIR}" |
+        docker exec -i "${container_id}" tar --no-same-owner -xf - -C /root/zmk-config
 
     tr -d '\r' < "$0" |
-        docker exec -i "${container_name}" /bin/bash -c 'cat > /root/zmk-config/build.sh && chmod +x /root/zmk-config/build.sh'
+        docker exec -i "${container_id}" /bin/bash -c 'cat > /root/zmk-config/build.sh && chmod +x /root/zmk-config/build.sh'
 
     local mod name
     [ "${#MODULES[@]}" -gt 0 ] || return 0
-    for mod in "${MODULES[@]}"; do
+    for mod in ${MODULES[@]+"${MODULES[@]}"}; do
         name="$(basename "${mod}")"
         msg "Copying module: ${name}"
-        build_tar_excludes "${mod}"
-        (cd "${mod}" && tar cf - "${SOURCE_TAR_EXCLUDES[@]}" .) |
-            docker exec -i "${container_name}" /bin/bash -c 'mkdir -p "/root/external_modules/$1" && tar --no-same-owner -xf - -C "/root/external_modules/$1"' _ "${name}"
+        tar_source_dir "${mod}" |
+            docker exec -i "${container_id}" /bin/bash -c 'mkdir -p "/root/external_modules/$1" && tar --no-same-owner -xf - -C "/root/external_modules/$1"' _ "${name}"
     done
 }
 
 copy_artifacts_from_container() {
     local artifact_dir="$1"
     mkdir -p "${artifact_dir}"
-    if ! docker exec "${container_name}" tar -C /root/zmk-config/.build -cf - . |
+    if ! docker exec "${container_id}" tar -C /root/zmk-config/.build -cf - . |
         (cd "${artifact_dir}" && tar xf -); then
         echo "failed to copy build output from the container" >&2
         return 1
     fi
-    if ! find "${artifact_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) | grep -q .; then
+    if ! firmware_files "${artifact_dir}" | grep -q .; then
         echo "no firmware artifact was copied from the container" >&2
         return 1
     fi
@@ -1384,7 +1489,7 @@ built_target_count() {
 }
 
 firmware_artifact_count() {
-    find "${artifact_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) -print |
+    firmware_files "${artifact_dir}" |
         sed '/^$/d' |
         wc -l |
         tr -d '[:space:]'
@@ -1414,6 +1519,7 @@ write_summary() {
         fi
         echo "Pristine: ${PRISTINE}"
         echo "Build jobs: ${BUILD_JOBS}"
+        echo "Fallback binary: ${ZMK_FALLBACK_BINARY:-bin}"
         echo "Extra snippets: ${HOST_SNIPPETS:-<none>}"
         if [ ${#MODULES[@]} -gt 0 ]; then
             echo "Module inputs:"
@@ -1425,8 +1531,8 @@ write_summary() {
         echo "Files"
         echo "-----"
         echo "- build.log"
-        if find "${artifact_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) | grep -q .; then
-            find "${artifact_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) |
+        if firmware_files "${artifact_dir}" | grep -q .; then
+            firmware_files "${artifact_dir}" |
                 sort |
                 while IFS= read -r file; do
                     echo "- $(basename "${file}")"
@@ -1439,12 +1545,16 @@ write_summary() {
             failure_excerpt
         fi
     } > "${artifact_dir}/build-summary.txt"
+    SUMMARY_WRITTEN=1
 }
 
 validate_host_layout
 validate_module_inputs
 validate_positive_int "build jobs" "${BUILD_JOBS}"
+validate_positive_int "ZMK_WEST_UPDATE_ATTEMPTS" "${ZMK_WEST_UPDATE_ATTEMPTS:-3}"
+validate_firmware_extension "${ZMK_FALLBACK_BINARY:-bin}"
 require_host_commands docker tar
+require_tar_exclude
 
 requested_image_tag="${ZMK_BUILD_IMAGE_TAG:-auto}"
 resolved_image_tag="${requested_image_tag}"
@@ -1455,6 +1565,8 @@ if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = "auto" ]; then
 fi
 zmk_build_image="$(resolve_docker_image "${resolved_image_tag}")"
 zmk_cache_volume="${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}"
+# ccache lives on the cache volume so that it survives the throw-away build container (see README.md).
+zmk_ccache_dir="${ZMK_CCACHE_DIR:-/workspaces/.ccache}"
 [ "${PRISTINE}" != "1" ] || docker volume rm "${zmk_cache_volume}" 2>/dev/null || true
 RUN_STARTED_AT="$(date +%s)"
 artifact_dir="${SCRIPT_DIR}/.build/${run_id}"
@@ -1470,37 +1582,41 @@ fi
 msg "Docker image: ${zmk_build_image}"
 msg "Docker cache volume: ${zmk_cache_volume}"
 msg "Build jobs: ${BUILD_JOBS}"
+msg "Container: ${container_name}"
 
-docker rm -f "${container_name}" >/dev/null 2>&1 || true
+RUN_FAILURE_REASON="container creation failed"
+docker_create_args=(create --name "${container_name}")
 if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
-    docker create --name "${container_name}" \
-        --platform "${ZMK_DOCKER_PLATFORM}" \
-        -v "${zmk_cache_volume}:/workspaces" \
-        -e ZMK_IN_CONTAINER=1 \
-        -e PRISTINE="${PRISTINE}" \
-        -e SETTINGS_RESET="${SETTINGS_RESET}" \
-        -e BUILD_JOBS="${BUILD_JOBS}" \
-        -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
-        -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log' >/dev/null
-else
-    docker create --name "${container_name}" \
-        -v "${zmk_cache_volume}:/workspaces" \
-        -e ZMK_IN_CONTAINER=1 \
-        -e PRISTINE="${PRISTINE}" \
-        -e SETTINGS_RESET="${SETTINGS_RESET}" \
-        -e BUILD_JOBS="${BUILD_JOBS}" \
-        -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
-        -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log' >/dev/null
+    docker_create_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
 fi
+# Keep platform and default paths on one set of volume/environment arguments.
+container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"
+docker "${docker_create_args[@]}" \
+    -v "${zmk_cache_volume}:/workspaces" \
+    -e ZMK_IN_CONTAINER=1 \
+    -e PRISTINE="${PRISTINE}" \
+    -e SETTINGS_RESET="${SETTINGS_RESET}" \
+    -e BUILD_JOBS="${BUILD_JOBS}" \
+    -e ZMK_WEST_UPDATE_ATTEMPTS="${ZMK_WEST_UPDATE_ATTEMPTS:-3}" \
+    -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
+    -e CCACHE_DIR="${zmk_ccache_dir}" \
+    -e CCACHE_IGNOREOPTIONS='-specs=*' \
+    -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
+    "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log' 2>&1 | tee -a "${LOG_FILE}" "${container_create_output}"
+container_id="$(tr -d '\r' < "${container_create_output}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+[ -n "${container_id}" ] || die "Docker create did not return a container ID"
 container_created=1
-docker start "${container_name}" >/dev/null
+rm -f "${container_create_output}"
+container_create_output=""
+RUN_FAILURE_REASON="container start failed"
+docker start "${container_id}" 2>&1 | tee -a "${LOG_FILE}"
 
-copy_target_to_container
+RUN_FAILURE_REASON="source copy failed"
+copy_target_to_container 2>&1 | tee -a "${LOG_FILE}"
+RUN_FAILURE_REASON="${MODE} execution failed"
 
 if [ "${MODE}" = "validate" ]; then
-    if docker exec "${container_name}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh validate "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}" 2>&1 | tee "${LOG_FILE}"; then
+    if docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh validate "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}" 2>&1 | tee -a "${LOG_FILE}"; then
         write_summary "SUCCESS"
         echo -e "${CYAN}${artifact_dir}${NC}"
         exit 0
@@ -1510,7 +1626,7 @@ if [ "${MODE}" = "validate" ]; then
     exit 1
 fi
 
-if ! docker exec "${container_name}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh build "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}" 2>&1 | tee "${LOG_FILE}"; then
+if ! docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh build "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}" 2>&1 | tee -a "${LOG_FILE}"; then
     write_summary "FAILED" "firmware build failed"
     echo -e "${RED}Build failed. See: ${artifact_dir}${NC}" >&2
     exit 1
@@ -1525,7 +1641,7 @@ fi
 write_summary "SUCCESS"
 
 echo -e "\n${GREEN}Artifacts:${NC}"
-find "${artifact_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) | sort | while IFS= read -r file; do
+firmware_files "${artifact_dir}" | sort | while IFS= read -r file; do
     printf '  - %s\n' "$(basename "${file}")"
 done
 echo -e "${CYAN}${artifact_dir}${NC}"

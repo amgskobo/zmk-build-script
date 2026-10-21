@@ -6,8 +6,8 @@ run_dir="${2:-}"
 
 is_valid_run_dir() {
   local candidate="${1%/}" parent base pid
-  case "${candidate}" in
-    *..*) return 1 ;;
+  case "/${candidate}/" in
+    */../*) return 1 ;;
   esac
   parent="${candidate%/*}"
   base="${candidate##*/}"
@@ -72,6 +72,16 @@ if [ ! -f "${build_log}" ]; then
   exit 1
 fi
 
+# A summary has one value per field. A matching SUCCESS line must not hide a
+# contradictory status or a second mode/count/fallback later in the file.
+for field in Status Mode 'Built targets' 'Fallback binary'; do
+  field_count="$(grep -c "^${field}:" "${build_summary}" || true)"
+  if [ "${field_count}" -gt 1 ]; then
+    echo "duplicate summary field: ${field}: ${build_summary}" >&2
+    exit 1
+  fi
+done
+
 if ! grep -qx 'Status: SUCCESS' "${build_summary}"; then
   echo "build-summary.txt does not report success: ${build_summary}" >&2
   exit 1
@@ -93,8 +103,15 @@ if [ "${mode}" = "build" ]; then
     exit 1
   fi
 
+  fallback="$(sed -n 's/^Fallback binary: //p' "${build_summary}" | tail -n 1)"
+  fallback="${fallback:-bin}"
+  case "${fallback}" in
+    .*|-*|*[!A-Za-z0-9._-]*) echo "Invalid fallback firmware extension in summary" >&2; exit 1 ;;
+  esac
+  [ "${built_targets}" -gt 0 ] || { echo "Built targets must be positive" >&2; exit 1; }
+
   firmware_list="$(
-    find "${run_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' \) -print |
+    find "${run_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' -o -name "*.${fallback}" \) ! -iname build.log ! -iname build-summary.txt -print |
       sort
   )"
   if [ -z "${firmware_list}" ]; then
@@ -105,6 +122,11 @@ if [ "${mode}" = "build" ]; then
   firmware_count="$(printf '%s\n' "${firmware_list}" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
   if [ "${firmware_count}" -lt "${built_targets}" ]; then
     echo "Firmware artifact count (${firmware_count}) is lower than built target count (${built_targets})." >&2
+    exit 1
+  fi
+
+  if [ "${firmware_count}" -gt "${built_targets}" ]; then
+    echo "Firmware artifact count (${firmware_count}) exceeds built target count (${built_targets})." >&2
     exit 1
   fi
 

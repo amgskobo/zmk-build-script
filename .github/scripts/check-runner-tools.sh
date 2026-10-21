@@ -5,8 +5,8 @@ echo "[preflight] bash"
 bash --version | sed -n '1p'
 
 echo "[preflight] tar --exclude"
-if ! tar --help 2>&1 | grep -q -- "--exclude"; then
-  echo "tar does not support --exclude, or it is not visible in tar --help output." >&2
+if ! tar cf - --exclude zmk-capability-probe -T /dev/null >/dev/null 2>&1; then
+  echo "tar cannot create an empty archive with --exclude." >&2
   exit 1
 fi
 

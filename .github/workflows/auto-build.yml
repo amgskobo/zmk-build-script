@@ -64,8 +64,9 @@ jobs:
       - name: Resolve source list
         id: resolve
         shell: bash
+        env:
+          SOURCE_FILE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_file || 'repos.txt' }}
         run: |
-          SOURCE_FILE="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_file || 'repos.txt' }}"
           if [ ! -f "${SOURCE_FILE}" ]; then
             echo "Source list file not found: ${SOURCE_FILE}" >&2
             exit 1
@@ -108,14 +109,19 @@ jobs:
       - name: Show selected runner (Unix)
         if: ${{ runner.os != 'Windows' }}
         shell: bash
+        env:
+          SOURCE_SLUG: ${{ matrix.source.slug }}
+          SELECTED_RUNNER_OS: ${{ runner.os }}
+          SELECTED_RUNNER_NAME: ${{ runner.name }}
+          SELECTED_RUNNER_ARCH: ${{ runner.arch }}
         run: |
           {
             echo "## Selected runner"
             echo
-            echo "- source: \`${{ matrix.source.slug }}\`"
-            echo "- runner.os: \`${{ runner.os }}\`"
-            echo "- runner.name: \`${{ runner.name }}\`"
-            echo "- runner.arch: \`${{ runner.arch }}\`"
+            echo "- source: \`${SOURCE_SLUG}\`"
+            echo "- runner.os: \`${SELECTED_RUNNER_OS}\`"
+            echo "- runner.name: \`${SELECTED_RUNNER_NAME}\`"
+            echo "- runner.arch: \`${SELECTED_RUNNER_ARCH}\`"
             echo
             echo "- mode: \`${EXTERNAL_MODE}\`"
             echo "- build_jobs: \`${EXTERNAL_BUILD_JOBS}\`"
@@ -127,14 +133,19 @@ jobs:
       - name: Show selected runner (Windows)
         if: ${{ runner.os == 'Windows' }}
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        env:
+          SOURCE_SLUG: ${{ matrix.source.slug }}
+          SELECTED_RUNNER_OS: ${{ runner.os }}
+          SELECTED_RUNNER_NAME: ${{ runner.name }}
+          SELECTED_RUNNER_ARCH: ${{ runner.arch }}
         run: |
           {
             echo "## Selected runner"
             echo
-            echo "- source: \`${{ matrix.source.slug }}\`"
-            echo "- runner.os: \`${{ runner.os }}\`"
-            echo "- runner.name: \`${{ runner.name }}\`"
-            echo "- runner.arch: \`${{ runner.arch }}\`"
+            echo "- source: \`${SOURCE_SLUG}\`"
+            echo "- runner.os: \`${SELECTED_RUNNER_OS}\`"
+            echo "- runner.name: \`${SELECTED_RUNNER_NAME}\`"
+            echo "- runner.arch: \`${SELECTED_RUNNER_ARCH}\`"
             echo
             echo "- mode: \`${EXTERNAL_MODE}\`"
             echo "- build_jobs: \`${EXTERNAL_BUILD_JOBS}\`"
@@ -143,15 +154,15 @@ jobs:
             echo
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Force LF checkout (Unix)
+      - name: Check LF checkout (Unix)
         if: ${{ runner.os != 'Windows' }}
         shell: bash
-        run: bash .github/scripts/force-lf-checkout.sh
+        run: bash .github/scripts/check-lf.sh
 
-      - name: Force LF checkout (Windows)
+      - name: Check LF checkout (Windows)
         if: ${{ runner.os == 'Windows' }}
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
-        run: bash .github/scripts/force-lf-checkout.sh
+        run: bash .github/scripts/check-lf.sh
 
       - name: Check runner tools (Unix)
         if: ${{ runner.os != 'Windows' }}
