@@ -283,18 +283,24 @@ chmod +x "${fake_bin}/tar"
 
 create_tmp="${tmp_dir}/create-temporaries"
 mkdir -p "${create_tmp}"
+# Another run may sort after this invocation even when its PID is unrelated.
+foreign_run="${tool_root}/.build/run-9999-12-31_23-59-59-pid-1"
+mkdir -p "${foreign_run}"
+printf 'Status: FAILED\nReason: unrelated summary sentinel\n' > "${foreign_run}/build-summary.txt"
 for phase in create start copy; do
   case "${phase}" in
     create) reason='container creation failed' ;;
     start) reason='container start failed' ;;
     copy) reason='source copy failed' ;;
   esac
-  if TMPDIR="${create_tmp}" ZMK_TEST_REAL_TAR="${real_tar}" PATH="${fake_bin}:${PATH}" FAKE_FAILURE="${phase}" \
-      bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/host-${phase}.log" 2>&1; then
+  TMPDIR="${create_tmp}" ZMK_TEST_REAL_TAR="${real_tar}" PATH="${fake_bin}:${PATH}" FAKE_FAILURE="${phase}" \
+      bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/host-${phase}.log" 2>&1 &
+  build_pid=$!
+  if wait "${build_pid}"; then
     echo "injected host ${phase} failure was accepted" >&2
     exit 1
   fi
-  summary="$(find "${tool_root}/.build" -name build-summary.txt -print | sort | tail -n 1)"
+  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
   [ -n "${summary}" ] || { echo "host ${phase} failure lost its summary" >&2; exit 1; }
   grep -qx 'Status: FAILED' "${summary}"
   grep -qx "Reason: ${reason}" "${summary}"
@@ -337,9 +343,11 @@ for phase in start copy validate artifact module; do
   invocation=(validate "${fixture}")
   [ "${phase}" != artifact ] || invocation=("${fixture}")
   [ "${phase}" != module ] || invocation=(validate "${fixture}" -m "${dot_module}/.")
-  if PATH="${fake_bin}:${PATH}" IDENTITY_PHASE="${phase}" IDENTITY_COMMANDS="${commands}" \
+  PATH="${fake_bin}:${PATH}" IDENTITY_PHASE="${phase}" IDENTITY_COMMANDS="${commands}" \
       ZMK_CONTAINER_NAME=replaceable-test-name bash "${tool_root}/build.sh" "${invocation[@]}" \
-      >"${tmp_dir}/identity-${phase}.log" 2>&1; then
+      >"${tmp_dir}/identity-${phase}.log" 2>&1 &
+  build_pid=$!
+  if wait "${build_pid}"; then
     echo "injected identity ${phase} failure was accepted" >&2; identity_failed=1
   fi
   if ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"; then
@@ -360,9 +368,180 @@ for phase in start copy validate artifact module; do
     validate|module) reason='validation failed' ;;
     artifact) reason='artifact copy failed' ;;
   esac
-  summary="$(find "${tool_root}/.build" -name build-summary.txt -print | sort | tail -n 1)"
+  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
   grep -qx 'Status: FAILED' "${summary}"
   grep -qx "Reason: ${reason}" "${summary}"
+done
+grep -qx 'Reason: unrelated summary sentinel' "${foreign_run}/build-summary.txt"
+
+# Cleanup/reset failures must fail the run without changing a prior failure or ownership.
+lifecycle_failed=0
+cat > "${fake_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${LIFECYCLE_COMMANDS}"
+case "$1" in
+  volume)
+    case "$2" in
+      ls)
+        printf '%s\n' "${ZMK_DOCKER_CACHE_VOLUME}-other"
+        [ "${LIFECYCLE_PHASE}" = missing ] || printf '%s\n' "${ZMK_DOCKER_CACHE_VOLUME}"
+        [ "${LIFECYCLE_PHASE}" != list-failure ] || { echo 'injected partial volume list failure' >&2; exit 23; } ;;
+      rm)
+        [ "${LIFECYCLE_PHASE}" != reset-failure ] || { echo 'injected cache reset failure' >&2; exit 23; } ;;
+      *) exit 99 ;;
+    esac ;;
+  create)
+    [ "${LIFECYCLE_PHASE}" != create-failure ] || { echo 'injected create failure' >&2; exit 23; }
+    printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  start)
+    [ "${LIFECYCLE_PHASE}" != both-failures ] || { echo 'injected start failure' >&2; exit 23; } ;;
+  exec)
+    case "$*" in
+      *'tar --no-same-owner'*|*'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
+      *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
+      *'mkdir -p /root/zmk-config'*) ;;
+      *) exit 99 ;;
+    esac ;;
+  rm)
+    case "${LIFECYCLE_PHASE}" in
+      cleanup-failure|both-failures|keep) echo 'injected container cleanup failure' >&2; exit 23 ;;
+    esac ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${fake_bin}/docker"
+for phase in cleanup-failure both-failures keep reset-failure list-failure missing present create-failure; do
+  commands="${tmp_dir}/lifecycle-${phase}.commands.log"
+  : > "${commands}"
+  invocation=(validate "${fixture}")
+  expected=0 keep=0 reason=
+  case "${phase}" in
+    cleanup-failure) expected=1; reason='container cleanup failed' ;;
+    both-failures) expected=23; reason='container start failed' ;;
+    keep) keep=1 ;;
+    reset-failure|list-failure) expected=1; reason='cache reset failed'; invocation+=(--pristine) ;;
+    missing|present) invocation+=(--pristine) ;;
+    create-failure) expected=23; reason='container creation failed' ;;
+  esac
+  PATH="${fake_bin}:${PATH}" LIFECYCLE_PHASE="${phase}" LIFECYCLE_COMMANDS="${commands}" \
+      ZMK_KEEP_CONTAINER="${keep}" ZMK_DOCKER_CACHE_VOLUME=lifecycle-cache ZMK_CONTAINER_NAME=replaceable-test-name \
+      bash "${tool_root}/build.sh" "${invocation[@]}" >"${tmp_dir}/lifecycle-${phase}.log" 2>&1 &
+  build_pid=$!
+  if wait "${build_pid}"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "${status}" != "${expected}" ]; then
+    echo "lifecycle ${phase}: expected status ${expected}, got ${status}" >&2; lifecycle_failed=1
+  fi
+  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+  if [ ! -f "${summary}" ]; then
+    echo "lifecycle ${phase}: missing run summary for PID ${build_pid}" >&2; lifecycle_failed=1; continue
+  fi
+  if [ "${expected}" = 0 ]; then
+    if ! bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}" \
+        >"${tmp_dir}/lifecycle-${phase}.checker.log" 2>&1; then lifecycle_failed=1; fi
+  elif ! grep -qx 'Status: FAILED' "${summary}" || ! grep -qx "Reason: ${reason}" "${summary}"; then
+    echo "lifecycle ${phase}: missing FAILED summary or original reason" >&2; lifecycle_failed=1
+  fi
+  case "${phase}" in
+    cleanup-failure|both-failures)
+      if ! grep -q 'injected container cleanup failure' "${summary%/*}/build.log" ||
+          ! grep -q 'failed to remove build container' "${summary}"; then
+        echo "lifecycle ${phase}: cleanup diagnostics lost" >&2; lifecycle_failed=1
+      fi ;;
+    reset-failure|list-failure)
+      if grep -q '^create ' "${commands}" || ! grep -q 'injected .* failure' "${summary%/*}/build.log"; then
+        echo "lifecycle ${phase}: build started after reset failure or diagnostics lost" >&2; lifecycle_failed=1
+      fi ;;
+  esac
+  if [ "${phase}" = keep ] || [ "${phase}" = create-failure ]; then
+    if grep -q '^rm ' "${commands}"; then
+      echo "lifecycle ${phase}: removed a kept or unowned container" >&2; lifecycle_failed=1
+    fi
+  elif [ "${phase}" != reset-failure ] && [ "${phase}" != list-failure ]; then
+    if ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"; then lifecycle_failed=1; fi
+  fi
+  case "${phase}" in
+    missing|list-failure)
+      if grep -q '^volume rm ' "${commands}"; then
+        echo "lifecycle ${phase}: removed an absent or unverified volume" >&2; lifecycle_failed=1
+      fi ;;
+    present|reset-failure)
+      if ! grep -qx 'volume rm lifecycle-cache' "${commands}"; then lifecycle_failed=1; fi ;;
+  esac
+done
+
+# SIGTERM must finalize failure evidence and retain ownership in both modes.
+cat > "${fake_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SIGNAL_COMMANDS}"
+block_signal_phase() {
+  : > "${SIGNAL_REACHED}"
+  for attempt in $(seq 1 100); do
+    [ ! -f "${SIGNAL_RELEASE}" ] || return 0
+    sleep .1
+  done
+  return 23
+}
+case "$1" in
+  create)
+    [ "${SIGNAL_PHASE}" != create ] || block_signal_phase || exit "$?"
+    printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  start) ;;
+  exec)
+    case "$*" in
+      *'tar --no-same-owner'*|*'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
+      *'./build.sh validate'*|*'./build.sh build'*)
+        block_signal_phase ;;
+      *'mkdir -p /root/zmk-config'*) ;;
+      *) exit 99 ;;
+    esac ;;
+  rm|stop) : > "${SIGNAL_RELEASE}" ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${fake_bin}/docker"
+for signal_mode in build validate; do
+  for keep in 0 1; do
+   for signal_phase in create execute; do
+    signal_prefix="${tmp_dir}/signal-${signal_mode}-${keep}-${signal_phase}"
+    invocation=("${fixture}")
+    [ "${signal_mode}" != validate ] || invocation=(validate "${fixture}")
+    PATH="${fake_bin}:${PATH}" SIGNAL_COMMANDS="${signal_prefix}.commands.log" \
+      SIGNAL_REACHED="${signal_prefix}.reached" SIGNAL_RELEASE="${signal_prefix}.release" \
+      SIGNAL_PHASE="${signal_phase}" \
+      ZMK_KEEP_CONTAINER="${keep}" bash "${tool_root}/build.sh" "${invocation[@]}" \
+      >"${signal_prefix}.log" 2>&1 &
+    build_pid=$!
+    for attempt in $(seq 1 100); do
+      [ ! -f "${signal_prefix}.reached" ] || break
+      sleep .1
+    done
+    [ -f "${signal_prefix}.reached" ] || { kill -TERM "${build_pid}" 2>/dev/null || true; exit 1; }
+    kill -TERM "${build_pid}"
+    if [ "${signal_phase}" = create ]; then
+      sleep .1
+      : > "${signal_prefix}.release"
+    fi
+    if wait "${build_pid}"; then status=0; else status=$?; fi
+    : > "${signal_prefix}.release"
+    [ "${status}" = 143 ] || { echo 'SIGTERM exit status lost' >&2; exit 1; }
+    summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+    grep -qx 'Status: FAILED' "${summary}"
+    grep -qx 'Reason: interrupted by SIGTERM' "${summary}"
+    if [ "${keep}" = 1 ]; then
+      if [ "${signal_phase}" = execute ]; then
+        grep -qx 'stop -t 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${signal_prefix}.commands.log"
+      fi
+      if grep -q '^rm ' "${signal_prefix}.commands.log"; then exit 1; fi
+    else
+      grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${signal_prefix}.commands.log"
+    fi
+    if [ "${signal_phase}" = create ] && grep -q '^start ' "${signal_prefix}.commands.log"; then exit 1; fi
+   done
+  done
 done
 
 fake_bin="${tmp_dir}/fake-bin"
@@ -510,7 +689,7 @@ if (cd "${runner_fixture}"; ZMK_TEST_RESULTS=visible-results bash .github/script
 fi
 grep -q 'inside the repository must be Git-ignored' "${tmp_dir}/visible-results.log"
 [ ! -d "${runner_fixture}/visible-results" ]
-[ "${identity_failed}" = 0 ] && [ "${module_names_failed}" = 0 ] || exit 1
+[ "${identity_failed}" = 0 ] && [ "${module_names_failed}" = 0 ] && [ "${lifecycle_failed}" = 0 ] || exit 1
 echo '[host-contract] passed'
   exit 0
 fi
@@ -601,6 +780,13 @@ ccache_dir=
 docker exec -i "${last_container}" sh -c 'cat > /tmp/test-build-container.py' < "${repo_root}/.github/scripts/test-build-container.py"
 docker exec -i "${last_container}" sh -c 'cat > /tmp/target-shapes.yaml' < "${repo_root}/.github/fixtures/target-shapes-zmk-config/build.yaml"
 docker exec -i "${last_container}" sh -c 'cat > /tmp/source-common.sh' < "${repo_root}/scripts/source-common.sh"
+docker exec -i "${last_container}" sh -c 'cat > /tmp/auto-build-external.sh' < "${repo_root}/scripts/auto-build-external.sh"
+docker exec -i "${last_container}" sh -c 'cat > /tmp/auto-build.yml' < "${repo_root}/.github/workflows/auto-build.yml"
+docker exec -i "${last_container}" sh -c 'cat > /tmp/check-build-output.sh' < "${repo_root}/.github/scripts/check-build-output.sh"
+docker exec "${last_container}" mkdir -p /tmp/workflows
+for workflow in "${repo_root}/.github/workflows/"*.yml; do
+  docker exec -i "${last_container}" sh -c 'cat > "/tmp/workflows/$1"' _ "${workflow##*/}" < "${workflow}"
+done
 docker exec "${last_container}" python3 -u /tmp/test-build-container.py /tmp/target-shapes.yaml
 
 # Round-trip the actual pruned Linux tree through the same host-path helper as external clone.
@@ -613,4 +799,21 @@ docker exec "${last_container}" python3 -u /tmp/test-build-container.py /tmp/tar
 for file in keep.txt 'nested/valid name.txt' nested/COM0.txt nested/my..file.txt unicode-名前.txt $'DEL-\177.txt' COM⁴.txt; do
   cmp "${tmp_dir}/clone-copy/${file}" <(printf 'clone payload\n')
 done
+# Use the existing validate container as the holder; never reset a production cache.
+: "${ZMK_DOCKER_CACHE_VOLUME:?Run Docker contracts through test.sh}"
+docker inspect -f '{{range .Mounts}}{{println .Name}}{{end}}' "${last_container}" |
+  grep -Fxq "${ZMK_DOCKER_CACHE_VOLUME}"
+ZMK_KEEP_CONTAINER=0 bash "${tool_root}/build.sh" validate "${target_no_west}" --pristine \
+  >"${tmp_dir}/pristine-in-use.log" 2>&1 &
+pristine_pid=$!
+if wait "${pristine_pid}"; then
+  echo 'pristine continued with an in-use cache volume' >&2; exit 1
+fi
+summary="$(find "${tool_root}/.build" -path "*-pid-${pristine_pid}/build-summary.txt" -print)"
+grep -qx 'Status: FAILED' "${summary}"
+grep -qx 'Reason: cache reset failed' "${summary}"
+grep -q 'volume is in use' "${summary%/*}/build.log"
+[ "$(docker inspect -f '{{.State.Running}}' "${last_container}")" = true ]
+docker volume inspect "${ZMK_DOCKER_CACHE_VOLUME}" >/dev/null
+
 echo "build host/copy contracts passed."

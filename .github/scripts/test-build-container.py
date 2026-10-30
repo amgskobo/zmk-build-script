@@ -6,9 +6,11 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -16,6 +18,7 @@ import yaml
 
 BUILD = pathlib.Path('/root/zmk-config/build.sh')
 SHAPES = pathlib.Path(sys.argv.pop(1))
+WORKFLOW = pathlib.Path('/tmp/auto-build.yml')
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 FIELDS = ('board', 'shield', 'snippet', 'cmake-args')
 
@@ -68,6 +71,134 @@ class ContainerContracts(unittest.TestCase):
         for document in (None, {}):
             with self.subTest(document=document):
                 self.expect_targets(document, [], reset=True)
+
+    def test_standalone_application_layout(self):
+        app = self.root / 'audio app'
+        app.mkdir()
+        (app / 'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 3.20.0)\n')
+        self.expect_targets({'application': 'audio app', 'include': [{'board': 'A'}]},
+                            [target('A-zmk')])
+        for invalid in ('../outside', str(self.root), 'C:/outside', 'app\\outside', '', 7):
+            with self.subTest(application=invalid):
+                self.expect_error({'application': invalid, 'include': [{'board': 'A'}]},
+                                  'invalid application layout')
+        self.expect_error({'application': 'missing', 'include': [{'board': 'A'}]},
+                          'application requires CMakeLists.txt')
+        (self.root / 'escape').symlink_to(self.root.parent, target_is_directory=True)
+        self.expect_error({'application': 'escape', 'include': [{'board': 'A'}]},
+                          'application must stay inside the target repository')
+
+    def test_standalone_module_roots_without_registering_application(self):
+        for name in ('boards', 'dts', 'snippets', 'zephyr'):
+            (self.root / name).mkdir()
+        for name in ('CMakeLists.txt', 'Kconfig', 'zephyr/CMakeLists.txt', 'zephyr/Kconfig'):
+            (self.root / name).touch()
+        metadata = self.root / 'zephyr/module.yml'
+        for app in ('.', 'nested app'):
+            with self.subTest(application=app):
+                directory = self.root / app
+                directory.mkdir(exist_ok=True)
+                (directory / 'CMakeLists.txt').touch()
+                if metadata.exists():
+                    metadata.unlink()
+                self.expect_targets({'application': app, 'board': 'A'}, [target('A-zmk')])
+                actual = yaml.safe_load(metadata.read_text())
+                self.assertEqual(actual['build'], {'settings': {
+                    'board_root': '.', 'dts_root': '.', 'snippet_root': '.'}})
+
+    def test_standalone_preserves_explicit_legacy_module_build_declarations(self):
+        (self.root / 'CMakeLists.txt').touch()
+        (self.root / 'dts').mkdir()
+        declared = {'cmake': 'module', 'kconfig': 'module/Kconfig'}
+        (self.root / 'module.yml').write_text(yaml.safe_dump({'build': declared}))
+        self.expect_targets({'application': '.', 'board': 'A'}, [target('A-zmk')])
+        actual = yaml.safe_load((self.root / 'zephyr/module.yml').read_text())
+        self.assertEqual(actual['build'], dict(declared, settings={'dts_root': '.'}))
+
+    def test_standalone_without_module_content_does_not_register_application(self):
+        (self.root / 'CMakeLists.txt').touch()
+        (self.root / 'Kconfig').touch()
+        self.expect_targets({'application': '.', 'board': 'A'}, [target('A-zmk')])
+        self.assertFalse((self.root / 'zephyr/module.yml').exists())
+
+    def test_external_workflow_forwards_pristine_in_both_modes(self):
+        workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+        steps = [step for step in workflow['jobs']['build-runner']['steps']
+                 if step.get('name', '').startswith('Build source (')]
+        self.assertCountEqual([step['name'] for step in steps],
+                              ['Build source (Unix)', 'Build source (Windows)'])
+        (self.root / 'scripts').mkdir()
+        (self.root / 'scripts/build-external-source.sh').write_text(
+            '#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$WORKFLOW_ARGV"\n')
+        (self.root / '.github/scripts').mkdir(parents=True)
+        shutil.copyfile('/tmp/check-build-output.sh', self.root / '.github/scripts/check-build-output.sh')
+        for script in ('auto-build-external.sh', 'source-common.sh'):
+            shutil.copyfile('/tmp/' + script, self.root / 'scripts' / script)
+        (self.root / '.build').mkdir()
+        for step in steps:
+            for mode in ('build', 'validate'):
+                for pristine in ('true', 'false'):
+                    for kind in ('repo', 'path'):
+                        with self.subTest(step=step['name'], mode=mode,
+                                          pristine=pristine, kind=kind):
+                            source = ('https://example.invalid/config.git' if kind == 'repo'
+                                      else str(self.root / 'source with spaces'))
+                            env = dict(os.environ, EXTERNAL_MODE=mode, EXTERNAL_BUILD_JOBS='2',
+                                       EXTERNAL_PRISTINE=pristine, SOURCE_INDEX='0002',
+                                       WORKFLOW_ARGV=str(self.root / 'workflow.argv'))
+                            sources = self.root / 'sources.txt'
+                            sources.write_text('repo:https://example.invalid/unselected.git\n' + kind + ':' + source + '\n')
+                            (self.root / '.build/ci-source-file').write_text(str(sources))
+                            result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
+                                                    cwd=self.root, env=env, capture_output=True)
+                            self.assertEqual(result.returncode, 0, result.stderr.decode())
+                            record = (self.root / '.build/ci-source.record').read_text().strip()
+                            actual = (self.root / 'workflow.argv').read_bytes().decode().rstrip('\0').split('\0')
+                            expected = ['--' + kind, source, '--source-slug',
+                                        'config' if kind == 'repo' else 'source-with-spaces',
+                                        '--mode', mode, '--jobs', '2']
+                            if pristine == 'true':
+                                expected.append('--pristine')
+                            self.assertEqual(actual, expected)
+                            self.assertNotIn('unselected.git', (self.root / record).read_text())
+                            self.assertNotIn(source, result.stdout.decode())
+
+    def test_workflows_publish_only_fixed_reports(self):
+        root = pathlib.Path('/tmp/workflows')
+        workflows = list(root.glob('*.yml'))
+        self.assertEqual(len(workflows), 4)
+        allowed = {'.build/public/' + name + '.txt' for name in (
+            'tests-shell', 'tests-docker', 'tests-build', 'tests-all', 'build', 'validate')}
+        uploads = 0
+        for path in workflows:
+            source = path.read_text()
+            self.assertNotIn('runner.name', source)
+            document = yaml.load(source, Loader=yaml.BaseLoader)
+            for job in document['jobs'].values():
+                self.assertNotIn('inputs.', job.get('name', ''))
+                for step in job.get('steps', []):
+                    if step.get('name', '').startswith('Show selected runner'):
+                        self.assertNotIn('${EXTERNAL_', step['run'])
+                    for raw_entry in ('scripts/test.sh', 'scripts/build-external-source.sh', 'scripts/check-runner-tools.sh', 'scripts/check-lf.sh'):
+                        self.assertNotIn(raw_entry, step.get('run', ''), step)
+                    if 'actions/upload-artifact@' in step.get('uses', ''):
+                        uploads += 1
+                        self.assertTrue(set(step['with']['path'].splitlines()) <= allowed, step)
+                        self.assertNotIn('matrix.source.slug', step['with']['name'])
+                        self.assertIn('publication-init', step['if'])
+                        self.assertIn('publication-check', step['if'])
+        self.assertEqual(uploads, 6)
+
+    def test_external_workflow_keeps_source_values_out_of_runner_details(self):
+        workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+        for job in workflow['jobs'].values():
+            for step in job.get('steps', []):
+                for value in step.get('env', {}).values():
+                    self.assertNotIn('matrix.source.slug', value)
+                    self.assertNotIn('matrix.source.source', value)
+                    self.assertNotIn('inputs.source_file', value)
+        resolver = workflow['jobs']['sources']['steps']
+        self.assertTrue(any('ci-matrix' in step.get('run', '') for step in resolver))
 
     def test_normal_defaults_aliases_and_order(self):
         self.expect_targets({'defaults': {'cmake-args': '-DDEFAULT=1'}, 'include': [
@@ -315,7 +446,13 @@ elif sys.argv[1] == 'manifest':
 elif sys.argv[1] == 'zephyr-export': pass
 elif sys.argv[1] == 'build':
     print('controlled build boundary reached')
-    sys.exit(71)
+    build = pathlib.Path(sys.argv[sys.argv.index('-d') + 1])
+    (build / 'zephyr').mkdir(parents=True, exist_ok=True)
+    (build / 'intermediate.o').write_text('temporary compiler output\\n')
+    status = int(os.environ.get('PROBE_BUILD_EXIT', '71'))
+    if status == 0 and os.environ.get('PROBE_SKIP_FIRMWARE') != '1':
+        (build / 'zephyr/zephyr.uf2').write_bytes(b'controlled firmware')
+    sys.exit(status)
 else: sys.exit('unexpected west operation')
 ''')
         (fake_bin / 'rsync').write_text('''#!/usr/bin/env python3
@@ -395,6 +532,81 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                 self.assertEqual(case.manifest_stamp.read_text(), 'stale\n')
                 self.assertFalse(case.counter.exists())
 
+    def test_module_metadata_without_root_content_is_still_validated(self):
+        for metadata in ('build: []\n', 'build: {settings: false}\n', '[]\n'):
+            with self.subTest(metadata=metadata):
+                module = self.modules / 'schema-module'
+                (module / 'zephyr').mkdir(parents=True, exist_ok=True)
+                (module / 'zephyr/module.yml').write_text(metadata)
+                status, output = self.run_config({'board': 'A'})
+                self.assertNotEqual(status, 0, output)
+                case = self.make_workspace(local_override=True, force_update=True,
+                                           update_actions=[{'exit': 0}])
+                project = case.inputs / 'project'
+                (project / 'zephyr').mkdir()
+                (project / 'zephyr/module.yml').write_text(metadata)
+                completed, output = self.run_workspace(case)
+                self.assertNotIn(completed.returncode, (0, 71), output)
+                self.assertEqual(case.commands.read_text(), '')
+                self.assertEqual(case.manifest_stamp.read_text(), 'stale\n')
+                self.assertEqual(case.stamp.read_text(), 'project\tmodules/project\n')
+
+    def test_create_group_signals_acquire_identity_before_cleanup(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+with open(os.environ['SIGNAL_CALLS'], 'a') as output:
+    output.write(json.dumps(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'create':
+    pathlib.Path(os.environ['SIGNAL_REACHED']).touch()
+    while not pathlib.Path(os.environ['SIGNAL_RELEASE']).exists(): time.sleep(.01)
+    print('a' * 64)
+elif sys.argv[1] != 'rm': sys.exit(99)
+''')
+        docker.chmod(0o755)
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for mode in ('build', 'validate'):
+            for keep in (0, 1):
+                for signum in (signal.SIGINT, signal.SIGTERM):
+                    with self.subTest(mode=mode, keep=keep, signal=signum):
+                        case = self.root / ('%s-%s-%s' % (mode, keep, signum))
+                        case.mkdir()
+                        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                                   ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER=str(keep),
+                                   SIGNAL_CALLS=str(case / 'calls'), SIGNAL_REACHED=str(case / 'reached'),
+                                   SIGNAL_RELEASE=str(case / 'release'))
+                        args = ['bash', str(BUILD)]
+                        if mode == 'validate': args.append('validate')
+                        args.append(str(self.root))
+                        process = subprocess.Popen(args, env=env, start_new_session=True,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        try:
+                            deadline = time.monotonic() + 5
+                            while not (case / 'reached').exists() and time.monotonic() < deadline:
+                                self.assertIsNone(process.poll())
+                                time.sleep(.01)
+                            self.assertTrue((case / 'reached').exists())
+                            os.killpg(process.pid, signum)
+                            time.sleep(.05)
+                            (case / 'release').touch()
+                            output, _ = process.communicate(timeout=5)
+                            self.assertEqual(process.returncode, 128 + signum, output)
+                            self.assertIn('a' * 64, output)
+                            calls = [json.loads(line) for line in (case / 'calls').read_text().splitlines()]
+                            self.assertFalse(any(call[0] == 'start' for call in calls), calls)
+                            self.assertEqual(['rm', '-f', 'a' * 64] in calls, keep == 0, calls)
+                            summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
+                            self.assertEqual(len(summaries), 1)
+                            summary = summaries[0].read_text()
+                            self.assertIn('Status: FAILED', summary)
+                            self.assertIn('Reason: interrupted by ' + signal.Signals(signum).name, summary)
+                        finally:
+                            try: os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError: pass
+                            if process.poll() is None: process.wait(timeout=3)
+
     def test_restore_copy_failure_preserves_recovery_state(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project', True)
         self.assertNotEqual(result.returncode, 0)
@@ -404,6 +616,81 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
         self.assertEqual(stamp.read_text(), 'project\tmodules/project\n')
         self.assertEqual((project / 'content.txt').read_text(), 'local override\n')
         self.assertNotIn('west build ', commands.read_text())
+
+    def test_partial_restore_retry_keeps_completed_projects(self):
+        case = self.make_workspace(prior_overlay=True, fail_copy=True)
+        second = case.workspace / 'modules/second'
+        second.mkdir(parents=True)
+        (second / 'content.txt').write_text('second overlay\n')
+        backup = case.backup.parent / 'second'
+        backup.mkdir()
+        (backup / 'content.txt').write_text('second original\n')
+        case.stamp.write_text('project\tmodules/project\nsecond\tmodules/second\n')
+        fake = pathlib.Path(case.env['PATH'].split(os.pathsep)[0])
+        west = fake / 'west'
+        west.write_text(west.read_text().replace(
+            "projects = [('zmk', 'zmk'), ('project', os.environ['PROBE_PROJECT_PATH'])]",
+            "projects = [('zmk', 'zmk'), ('project', os.environ['PROBE_PROJECT_PATH']), ('second', 'modules/second')]"))
+        rsync = fake / 'rsync'
+        rsync.write_text(rsync.read_text().replace(
+            "if 'local-overlay-backups' in source.parts and",
+            "if source.name == 'second' and 'local-overlay-backups' in source.parts and"))
+        for attempt in range(2):
+            result, output = self.run_workspace(case)
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn('failed to restore module input overlay: second', output)
+            self.assertTrue(case.project.exists(), 'restored project lost on retry %d' % attempt)
+            self.assertEqual((case.project / 'content.txt').read_text(), 'original project\n')
+            self.assertTrue(backup.exists())
+        case.env['PROBE_FAIL_COPY'] = '0'
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertFalse(case.counter.exists(), 'completed restoration must not require an update')
+        self.assertEqual((second / 'content.txt').read_text(), 'second original\n')
+        self.assertFalse(case.stamp.exists())
+
+    def test_restore_backup_cleanup_failure_keeps_completed_state(self):
+        case = self.make_workspace()
+        fake = pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'rm'
+        fake.write_text('\n'.join([
+            '#!/usr/bin/env python3', 'import os, sys',
+            'if os.environ.get("PROBE_BLOCK_BACKUP") == "1" and os.environ["PROBE_BACKUP"] in sys.argv[1:]:',
+            '    sys.exit(23)',
+            'os.execv(os.environ["PROBE_REAL_RM"], ["rm"] + sys.argv[1:])', '']))
+        fake.chmod(0o755)
+        case.env.update(PROBE_BLOCK_BACKUP='1', PROBE_BACKUP=str(case.backup))
+        result, output = self.run_workspace(case)
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn('failed to remove restored overlay backup', output)
+        self.assertTrue(case.backup.exists())
+        self.assertIn('project\tmodules/project\trestored\n', case.stamp.read_text())
+        case.env['PROBE_BLOCK_BACKUP'] = '0'
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual((case.project / 'content.txt').read_text(), 'original project\n')
+        self.assertFalse(case.stamp.exists())
+
+    def test_explicit_hidden_module_is_validated_and_reaches_build(self):
+        module = self.modules / '.hidden-module'
+        (module / 'zephyr').mkdir(parents=True)
+        (module / 'CMakeLists.txt').touch()
+        (module / 'zephyr/module.yml').write_text('build: []\n')
+        self.expect_error({'board': 'A'}, 'build must be a map')
+        for name in ('.hidden-module', '..hidden-module'):
+            case = self.make_workspace(prior_overlay=False)
+            source = case.inputs / name
+            (source / 'zephyr').mkdir(parents=True)
+            (source / 'CMakeLists.txt').touch()
+            (source / 'zephyr/module.yml').write_text('build: {cmake: .}\n')
+            destination = pathlib.Path('/workspaces/module-inputs') / name
+            self.assertFalse(destination.exists())
+            self.addCleanup(shutil.rmtree, destination, True)
+            result, output = self.run_workspace(case)
+            self.assertEqual(result.returncode, 71, output)
+            calls = [json.loads(line) for line in case.commands.with_suffix('.argv.jsonl').read_text().splitlines()]
+            builds = [args for args in calls if args[0] == 'build']
+            self.assertIn('-DZMK_EXTRA_MODULES=' + str(destination), builds[0])
+            self.assertTrue((destination / 'zephyr/module.yml').exists())
 
     def test_restore_removal_failure_preserves_recovery_state(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project', False, True)
@@ -465,6 +752,55 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                 self.assertTrue(args[0].startswith('-DZMK_CONFIG='), args)
                 self.assertEqual(args[1:], expected)
 
+    def test_concurrent_workspace_reuse_stops_before_mutation(self):
+        case = self.make_workspace(prior_overlay=False)
+        reached, release = case.root / 'build-reached', case.root / 'build-release'
+        west = pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'west'
+        text = west.read_text().replace('import json, os, pathlib, subprocess, sys',
+                                        'import json, os, pathlib, subprocess, sys, time')
+        text = text.replace("    status = int(os.environ.get('PROBE_BUILD_EXIT', '71'))", '''    if os.environ.get('PROBE_BLOCK_BUILD') == '1':
+        pathlib.Path(os.environ['PROBE_REACHED']).touch()
+        while not pathlib.Path(os.environ['PROBE_RELEASE']).exists(): time.sleep(.01)
+    status = int(os.environ.get('PROBE_BUILD_EXIT', '71'))''')
+        west.write_text(text)
+        first_env = dict(case.env, PROBE_BUILD_EXIT='0', PROBE_BLOCK_BUILD='1',
+                         PROBE_REACHED=str(reached), PROBE_RELEASE=str(release))
+        first = subprocess.Popen(['bash', str(BUILD), 'build'], env=first_env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not reached.exists() and time.monotonic() < deadline:
+                self.assertIsNone(first.poll())
+                time.sleep(.01)
+            self.assertTrue(reached.exists())
+            other = case.root / 'other-source'
+            shutil.copytree(case.source, other)
+            (other / 'build.yaml').write_text('board: B\n')
+            second_env = dict(case.env, SOURCE_DIR=str(other), OUTPUT_DIR=str(case.root / 'other-output'),
+                              PROBE_BUILD_EXIT='0')
+            prior_calls = case.commands.read_text()
+            second = subprocess.run(['bash', str(BUILD), 'build'], env=second_env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(second.returncode, 0, second.stdout + second.stderr +
+                                '\nActive build intermediate remains: ' +
+                                str((case.workspace / '.build/A-zmk/intermediate.o').exists()))
+            self.assertIn('workspace is already in use', second.stdout + second.stderr)
+            self.assertEqual(case.commands.read_text(), prior_calls)
+            self.assertTrue((case.workspace / '.build/A-zmk/intermediate.o').exists())
+            release.touch()
+            output, _ = first.communicate(timeout=5)
+            self.assertEqual(first.returncode, 0, output)
+            # A completed process releases the lease even if its container is retained.
+            again = subprocess.run(['bash', str(BUILD), 'build'], env=second_env,
+                                   capture_output=True, text=True, timeout=5)
+            self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        finally:
+            release.touch()
+            try: os.killpg(first.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            if first.poll() is None: first.wait(timeout=3)
+
     def test_parallel_failure_count_and_remaining_queue(self):
         # A partial batch, cancellation of queued work, then the first 8-bit wrap boundary.
         for total, jobs, started in ((1, 2, 1), (3, 2, 2), (256, 256, 256)):
@@ -481,6 +817,75 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                 names = ['target-%03d' % i for i in range(started)]
                 self.assertCountEqual([pathlib.Path(args[args.index('-d') + 1]).name for args in builds], names)
                 self.assertEqual(re.findall(r'ERROR: target failed: (target-\d+)', output), names)
+
+    def test_target_cleanup_on_success_compile_and_artifact_failure(self):
+        for jobs in (1, 2):
+            for failure in ('none', 'compile', 'missing', 'copy'):
+                with self.subTest(jobs=jobs, failure=failure):
+                    document = {'include': [{'board': 'A', 'artifact-name': 'cleanup-%d' % i}
+                                            for i in range(3)]}
+                    case = self.make_workspace(document=document, jobs=jobs, prior_overlay=False)
+                    cache = case.root / 'compiler-cache'
+                    cache.mkdir()
+                    (cache / 'keep').write_text('reusable compiler result\n')
+                    case.env.update(CCACHE_DIR=str(cache),
+                                    PROBE_BUILD_EXIT='71' if failure == 'compile' else '0')
+                    if failure == 'missing':
+                        case.env['PROBE_SKIP_FIRMWARE'] = '1'
+                    if failure == 'copy':
+                        fake_cp = pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'cp'
+                        fake_cp.write_text('\n'.join([
+                            '#!/usr/bin/env python3', 'import os, sys',
+                            'if any(arg.endswith(".uf2") for arg in sys.argv[1:]):',
+                            '    print("injected firmware copy failure", file=sys.stderr)',
+                            '    sys.exit(23)',
+                            'os.execv(os.environ["PROBE_REAL_CP"], ["cp"] + sys.argv[1:])', '']))
+                        fake_cp.chmod(0o755)
+                        case.env['PROBE_REAL_CP'] = shutil.which('cp')
+                    result, output = self.run_workspace(case)
+                    if failure == 'none':
+                        self.assertEqual(result.returncode, 0, output)
+                        self.assertIn('Build complete: 3 target(s).', output)
+                        self.assertEqual(len(list(pathlib.Path(case.env['OUTPUT_DIR']).glob('*.uf2'))), 3)
+                    else:
+                        self.assertNotEqual(result.returncode, 0, output)
+                        self.assertNotIn('Build complete:', output)
+                        if failure == 'compile' and jobs == 1:
+                            self.assertEqual(result.returncode, 71, output)
+                        if failure == 'missing':
+                            self.assertIn('no firmware artifact found', output)
+                        if failure == 'copy':
+                            self.assertIn('injected firmware copy failure', output)
+                    records = [json.loads(line) for line in case.commands.with_suffix('.argv.jsonl').read_text().splitlines()]
+                    builds = [args for args in records if args[0] == 'build']
+                    self.assertEqual(len(builds), 3 if failure == 'none' else jobs, output)
+                    for args in builds:
+                        self.assertFalse(pathlib.Path(args[args.index('-d') + 1]).exists(), output)
+                    self.assertEqual((cache / 'keep').read_text(), 'reusable compiler result\n')
+                    self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+
+    def test_target_cleanup_failure_is_reported_without_masking_build_failure(self):
+        for build_status in (0, 71):
+            with self.subTest(build_status=build_status):
+                case = self.make_workspace(prior_overlay=False)
+                case.env['PROBE_BUILD_EXIT'] = str(build_status)
+                fake_rm = pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'rm'
+                fake_rm.write_text('\n'.join([
+                    '#!/usr/bin/env python3', 'import os, pathlib, sys',
+                    'target = pathlib.Path(os.environ["PROBE_TARGET_BUILD"])',
+                    'if str(target) in sys.argv[1:] and (target / "intermediate.o").exists():',
+                    '    print("injected target cleanup failure", file=sys.stderr)',
+                    '    sys.exit(23)',
+                    'os.execv(os.environ["PROBE_REAL_RM"], ["rm"] + sys.argv[1:])', '']))
+                fake_rm.chmod(0o755)
+                build = case.workspace / '.build/A-zmk'
+                case.env['PROBE_TARGET_BUILD'] = str(build)
+                result, output = self.run_workspace(case)
+                self.assertEqual(result.returncode, build_status or 1, output)
+                self.assertIn('injected target cleanup failure', output)
+                self.assertIn('failed to remove target build directory:', output)
+                self.assertNotIn('Build complete:', output)
+                self.assertTrue((build / 'intermediate.o').exists(), output)
 
     def test_unavailable_project_list_preserves_cache_until_update(self):
         for succeeds in (False, True):

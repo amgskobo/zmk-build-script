@@ -83,22 +83,6 @@ resolve_path_source() {
     fi
 }
 
-gha_escape() {
-    local value="$1"
-    value="${value//%/%25}"
-    value="${value//$'\r'/%0D}"
-    value="${value//$'\n'/%0A}"
-    printf '%s' "${value}"
-}
-
-markdown_cell() {
-    local value="$1"
-    value="${value//|/\\|}"
-    value="${value//$'\r'/ }"
-    value="${value//$'\n'/ }"
-    printf '%s' "${value}"
-}
-
 docker_no_pathconv() {
     MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker "$@"
 }
@@ -136,31 +120,37 @@ emit_failure_annotation() {
     title="External ${ZMK_EXTERNAL_MODE} failed: ${slug}"
     message="source=${source}; ${reason}"
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-        printf '::error title=%s::%s\n' "$(gha_escape "${title}")" "$(gha_escape "${message}")"
+        printf '::error title=External source execution failed::%s\n' "$(public_failure_reason "${reason}")"
     else
         echo "ERROR: ${title} (${message})" >&2
     fi
 }
 
+public_failure_reason() {
+    case "$1" in
+        'clone failed'|'build failed'|'validate failed'|'clone cleanup failed'|\
+        'clone failed; clone cleanup failed'|'build failed; clone cleanup failed'|'validate failed; clone cleanup failed') printf '%s' "$1" ;;
+        'path not found:'*) printf '%s' 'path not found' ;;
+        *) printf '%s' 'source execution failed' ;;
+    esac
+}
+
 write_github_step_summary() {
     local result="$1" reason="${2:-}" summary_file="${GITHUB_STEP_SUMMARY:-}"
-    local cache_volume
+    local public_mode=unknown
     [ -n "${summary_file}" ] || return 0
-    cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${SOURCE_SLUG}"
+    case "${result}" in success|failure) ;; *) result=failure ;; esac
+    case "${ZMK_EXTERNAL_MODE}" in build|validate) public_mode="${ZMK_EXTERNAL_MODE}" ;; esac
     {
         echo "## External ZMK source build"
         echo
-        echo "| result | slug | type | source | cache volume |"
-        echo "| --- | --- | --- | --- | --- |"
-        printf '| %s | `%s` | %s | `%s` | `%s` |\n' \
-            "$(markdown_cell "${result}")" \
-            "$(markdown_cell "${SOURCE_SLUG}")" \
-            "$(markdown_cell "${SOURCE_TYPE}")" \
-            "$(markdown_cell "${SOURCE_VALUE}")" \
-            "$(markdown_cell "${cache_volume}")"
+        echo "| result | mode |"
+        echo "| --- | --- |"
+        printf '| %s | %s |\n' \
+            "${result}" "${public_mode}"
         if [ -n "${reason}" ]; then
             echo
-            printf 'Reason: `%s`\n' "$(markdown_cell "${reason}")"
+            printf 'Reason: `%s`\n' "$(public_failure_reason "${reason}")"
         fi
         echo
     } >> "${summary_file}"
@@ -168,17 +158,36 @@ write_github_step_summary() {
 
 cleanup_clone_container() {
     [ "${clone_container_created:-0}" = 1 ] || return 0
-    docker_no_pathconv rm -f "${clone_container_id}" >/dev/null 2>&1 || true
+    if ! docker_no_pathconv rm -f "${clone_container_id}" >/dev/null; then
+        echo "ERROR: failed to remove clone container: ${clone_container_id}" >&2
+        return 1
+    fi
     clone_container_created=0
     clone_container_id=""
 }
 
+clear_clone_directory() {
+    local clone_dir="$1" root parent
+    root="$(cd "${WORK_DIR}" && pwd -P)" || return 1
+    parent="$(cd "$(dirname "${clone_dir}")" && pwd -P)" || return 1
+    if [ "${parent}" != "${root}" ] || [ -z "${clone_dir##*/}" ] ||
+        [ "${clone_dir##*/}" = . ] || [ "${clone_dir##*/}" = .. ]; then
+        echo "ERROR: refusing to clear path outside clone root: ${clone_dir}" >&2
+        return 1
+    fi
+    clone_dir="${parent}/${clone_dir##*/}"
+    if ! rm -rf -- "${clone_dir}"; then
+        echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
+        return 1
+    fi
+}
+
 clone_repo_with_docker() {
     local source="$1" slug="$2" clone_dir="$3"
-    local clone_parent clone_dir_for_docker attempt prune_clone_paths=0
+    local clone_parent clone_dir_for_docker clone_container_name attempt prune_clone_paths=0
 
     clone_parent="$(dirname "${clone_dir}")"
-    mkdir -p "${clone_parent}"
+    mkdir -p "${clone_parent}" || return 1
     clone_container_name="zmk-source-clone-${slug:0:80}-pid-$$"
     clone_container_created=0
     clone_container_id=""
@@ -189,9 +198,7 @@ clone_repo_with_docker() {
     echo "[source:${slug}] Cloning: ${source}"
     attempt=1
     while [ "${attempt}" -le "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; do
-        if ! rm -rf "${clone_dir}"; then
-            echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
-            clone_container_name=""
+        if ! clear_clone_directory "${clone_dir}"; then
             trap - EXIT
             return 1
         fi
@@ -213,15 +220,12 @@ clone_repo_with_docker() {
                 break
             fi
         fi
-        cleanup_clone_container
-        if ! rm -rf "${clone_dir}"; then
-            echo "ERROR: failed to clear clone destination: ${clone_dir}" >&2
-            clone_container_name=""
+        cleanup_clone_container || return 1
+        if ! clear_clone_directory "${clone_dir}"; then
             trap - EXIT
             return 1
         fi
         if [ "${attempt}" -ge "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; then
-            clone_container_name=""
             trap - EXIT
             return 1
         fi
@@ -231,20 +235,19 @@ clone_repo_with_docker() {
     mkdir -p "${clone_dir}"
     clone_dir_for_docker="$(docker_host_path "${clone_dir}")"
     if ! docker_no_pathconv cp "${clone_container_id}:/tmp/source/." "${clone_dir_for_docker}"; then
-        cleanup_clone_container
-        clone_container_name=""
+        cleanup_clone_container || return 1
         trap - EXIT
-        rm -rf "${clone_dir}"
+        clear_clone_directory "${clone_dir}" || return 1
         return 1
     fi
 
-    cleanup_clone_container
-    clone_container_name=""
+    cleanup_clone_container || return 1
     trap - EXIT
 }
 
 build_single_source() {
-    local target_dir clone_dir cache_volume container_slug
+    local target_dir clone_dir cache_volume container_slug reason failure_phase
+    local build_status=0 cleanup_failed=0
     local build_command=()
     local build_env=()
 
@@ -266,14 +269,14 @@ build_single_source() {
     if [ "${SOURCE_TYPE}" = "repo" ] || [ "${ZMK_EXTERNAL_PRISTINE}" = "1" ]; then
         require_docker
     fi
-    [ "${ZMK_EXTERNAL_PRISTINE}" != "1" ] || docker_no_pathconv volume rm "${cache_volume}" 2>/dev/null || true
-
     if [ "${SOURCE_TYPE}" = "repo" ]; then
         clone_dir="${WORK_DIR}/${SOURCE_SLUG}"
         if ! clone_repo_with_docker "${SOURCE_VALUE}" "${SOURCE_SLUG}" "${clone_dir}"; then
+            reason="clone failed"
+            clear_clone_directory "${clone_dir}" || reason="clone failed; clone cleanup failed"
             echo "=== FAILED: clone ${SOURCE_SLUG} ===" >&2
-            emit_failure_annotation "${SOURCE_SLUG}" "${SOURCE_VALUE}" "clone failed"
-            write_github_step_summary "failure" "clone failed"
+            emit_failure_annotation "${SOURCE_SLUG}" "${SOURCE_VALUE}" "${reason}"
+            write_github_step_summary "failure" "${reason}"
             return 1
         fi
         target_dir="${clone_dir}"
@@ -294,8 +297,8 @@ build_single_source() {
         build_command+=(validate "${target_dir}")
     else
         build_command+=("${target_dir}")
-        [ "${ZMK_EXTERNAL_PRISTINE}" != "1" ] || build_command+=(--pristine)
     fi
+    [ "${ZMK_EXTERNAL_PRISTINE}" != "1" ] || build_command+=(--pristine)
     build_command+=(--jobs "${BUILD_JOBS}")
     [ "${ZMK_EXTERNAL_SETTINGS_RESET}" != "1" ] || build_command+=(--settings-reset)
     if [ ${#build_snippets[@]} -gt 0 ]; then
@@ -316,16 +319,30 @@ build_single_source() {
     fi
 
     if env "${build_env[@]}" "${build_command[@]}"; then
+        build_status=0
+    else
+        build_status=$?
+    fi
+    if [ "${SOURCE_TYPE}" = repo ]; then
+        clear_clone_directory "${clone_dir}" || cleanup_failed=1
+    fi
+    if [ "${build_status}" = 0 ] && [ "${cleanup_failed}" = 0 ]; then
         echo "=== SUCCESS: ${SOURCE_SLUG} ==="
-        [ "${SOURCE_TYPE}" != "repo" ] || rm -rf "${clone_dir}"
         write_github_step_summary "success"
         return 0
     fi
 
-    echo "=== FAILED: ${ZMK_EXTERNAL_MODE} ${SOURCE_SLUG} ===" >&2
-    emit_failure_annotation "${SOURCE_SLUG}" "${SOURCE_VALUE}" "${ZMK_EXTERNAL_MODE} failed"
-    [ "${SOURCE_TYPE}" != "repo" ] || rm -rf "${clone_dir}"
-    write_github_step_summary "failure" "${ZMK_EXTERNAL_MODE} failed"
+    reason="${ZMK_EXTERNAL_MODE} failed"
+    failure_phase="${ZMK_EXTERNAL_MODE}"
+    if [ "${build_status}" = 0 ]; then
+        reason="clone cleanup failed"
+        failure_phase=cleanup
+    elif [ "${cleanup_failed}" != 0 ]; then
+        reason="${reason}; clone cleanup failed"
+    fi
+    echo "=== FAILED: ${failure_phase} ${SOURCE_SLUG} ===" >&2
+    emit_failure_annotation "${SOURCE_SLUG}" "${SOURCE_VALUE}" "${reason}"
+    write_github_step_summary "failure" "${reason}"
     return 1
 }
 

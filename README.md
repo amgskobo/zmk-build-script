@@ -2,10 +2,31 @@
 
 [日本語版 README](README.ja.md)
 
-Small Docker + Bash helper for building current-layout ZMK keyboard repositories.
+Docker + Bash builder for ZMK configuration repositories and explicitly selected
+standalone Zephyr applications. It builds one repository, reuses dependencies and
+compiler results, and saves firmware and logs on the host. Maintainer contracts
+are in [AGENTS.md](AGENTS.md).
 
-Usage and runner setup are collected here; maintainer contracts are in [AGENTS.md](AGENTS.md).
-The entry layout is:
+## Requirements and quick start
+
+Use Docker Desktop or Docker Engine with its Linux engine, and Bash with standard
+Unix tools. Git is optional for the production builder. On Windows, use Git Bash;
+PowerShell can launch it explicitly:
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' ./build.sh ../your-zmk-config
+```
+
+From Bash on Windows, macOS, or Linux:
+
+```bash
+./build.sh validate ../your-zmk-config
+./build.sh ../your-zmk-config
+```
+
+The entry point is the repository root containing `build.yaml` and
+`config/west.yml`; direct config directories and custom config paths are not
+supported. The supported layout is:
 
 ```text
 your-zmk-config/
@@ -14,110 +35,61 @@ your-zmk-config/
 |   +-- west.yml
 |   +-- <keyboard>.conf
 |   +-- <keyboard>.keymap
-|   +-- boards/...        # legacy compatibility path; do not use for new repos
-+-- zephyr/
-|   +-- module.yml        # optional module metadata
-+-- boards/...            # standard user/module board and shield definitions
-+-- dts/...               # optional, requires build.settings.dts_root: .
-+-- snippets/<name>/...   # optional, requires build.settings.snippet_root: .
+|   +-- boards/...        # existing compatibility path
++-- zephyr/module.yml     # module metadata
++-- boards/...            # standard board and shield definitions
++-- dts/...               # optional module content
++-- snippets/<name>/...   # optional module content
 ```
 
-The script follows ZMK's search paths instead of banning `config/boards`, but
-new repos should use root `boards/` or an external module. New repositories should declare module roots in `zephyr/module.yml`.
-Explicit `-m` modules require that metadata. Target repositories also support
-the container-only normalization described below. When a
-legacy target repo has root module content plus root `module.yml` but no
-`zephyr/module.yml`, the container creates a transient `zephyr/module.yml` from
-the current root layout. The source repo is not modified.
+Use root `boards/` or external modules for new repositories. Target metadata
+missing from legacy layouts is normalized inside the container; host sources
+are preserved. Explicit `-m` modules require the declarations described below.
 
-## Key Features
+## Commands and options
 
-- Cross-platform host flow: Windows, macOS, and Linux use the same Docker + Bash
-  script entrypoint.
-- Host CPU independent: AMD64/x86_64 and ARM64 hosts run through Docker; the
-  `zmk-build-arm` image name refers to the firmware toolchain, not the host CPU.
-- Explicit module override: each `-m <dir>` can overlay a matching west project
-  or be added as an extra ZMK module. `local_modules/` is ignored.
-- Persistent west workspace: dependencies are reused between runs, while the
-  target config is copied fresh each time.
-- Safe overlay restore: explicit module-input west project overrides are backed up and restored
-  on the next build. If copying a backup fails, the build stops and retains that
-  project's backup and overlay record for recovery.
-- Fast repeat builds: a persistent compiler cache (ccache) lives on the cache
-  volume, and only the files Git shows are copied into the container, so large
-  ignored directories do not slow the copy.
-- Target parallel build: `--jobs N` / `ZMK_BUILD_JOBS=N` can build `build.yaml`
-  targets in parallel. External full/pristine workflow runs default this to 1
-  to avoid stacking target parallelism on top of Ninja's own compile
-  parallelism.
-- One artifact per target: `.uf2` is preferred, with `.bin` / `.hex` fallback
-  support.
-- CI coverage: representative ZMK 4.1 HWMv2 boards, target-shape parsing, and
-  explicit module override paths are validated.
-
-## Requirements
-
-- Docker Desktop or Docker Engine
-- Bash
-
-On Windows, use Git Bash. PowerShell can launch Git Bash, but the script itself
-must run under Bash. Use a normal Bash environment with standard Unix tools
-available.
-
-## Quick Start
-
-Start Docker's Linux engine, then run in Bash on Windows, macOS, or Linux:
-
-```bash
-./build.sh validate ../your-zmk-config
-./build.sh ../your-zmk-config
+```text
+./build.sh <zmk-config-root> [--pristine] [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
+./build.sh validate <zmk-config-root> [--pristine] [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
+./build.sh clean
 ```
 
-On Windows install Git for Windows and launch Git Bash explicitly from PowerShell:
+`validate` checks layout, module metadata and `build.yaml` inside the selected
+image and prints the target list without compiling firmware. Both modes save
+`build.log` and `build-summary.txt` in a new run directory.
 
-```powershell
-& 'C:\Program Files\Git\bin\bash.exe' ./build.sh ../your-zmk-config
-```
+| Option | Meaning |
+| --- | --- |
+| `--pristine` | Delete the selected Docker cache volume before build or validation. Firmware builds also use `west build -p`. |
+| `--settings-reset` | Add a `settings_reset` target for each board that has none. |
+| `-j N`, `--jobs N` | Build targets N at a time (default 1). |
+| `-S NAME`, `--snippet NAME` | Append a snippet to every target; repeatable. |
+| `-m DIR`, `--module DIR` | Copy an explicit module; repeatable. |
+| `-h`, `--help`, `help` | Show usage. |
 
-AMD64/x86_64 and ARM64 hosts use the same entry point; the image name refers to
-the firmware toolchain. Set `ZMK_DOCKER_PLATFORM=linux/amd64` if Docker cannot
-select a usable platform. Give concurrent repositories different cache volumes.
+Target parallelism is separate from Ninja's compile parallelism. Use `--jobs 1`
+for cold builds or limited memory. Parallelism and retry counts must be positive
+decimal integers; all-zero forms such as `00` are rejected.
 
-### Cache and Logs
+| Environment variable | Meaning (default) |
+| --- | --- |
+| `ZMK_BUILD_IMAGE` | Full Docker image override. |
+| `ZMK_BUILD_IMAGE_REPOSITORY` | Image repository (`zmkfirmware/zmk-build-arm`). |
+| `ZMK_BUILD_IMAGE_TAG` | Image tag (`auto`; see Docker image). |
+| `ZMK_DOCKER_PLATFORM` | Optional Docker `--platform` value. |
+| `ZMK_DOCKER_CACHE_VOLUME` | Volume mounted at `/workspaces` (`zmk-cache`). Use a separate volume per repository/tool. |
+| `ZMK_CCACHE_DIR` | ccache directory inside the container (`/workspaces/.ccache`). Keep it on the cache volume for persistence. |
+| `ZMK_COPY_IGNORED` | `1` also copies files ignored by Git. |
+| `ZMK_BUILD_JOBS` | Default for `--jobs` (1). |
+| `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` attempts (3). |
+| `ZMK_FALLBACK_BINARY` | Firmware extension tried after `.uf2` (`bin`). |
+| `ZMK_EXTRA_MODULES` | Container-visible module paths appended to the selected application's extra modules. |
+| `ZMK_KEEP_CONTAINER` | `1` retains the build container after the run. |
+| `ZMK_CONTAINER_NAME` | Optional build container name. |
 
-The compiler cache (ccache) is kept on the same volume in `/workspaces/.ccache`
-(`ZMK_CCACHE_DIR` changes the path), so eligible compiler results survive the
-throw-away build container. The container sets `CCACHE_IGNOREOPTIONS=-specs=*`
-so SDK specs-file lookup does not prevent cache hits. The SDK is part of the
-selected Docker image; use a separate cache or `--pristine` when changing the
-image or SDK. `--pristine` deletes both the west workspace and compiler cache.
+## Build configuration
 
-Build output is also mirrored into the build container's own log stream. With
-`ZMK_KEEP_CONTAINER=1`, you can inspect the same stream later with
-`docker logs -f <container>` or Docker Desktop.
-
-After creation, build and clone operations address the returned container ID,
-including cleanup. Reusing a container name cannot redirect an in-progress run.
-
-## Build
-
-```bash
-./build.sh ../your-zmk-config --pristine
-```
-
-When `build.yaml` contains multiple targets, each target can use its own build
-directory and run in parallel:
-
-```bash
-./build.sh ../your-zmk-config --pristine --jobs 2
-ZMK_BUILD_JOBS=2 ./build.sh ../your-zmk-config --pristine
-```
-
-`--jobs` controls target-level parallelism only. Each target still runs its own
-`west build`, and Ninja may parallelize compilation inside that target. Use
-`--jobs 1` for cold `--pristine` builds on constrained runners.
-
-The target needs `build.yaml` with an `include:` list or a top-level matrix:
+`build.yaml` accepts an `include:` list or a top-level board/shield matrix:
 
 ```yaml
 include:
@@ -127,394 +99,303 @@ include:
     artifact-name: example_corne_left
 ```
 
-Supported per-target keys:
-
-| Key | Meaning |
+| Per-target key | Meaning |
 | --- | --- |
-| `board` | Required. Passed to `west build -b`. |
-| `shield` | Optional. Passed as `-DSHIELD=...`. |
-| `snippet` | Optional. Passed with `west build -S`. |
-| `cmake-args` | Optional. Strings are parsed with `shlex.split`; list entries are literal arguments. Empty strings and quoted/list whitespace are preserved. |
-| `extra-cmake-args` | Optional. Appended after `cmake-args`. |
-| `artifact-name` | Optional output base name. |
-| `skip` | Optional for `include:` entries. Skips the target when true. |
+| `board` | Required board passed to `west build -b`. |
+| `shield` | Optional `-DSHIELD=...`. |
+| `snippet` | Optional `west build -S` argument. |
+| `cmake-args` | String parsed with `shlex.split`, or a list of literal arguments. Empty arguments and quoted/list whitespace are preserved. |
+| `extra-cmake-args` | Arguments appended after `cmake-args`. |
+| `artifact-name` | Output base name; supports `{board}`, `{shield}` and `{snippet}`. |
+| `skip` | Skip an `include:` entry when true. |
 
-Top-level `board:` and `shield:` arrays are expanded as a matrix. `include:`
-entries may also use board/shield arrays. `exclude:` removes matching generated
-targets, and `defaults:` supplies missing target values. `artifact-name` may use
-`{board}`, `{shield}`, and `{snippet}` placeholders.
+Top-level and `include:` board/shield arrays expand as matrices. `defaults:`
+supplies missing values; `exclude:` matches YAML values before CLI snippets are
+appended. Alias spellings `cmake_args`, `extra_cmake_args` and `artifact_name` are
+also accepted. Artifact names are normalized to safe filenames; Windows device
+names, including names with extensions, and case-insensitive duplicates are
+rejected.
 
-Each build target copies back one firmware file only. Preference order is
-`.uf2`, `ZMK_FALLBACK_BINARY` (default `.bin`), `.hex`, then `.bin`.
+For a standalone Zephyr application, add top-level `application: app`. The
+relative directory must contain `CMakeLists.txt` and stay inside the repository,
+including symlinks. The manifest must provide a project named `zephyr`. The
+builder resolves that workspace's Zephyr package and passes extra modules with
+`ZEPHYR_EXTRA_MODULES`. Without `application`, it builds `zmk/app` with ZMK's
+configuration and `ZMK_EXTRA_MODULES` arguments. Select an image with the required
+Zephyr dependencies and a dedicated cache volume for each application.
+Target board, DTS and snippet roots are normalized in this mode too. The builder
+preserves explicit module build declarations and does not infer them from the
+standalone application's CMake or Kconfig entry points.
 
-Artifacts are saved under:
-
-```text
-.build/
-+-- run-YYYY-MM-DD_HH-MM-SS-pid-PID/
-    +-- example_corne_left.uf2
-    +-- build.log
-    +-- build-summary.txt
-```
-
-Run directory names are part of the output contract and must follow
-`run-YYYY-MM-DD_HH-MM-SS-pid-PID`; output checks sort valid run directories by
-that name and fail if a `build-summary.txt` appears outside this convention.
-
-## Options And Environment
-
-```text
-./build.sh <zmk-config-root> [--pristine] [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
-./build.sh validate <zmk-config-root> [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
-./build.sh clean
-```
-
-| Option | Meaning |
-| --- | --- |
-| `--pristine` | Build with `west build -p` and delete the whole Docker cache volume first. The compiler cache lives on that volume, so it is deleted too. |
-| `--settings-reset` | Add a `settings_reset` target for each board that has none. |
-| `--jobs N` | Build `build.yaml` targets N at a time (default 1). |
-| `-S snippet` | Append a snippet to every target. |
-| `-m module-dir` | Add a module (see Explicit Modules). Repeatable. |
-
-| Environment variable | Meaning (default) |
-| --- | --- |
-| `ZMK_BUILD_IMAGE` | Full Docker image override. |
-| `ZMK_BUILD_IMAGE_REPOSITORY` | Image repository (`zmkfirmware/zmk-build-arm`). |
-| `ZMK_BUILD_IMAGE_TAG` | Image tag (`auto`, see Docker Image). |
-| `ZMK_DOCKER_PLATFORM` | Docker `--platform` value. |
-| `ZMK_DOCKER_CACHE_VOLUME` | Volume mounted at `/workspaces` (`zmk-cache`). |
-| `ZMK_CCACHE_DIR` | ccache directory in the container (`/workspaces/.ccache`). |
-| `ZMK_COPY_IGNORED` | `1` copies files that Git ignores too. |
-| `ZMK_BUILD_JOBS` | Same as `--jobs` (1). |
-| `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` attempts (3). |
-| `ZMK_FALLBACK_BINARY` | Firmware extension to try after `.uf2` (`bin`). |
-| `ZMK_EXTRA_MODULES` | Extra module paths appended to the container's `ZMK_EXTRA_MODULES`. |
-| `ZMK_KEEP_CONTAINER` | `1` keeps the build container after the run. |
-| `ZMK_CONTAINER_NAME` | Container name. |
-
-The persistent west workspace is pruned on every run: top-level entries that the
-manifest does not list are removed. Give each tool or repository that uses the
-same Docker image its own `ZMK_DOCKER_CACHE_VOLUME`.
-
-## Validate
+## Modules, snippets and source copy
 
 ```bash
-./build.sh validate ../your-zmk-config
+./build.sh ../your-zmk-config -m ../local-module -S local-snippet
 ```
 
-Validation parses `build.yaml` inside the ZMK Docker image and prints the target
-list. It also writes `build.log` and `build-summary.txt` under `.build/`.
+Each `-m` directory is copied into the container. Its resolved basename, including
+spaces, must be unique. If the name matches a west project, the local copy
+overlays that project after dependency resolution. Otherwise it becomes an extra
+module. Pass every local module explicitly; `local_modules/` is not discovered.
 
-Use `--settings-reset` to add a `settings_reset` build target for each board that
-does not already have one:
-
-```bash
-./build.sh validate ../your-zmk-config --settings-reset
-```
-
-## CI Coverage
-
-The CI fixture focuses on two representative ZMK 4.1 HWMv2 boards:
-
-- `nice_nano/nrf52840/zmk`
-- `xiao_ble/nrf52840/zmk`
-
-Both boards build `settings_reset`; `nice_nano` covers Corne left/right plus the
-heavier snippet, multi-shield, and CMake argument targets, while `xiao_ble`
-covers the XIAO-specific `tester_xiao` shield. This covers the build script's
-common board, shield, snippet, CMake argument, settings reset, and artifact
-collection paths. It is not an exhaustive build of every upstream ZMK board.
-
-Target-shape parsing is covered separately by
-`.github/fixtures/target-shapes-zmk-config`, which is validate-only. It exercises
-top-level matrix expansion, include matrix expansion, `defaults`, `exclude`,
-`skip`, alias keys, placeholders, and `--settings-reset` de-duplication without
-adding more firmware build targets.
-
-Local west project override is covered by
-`.github/fixtures/module-override-zmk-config`. CI copies the resolved
-`zmk-studio-messages` and `zcbor` west projects from the cache, passes both
-back with `-m`, also passes one extra module, asserts both
-`Overlaying module input west project` and `Adding module input as extra module` paths, and
-builds a studio-enabled `.bin` target plus a settings-reset `.hex` target, so
-multiple `-m` inputs, non-UF2 outputs and nested
-paths such as `proto/zmk` stay covered. The follow-up build restores the
-recorded overlay projects from workspace-local backups instead of resetting the
-full Docker volume.
-
-## Extra Snippets
-
-```bash
-./build.sh ../your-zmk-config -S zmk-usb-logging
-```
-
-Extra snippets are appended to every parsed target.
-
-Root snippets must follow Zephyr module rules. Put them at repo root under
-`snippets/` and declare the root in `zephyr/module.yml`:
+Declare root content in `zephyr/module.yml`. Include only the declarations needed
+by that module:
 
 ```yaml
 build:
+  cmake: .                 # root CMakeLists.txt
+  kconfig: Kconfig         # root Kconfig
   settings:
-    snippet_root: .
+    board_root: .          # root boards/
+    dts_root: .            # root dts/
+    snippet_root: .        # root snippets/
 ```
 
-## Explicit Modules
+Module metadata is checked as YAML, including inline maps and quoted keys, before
+changing the persistent workspace. A failed overlay restoration stops the build
+and keeps its backup and recovery record. The next run restores previous
+overlays before applying current inputs.
+Hidden directory names supplied with `-m` are included in the same validated
+input list; module paths are passed internally with NUL delimiters.
+
+Git working trees copy tracked files plus non-ignored untracked files. Deleted
+tracked files are omitted; ignored tracked files remain included. With
+`ZMK_COPY_IGNORED=1`, unavailable Git, failed or empty file listing, or a
+non-working-tree source, copying falls back to the full source with fixed exclusions.
+
+Copying always excludes `.git`, `.west` and `__pycache__`, plus top-level `.zmk`,
+`.build`, `.cache`, `.ccache`, `.vscode`, `build`, `dist`, `node_modules`, `out`,
+`tmp` and `zmk_search`. Matching nested directory names are retained. Dependency
+trees are excluded only when the source has `.west` and the tree has a `.git`
+marker; names such as `modules` or `tools` alone do not exclude source content.
+
+## Cache, cleanup and output
+
+Give concurrent repositories and other tools separate cache volumes:
 
 ```bash
-./build.sh ../your-zmk-config -m ../local-module
+ZMK_DOCKER_CACHE_VOLUME=zmk-cache-my-keyboard ./build.sh ../your-zmk-config
 ```
 
-Modules passed with `-m` are copied into Docker. If the directory name matches a
-west project name, that project is overlaid after `west update`. Otherwise it is
-passed to ZMK through `ZMK_EXTRA_MODULES`. Pass every module explicitly with
-`-m`; this tool does not load `local_modules/`.
+The container keeps a west workspace and copies only `config/` into it. ZMK uses
+`ZMK_CONFIG=/root/zmk-config/config` from the fresh container source. Dependency
+reuse checks the resolved manifest, including imports. Failed or interrupted
+updates are retried; unresolved manifests cannot mark a cache ready. Obsolete
+workspace roots are pruned only after restoring overlays and obtaining a
+complete project list. Use this volume exclusively for the selected source.
+Overlay recovery records each completed project before deleting its backup.
+A later project's failure can therefore be retried without deleting earlier
+restorations. Existing two-column recovery records remain supported.
+An operating-system lock outside the workspace protects dependency updates,
+overlays and build-directory cleanup from overlapping builds on the same cache.
+A competing build fails before changing the workspace. The lock releases when
+the build processes finish, including when the container is retained.
 
-Directory paths such as `module/.` are normalized before naming. Names are
-compared in full, including spaces; only identical directory names are rejected
-as duplicates.
-
-Generated west project directories are filtered per copy source, so cached
-dependencies are skipped without dropping intentional module content.
-
-When a target or `-m` directory is a Git working tree and `git` is available,
-only the files Git shows are copied: tracked files and untracked files that
-`.gitignore` does not match. Ignored bulk such as `artifacts/` or
-`web/node_modules/` stays on the host. Anything else is copied whole. Set
-`ZMK_COPY_IGNORED=1` to copy ignored files too.
-
-If a previous local overlay left files in the persistent west workspace, the
-matching project directory is cleared before `west update` so the next checkout
-does not conflict with stale local files.
-
-## Clean
-
-```bash
-./build.sh clean
-```
-
-Removes generated `.build` runs while keeping `.build/.gitkeep`.
-
-## Self-hosted Runners
-
-Hosted `Compatibility` is the normal compatibility gate. The manual
-`Self-hosted Build` workflow runs the standard fixture on your own machine;
-it adds machine-specific Docker smoke evidence. Use `platform: macos`,
-`windows`, `linux`, or `all`, and `mode: validate` or `build`. Start with validate
-on one online runner, then build. Use `all` after every selected OS is available.
-
-Register through repository Settings → Actions → Runners → New self-hosted
-runner, using the current package, token and command shown by GitHub. Keep the
-default OS labels and add the custom labels after Docker works for that user:
-
-| Host | Labels |
+| Data | Lifetime and cleanup |
 | --- | --- |
-| macOS | `self-hosted`, `macOS`, `zmk-docker`, `zmk-docker-active` |
-| Windows | `self-hosted`, `Windows`, `zmk-docker`, `zmk-docker-active` |
-| Linux | `self-hosted`, `Linux`, `zmk-docker`, `zmk-docker-active` |
+| Per-target build directories | Removed on success, compile failure, or firmware selection/copy failure, including with `ZMK_KEEP_CONTAINER=1`. |
+| Build and clone containers | Removed after use; `ZMK_KEEP_CONTAINER=1` retains only the build container. Operations use the immutable ID returned by Docker. |
+| Dependencies and ccache | Reused on the dedicated volume. `--pristine` deletes the entire selected volume, including ccache. |
+| Host-side URL clone copies | Removed before source success is reported; local-path sources are retained. |
+| Host firmware, logs and test evidence | Kept under this tool's `.build/`. `./build.sh clean` removes everything there except `.gitkeep`. |
 
-Run `bash .github/scripts/check-runner-tools.sh` and the common Maintenance
-checks as the runner user. Windows uses Git Bash at its standard installation
-path. With Docker Desktop, verify the same login/session before installing a
-runner service. Linux needs daemon access without sudo; after adding the runner
-user to the docker group, log in again or restart the runner service.
+Cleanup failures fail the affected target, run or source job. In `build.sh`, earlier
+build errors retain their reason and exit status. External wrappers report source
+failure with a nonzero status and record cleanup errors alongside clone/build failures.
+`--pristine` stops before container creation if listing or removing the selected
+volume fails. It can also reset a cache during validation.
+During execution, SIGINT and SIGTERM finalize a FAILED run with the interruption
+reason. A retained container is stopped on interruption; its identity and logs
+remain available.
+During container creation, the complete response pipeline defers both signals
+until the returned ID has been acquired, including process-group interruptions.
+If a signal arrives after the success summary has been written, including during
+container cleanup, the command can exit nonzero while the summary still says
+`SUCCESS`. Require both a zero command exit status and a successful output check;
+the output checker alone cannot detect this interruption.
 
-Keep self-hosted execution limited to trusted workflows. Remove
-`zmk-docker-active` or stop the runner to take a host out of external auto builds.
-A queued job needs an online, eligible, idle runner; check its account,
-repository/organization assignment and labels. If Docker works in Terminal but
-fails in Actions, compare the account and session. If tar excludes are missing,
-check the runner's normal Bash tools and PATH. A successful run must have matching
-mode, log, summary and exactly one firmware per target before upload.
+ccache lives outside the west workspace on the cache volume. Its
+`CCACHE_IGNOREOPTIONS=-specs=*` setting assumes SDK specs are fixed in the selected
+image. Use a separate cache or `--pristine` after changing the image or SDK.
+File cleanup does not force WSL's memory cache back to Windows; WSL memory
+reclamation belongs to the host operating system.
 
-## Docker Image
-
-The default tag mode is `auto`. In auto mode the script reads
-`config/west.yml`, detects the `zmk` project revision, and chooses the Docker
-image tag:
-
-- `main`, `master`, or unknown revision -> `stable`
-- `v0.3` / `0.3` / `v0.3-*` / `0.3-*` -> `3.5-branch`
-- `v4.1` / `4.1` / `v4.1-*` / `4.1-*` -> `4.1-branch`
-
-For current ZMK `main`, this resolves to:
+Each target returns one firmware file, selected in order: `.uf2`,
+`ZMK_FALLBACK_BINARY`, `.hex`, `.bin`. Fallback extensions omit the leading dot;
+letters, digits, dots, underscores and hyphens are allowed, with no path, glob,
+or leading dot/hyphen. CI uploads the publication reports described below;
+firmware and raw logs remain in local `.build/` storage.
 
 ```text
-zmkfirmware/zmk-build-arm:stable
+.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
++-- example_corne_left.uf2
++-- build.log
++-- build-summary.txt
 ```
 
-Explicit overrides always win:
+Started runs retain a failure summary and error excerpt even when setup, source
+copy, artifact recovery or container cleanup fails. Build output also goes to the
+container log stream; inspect a retained container with `docker logs <container>`.
+Check a specific run with:
 
 ```bash
-ZMK_BUILD_IMAGE=zmkfirmware/zmk-build-arm:stable ./build.sh ../your-zmk-config
-ZMK_BUILD_IMAGE_TAG=4.1-branch ./build.sh ../your-zmk-config
-ZMK_DOCKER_PLATFORM=linux/amd64 ./build.sh ../your-zmk-config
-ZMK_DOCKER_CACHE_VOLUME=zmk-cache-my-keyboard ./build.sh ../your-zmk-config
-ZMK_BUILD_JOBS=2 ./build.sh ../your-zmk-config
-ZMK_WEST_UPDATE_ATTEMPTS=5 ./build.sh ../your-zmk-config
-ZMK_EXTERNAL_CLONE_ATTEMPTS=5 bash ./scripts/build-external-source.sh --repo https://github.com/example/zmk-config.git
+bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID
 ```
 
-## External Repository Auto Builds
+Use `validate` instead of `build` for validation output. Both modes require a
+successful summary with the matching mode and a log file. Build checks also
+require a positive target count and exactly one firmware per build target.
+Run names must follow the displayed convention. The summary records the selected
+fallback; older summaries default to `bin`.
 
-Put one source per line in `repos.txt`. A source may be a ZMK config repository
-URL or a local path. The `Auto Build External ZMK Repos` workflow runs a matrix
-job per source. `build.sh` always handles exactly one target directory; source
-parallelism lives in `scripts/auto-build-external.sh` or the GitHub Actions job
-matrix. Each source job starts one `build.sh` process via
-`scripts/build-external-source.sh`, with slug-specific clone directories, Docker
-cache volumes, container names, and artifact uploads. URL sources are cloned in a
-Docker container and copied back to the host with `docker cp`, so no extra
-required host dependency is added. URL clone is retried 3 times by default; set
-`ZMK_EXTERNAL_CLONE_ATTEMPTS=N` to adjust it. If the host clone destination cannot
-be cleared, the wrapper stops before cloning or copying so stale files cannot be
-merged into the new source. Source lists also support
-`repo:<url>` / `path:<dir>` prefixes. Relative paths are resolved from the
-source list file's directory. For local multi-source runs, `--source-jobs N` /
-`ZMK_EXTERNAL_SOURCE_JOBS=N` controls how many source processes may run at once;
-the wrapper fills an open slot as soon as any source finishes. `--jobs N` still
-controls target-level parallelism inside each source. For external full/pristine
-builds, the GitHub workflow defaults `build_jobs` to 1, and scheduled runs use
-the same fallback. Raise it manually only when the selected runners have enough
-CPU/memory headroom.
+## Docker image
+
+`ZMK_BUILD_IMAGE` overrides the whole image. Otherwise the repository and tag
+variables select it. With tag `auto`, `config/west.yml`'s ZMK revision maps to:
+
+| ZMK revision | Image tag |
+| --- | --- |
+| `main`, `master`, missing or unrecognized | `stable` |
+| `v0.3` / `0.3` series, including patch and suffix revisions | `3.5-branch` |
+| `v4.1` / `4.1` series, including patch and suffix revisions | `4.1-branch` |
+
+The image name describes the firmware toolchain, not the host CPU. Host platform
+support depends on the selected image and Docker; set
+`ZMK_DOCKER_PLATFORM=linux/amd64` when needed. Local checks do not establish native
+ARM64 host compatibility or old-image firmware compatibility.
+
+## External sources
+
+[repos.txt](repos.txt) contains one URL or local path per line. Optional prefixes
+are `repo:` / `url:` and `path:`. List-relative paths resolve from the list file's
+directory. `build.sh` handles one repository; the wrappers own source selection,
+unique slugs and source parallelism:
 
 ```bash
-bash ./scripts/auto-build-external.sh repos.txt --source-jobs 2 --jobs 2 --pristine
-bash ./scripts/build-external-source.sh --repo https://github.com/example/zmk-config.git --jobs 2
-bash ./scripts/build-external-source.sh --path ../your-zmk-config --source-slug your-zmk-config
+bash scripts/auto-build-external.sh repos.txt --source-jobs 2 --jobs 1 --pristine
+bash scripts/auto-build-external.sh --list repos.txt
+bash scripts/auto-build-external.sh --list-json repos.txt
+bash scripts/build-external-source.sh --repo https://github.com/example/zmk-config.git
+bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug example
 ```
 
-In GitHub Actions, failures are isolated to the build job and the matching
-artifact name. For local multi-source runs, the wrapper only starts one script
-process per source, so `build.sh` keeps a single-build log stream. Scheduled
-runs use GitHub Actions UTC cron syntax, with the JST conversion kept in the
-workflow comments. The auto-build workflow has two jobs:
+| Wrapper option | Meaning |
+| --- | --- |
+| `--repo URL`, `--path DIR` | Select an explicit source type. |
+| `--source-slug NAME`, `--repo-slug NAME` | Set a source's slug; in the multi-source wrapper, place it after `--repo` / `--path`. |
+| `--mode build\|validate` | Select build or validation. |
+| `--pristine`, `--settings-reset`, `-j` / `--jobs`, `-S` / `--snippet`, `-m` / `--module` | Forward builder options, including pristine validation. |
+| `--source-jobs N` | Bound local source parallelism in `auto-build-external.sh`. Each worker still has its own target parallelism. |
+| `--sources-file FILE`, `--repos-file FILE` | Select a source list in `auto-build-external.sh`. |
+| `--list`, `--list-json` / `--matrix-json` | Print resolved sources or the JSON matrix without building. |
+| `--list-indices-json` | Print only numeric source indices for a public CI matrix. |
+| `--source-index N` | Select one source from the fully resolved list, preserving its unique slug; indices start at 1. |
 
-1. **sources** (on `ubuntu-latest`): Resolves `repos.txt` into a JSON matrix
-   via `auto-build-external.sh --list-json` and passes it through
-   `job outputs`.
-2. **build** (matrix per source): Each source runs
-   `build-external-source.sh` as an independent job on
-   `runs-on: [self-hosted, zmk-docker, zmk-docker-active]`.
-
-GitHub Actions label routing dispatches each build matrix job to any online
-runner that carries both custom labels. Multiple idle runners can pick up
-different sources in parallel. The OS is not pinned in the workflow; the
-picked runner's OS is read from `runner.os` and is used to branch shell steps
-(Git Bash on Windows, Bash on macOS / Linux) and to label the uploaded
-artifact. Manual workflow runs expose `source_jobs`, which maps to
-`strategy.max-parallel` and caps how many source matrix jobs run at once
-(scheduled runs default to 4). Manual runs also expose `build_jobs`; it controls
-target-level parallelism inside each source job and defaults to 1 for
-full/pristine safety. If all matching runners are offline, jobs sit queued until
-a runner comes online; `concurrency` with `cancel-in-progress: true` ensures
-scheduled runs do not pile up on top of stale queued runs. To offload a specific
-host, remove its `zmk-docker-active` label or stop the runner.
-
-## What The Script Does
-
-1. Copies the target repo into `/root/zmk-config` in Docker. In a Git working
-   tree only the files Git shows are copied (see Explicit Modules).
-2. Skips top-level local/generated directories such as `.cache`, `.ccache`, `.vscode`,
-   `build`, `dist`, `node_modules`, `out`, `tmp`, and `zmk_search`.
-3. Normalizes legacy root `module.yml` to a transient `zephyr/module.yml` when
-   root module content needs to be exposed to Zephyr.
-4. Copies only `config/` into the persistent west workspace.
-5. Builds with `ZMK_CONFIG=/root/zmk-config/config` so ZMK can see both
-   `config/boards` and root `boards`.
-6. If `zephyr/module.yml` exists, passes `/root/zmk-config` through
-   `ZMK_EXTRA_MODULES`.
-7. Restores previous overlays before deciding whether the workspace needs `west update`.
-   Prunes obsolete workspace roots only after obtaining a complete west project
-   list. An unavailable or partial list preserves the cache and requires an update;
-   a failed update cannot continue without a complete project list.
-   Cache validation uses west's resolved manifest, including imported dependency
-   definitions. Changes to those definitions trigger an update; an unresolved
-   manifest cannot mark the cache ready. Only a complete update verifies the cache.
-   Failed/interrupted updates are retried on the next build even if partial checkout
-   directories exist. Older cache markers trigger a fresh verification once.
-   Continuation with local overrides requires every failed project from the final
-   attempt to be identified and supplied locally.
-8. Applies the current explicit module overrides after dependency resolution,
-   recording recovery before copying so interrupted overlays can be restored.
-9. Builds each generated `build.yaml` target, optionally in parallel with one
-   build directory per target, using the compiler cache on the cache volume.
-10. Copies one firmware artifact per target back to `.build/`.
-11. Writes `build.log` and `build-summary.txt`, including a failure excerpt when
-   validation or firmware build fails.
-
-## Maintenance
-
-`build.sh` owns one configuration and its copy/workspace/output flow.
-`scripts/auto-build-external.sh` owns source lists, JSON matrices, unique slugs
-and the bounded queue; `scripts/build-external-source.sh` clones or selects one
-source and invokes the builder. Fixtures and behavior checks stay in `.github/`.
-Read [AGENTS.md](AGENTS.md) before changing these contracts.
-
-External wrappers also accept `--mode build|validate`, `--pristine`,
-`--settings-reset`, and repeated `-S` / `-m`. Their defaults are:
-
-| Environment | Default |
+| Wrapper environment | Default / purpose |
 | --- | --- |
 | `ZMK_EXTERNAL_MODE` | `build` |
 | `ZMK_EXTERNAL_PRISTINE` | `0` |
 | `ZMK_EXTERNAL_SETTINGS_RESET` | `0` |
 | `ZMK_EXTERNAL_SOURCE_JOBS` | `1` |
-| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external` |
+| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external`; each source adds its unique slug. |
 | `ZMK_EXTERNAL_CLONE_IMAGE` | `zmkfirmware/zmk-build-arm:stable` |
 | `ZMK_EXTERNAL_CLONE_ATTEMPTS` | `3` |
-| `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh` |
+| `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh`; worker used by the multi-source wrapper. |
 
-Run the same entry point locally and in CI:
+URL cloning runs in Docker and returns files with `docker cp`, requiring no host
+Git installation or bind mount. Windows-incompatible filenames are removed with
+warnings only for Windows hosts. Clone cleanup is limited to a child of the
+resolved clone root; removal failures stop the source job. Each source has its
+own clone directory, cache, container and artifacts. Workers that fail or exit
+before recording status count as failures; other sources continue and fill free
+slots immediately.
+
+## Workflows and self-hosted runners
+
+| Workflow | Purpose |
+| --- | --- |
+| [Compatibility](.github/workflows/compatibility.yml) | Hosted shell checks on Windows/macOS/Linux; Docker and firmware checks on Ubuntu. |
+| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | Manual `platform: macos\|windows\|linux\|all`, `mode: validate\|build`. Validate runs shell and Docker contracts; build also compiles fixtures. |
+| [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Resolve the list on Ubuntu, then route each source to an eligible self-hosted runner. |
+| [Heartbeat](.github/workflows/heartbeat.yml) | Update the tracked heartbeat record; this workflow commits and pushes. |
+
+CI publishes only fixed-field text reports under `.build/public/`. These contain
+the command outcome and recognized test statuses. Raw environment records,
+paths, source labels, runner names, logs and firmware are excluded from automatic
+uploads. External jobs use a numeric source index in their public names.
+These reports are sanitized copies, separate from the raw evidence. On hosted
+runners, raw evidence is temporary and is lost when the job is removed; detailed
+diagnosis requires a local reproduction or separately reviewed private retrieval.
+
+Register runners through repository Settings → Actions → Runners with GitHub's
+current package and registration command. Keep default `self-hosted` and OS
+labels (`macOS`, `Windows`, `Linux`), and add `zmk-docker` and `zmk-docker-active`
+after confirming Docker access as the runner user.
+
+Run `bash .github/scripts/check-runner-tools.sh` and the maintenance checks as
+that user. Windows steps explicitly use Git Bash at its standard installation
+path. Docker Desktop must be accessible in the same account/session. Linux needs
+Docker daemon access without sudo; refresh the login/service after group changes.
+Limit self-hosted execution to trusted workflows.
+
+External matrix jobs use `runner.os` for Bash/Git Bash selection and artifact
+names. `source_jobs` caps matrix parallelism (default 4); `build_jobs` controls
+target parallelism (default 1). Scheduled runs use these defaults and pristine
+builds. Cron schedules are UTC, with JST comments in each workflow; concurrency
+and timeouts limit overlap. With no eligible online runner, jobs remain queued.
+Check online/busy state, labels and registration scope. Remove
+`zmk-docker-active` or stop a runner to exclude it from external jobs.
+
+## Maintenance
+
+Read [AGENTS.md](AGENTS.md) before changing behavior. Local and CI checks share
+one entry point:
 
 ```bash
 bash .github/scripts/test.sh shell
 bash .github/scripts/test.sh docker
 bash .github/scripts/test.sh build
-# Or all three, in order:
 bash .github/scripts/test.sh all
 ```
 
-| Layer | Contracts |
+CI uses `bash .github/scripts/check-build-output.sh ci-tests <mode>` to run that
+same entry point while retaining detailed console output in local `.build/`
+logs, using a fresh `.build/ci-execution.XXXXXX/` for each command. `ci-tools`,
+`ci-lf`, `ci-syntax`, `ci-source <wrapper arguments>` and `ci-check build|validate`
+provide the same boundary for external builds. `publish clear` initializes the
+known report files before a job, and `publish verify` checks the final payload
+before upload. Both steps must succeed for the upload to run. Every test invocation also writes its report;
+`publish tests-shell|tests-docker|tests-build|tests-all EXIT RAW_DIRECTORY` can
+regenerate a test report, and `publish build|validate EXIT` records an external
+command outcome. Only exit statuses and recognized case names/statuses are copied.
+
+External CI uses `ci-matrix` and `ci-source-index N` with a private
+`.build/ci-source-file` selector prepared from the workflow event at runtime.
+Only numeric indices enter the matrix and step environment; source paths, URLs
+and slugs stay out of runner-generated step details as well as command output.
+The selector preparation uses the Node runtime bundled with `actions/github-script`;
+it adds no host requirement to the local CLI. Module metadata is checked even
+when its build files are entirely below `zephyr/`, before workspace changes.
+
+| Layer | Scope |
 | --- | --- |
-| `shell` | Bash syntax, LF and Git checkout behavior, whitespace, output validation, source lists/queue/failures, host guards and help |
-| `docker` | Actual host copy, Git ignore and opt-outs, generated dependencies, metadata normalization, exact parser traces and invalid schema, controlled overlay/update failure and recovery, retries and stale locks, path guards, ccache hits, Windows clone pruning and copy back |
-| `build` | Standard firmware targets, explicit project overlays plus an extra module, restoration without pristine, exact output count and dependency identities |
+| `shell` | Bash syntax, LF/checkout, whitespace, output checks, source queue/failures, host guards and help. Git is required for this test layer. |
+| `docker` | Actual source copy, metadata, production parser, controlled workspace/update/overlay failures, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
+| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets; exact outputs and dependency identities. |
 
-Each invocation creates `.build/test-<UTC>-pid-<PID>/` with commands, ordered raw
-logs, per-case status/timing and source checksums before/after. Existing evidence
-is never overwritten. `ZMK_TEST_RESULTS` can select a new directory outside the
-repository or inside a Git-ignored directory; visible in-tree evidence is rejected
-before testing because it would be included in source checksums.
-`ZMK_DOCKER_CACHE_VOLUME` can select a dedicated reusable test cache. The default
-is a fresh cache name, removed after the run; an explicitly supplied cache is retained. `ZMK_TEST_PRISTINE=1` resets that test cache before the
-standard build; restoration always keeps it. Never point tests at a shared
-production cache. Docker tests use the image's Python/PyYAML, with no extra host
-installation. Build checks pass the exact output directory to the checker;
-concurrent runs cannot change which result is checked.
+The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
+covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
+The fixtures exercise representative boards and outputs, not every upstream board.
 
-The shell layer needs Git; the production builder still treats Git as optional.
-Use `.gitattributes` and `.editorconfig` for UTF-8/LF. The checker rejects CR in
-tracked and visible untracked text, reads Windows bytes without text conversion,
-and leaves ignored outputs and binary files untouched. CI checks the checkout
-without resetting a user's worktree.
+Each invocation records commands, raw logs, status/timing, image identity and
+source checksums before/after in a fresh `.build/test-<UTC>-pid-<PID>/`.
+`ZMK_TEST_RESULTS` can select another new directory outside the repository or
+fully ignored by Git. Existing evidence is never overwritten. Use UTF-8/LF via
+`.gitattributes` and `.editorconfig`; checks preserve the working tree.
 
-Counts are positive decimal integers; all-zero forms such as `00` are rejected.
-Killed source workers count as failures and release their queue slots so other
-sources continue. Started runs keep failure summaries even for host setup errors.
-Only containers created by that run are cleaned up.
-
-Output checking requires a positive target count and exactly one firmware per
-target. The selected fallback is recorded in the summary (older summaries use
-`bin`). Extensions omit the leading dot and permit letters, digits, dots,
-underscores and hyphens; paths, globs and leading dot/hyphen are rejected.
-Workflow uploads cover `.uf2`, `.hex`, `.bin`; add a pattern for other formats.
-Explicit module roots require `build.cmake`, `build.kconfig`, and the applicable
-`build.settings.*_root` declarations for root content. Module metadata is parsed
-as YAML inside Docker, including inline maps, before changing the persistent
-workspace or updating dependencies. Windows reserved artifact names
-are rejected even when followed by an extension.
-
-Local checks and remote workflows are separate results; changes remain local
-until publication is explicitly requested.
+Tests create and remove a dedicated cache by default. An explicitly supplied
+`ZMK_DOCKER_CACHE_VOLUME` is reused and retained; never use a production cache.
+`ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while
+restoration always retains it. Each build/validate result is checked immediately
+using its exact run directory. Report local, remote CI, host-platform and physical
+hardware evidence separately. Publication requires an explicit user instruction.

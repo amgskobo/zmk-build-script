@@ -30,7 +30,7 @@ env:
 
 jobs:
   macos:
-    name: macOS self-hosted ${{ inputs.mode }}
+    name: macOS self-hosted verification
     if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: [self-hosted, macOS, zmk-docker, zmk-docker-active]
     timeout-minutes: 180
@@ -39,28 +39,36 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - name: Initialize publication reports
+        id: publication-init
+        run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell and Docker contracts
         run: |
           if [ "${BUILD_MODE}" = build ]; then
-            bash .github/scripts/test.sh all
+            bash .github/scripts/check-build-output.sh ci-tests all
           else
-            bash .github/scripts/test.sh shell
-            bash .github/scripts/test.sh docker
+            bash .github/scripts/check-build-output.sh ci-tests shell
+            bash .github/scripts/check-build-output.sh ci-tests docker
           fi
-      - name: Upload test evidence and firmware
+      - name: Verify publication payload
+        id: publication-check
         if: always()
+        run: bash .github/scripts/check-build-output.sh publish verify
+      - name: Upload publication reports
+        if: ${{ always() && steps.publication-init.outcome == 'success' && steps.publication-check.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: zmk-self-hosted-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .build/test-*/**
-            .build/run-*/**
+            .build/public/tests-shell.txt
+            .build/public/tests-docker.txt
+            .build/public/tests-all.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
   windows:
-    name: Windows self-hosted ${{ inputs.mode }}
+    name: Windows self-hosted verification
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: [self-hosted, Windows, zmk-docker, zmk-docker-active]
     timeout-minutes: 180
@@ -69,28 +77,36 @@ jobs:
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
     steps:
       - uses: actions/checkout@v6
+      - name: Initialize publication reports
+        id: publication-init
+        run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell and Docker contracts
         run: |
           if [ "${BUILD_MODE}" = build ]; then
-            bash .github/scripts/test.sh all
+            bash .github/scripts/check-build-output.sh ci-tests all
           else
-            bash .github/scripts/test.sh shell
-            bash .github/scripts/test.sh docker
+            bash .github/scripts/check-build-output.sh ci-tests shell
+            bash .github/scripts/check-build-output.sh ci-tests docker
           fi
-      - name: Upload test evidence and firmware
+      - name: Verify publication payload
+        id: publication-check
         if: always()
+        run: bash .github/scripts/check-build-output.sh publish verify
+      - name: Upload publication reports
+        if: ${{ always() && steps.publication-init.outcome == 'success' && steps.publication-check.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: zmk-self-hosted-windows-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .build/test-*/**
-            .build/run-*/**
+            .build/public/tests-shell.txt
+            .build/public/tests-docker.txt
+            .build/public/tests-all.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
   linux:
-    name: Linux self-hosted ${{ inputs.mode }}
+    name: Linux self-hosted verification
     if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
     runs-on: [self-hosted, Linux, zmk-docker, zmk-docker-active]
     timeout-minutes: 180
@@ -99,22 +115,30 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - name: Initialize publication reports
+        id: publication-init
+        run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell and Docker contracts
         run: |
           if [ "${BUILD_MODE}" = build ]; then
-            bash .github/scripts/test.sh all
+            bash .github/scripts/check-build-output.sh ci-tests all
           else
-            bash .github/scripts/test.sh shell
-            bash .github/scripts/test.sh docker
+            bash .github/scripts/check-build-output.sh ci-tests shell
+            bash .github/scripts/check-build-output.sh ci-tests docker
           fi
-      - name: Upload test evidence and firmware
+      - name: Verify publication payload
+        id: publication-check
         if: always()
+        run: bash .github/scripts/check-build-output.sh publish verify
+      - name: Upload publication reports
+        if: ${{ always() && steps.publication-init.outcome == 'success' && steps.publication-check.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: zmk-self-hosted-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .build/test-*/**
-            .build/run-*/**
+            .build/public/tests-shell.txt
+            .build/public/tests-docker.txt
+            .build/public/tests-all.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
