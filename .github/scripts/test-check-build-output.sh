@@ -352,7 +352,12 @@ foreign="${tmp_dir}/foreign-publication"
 mkdir -p "${foreign}"
 printf 'preserve\n' > "${foreign}/keep.txt"
 rm -rf "${ci_root}/.build/public"
-ln -s "${foreign}" "${ci_root}/.build/public"
+# Git Bash defaults to copying symlink targets. Use its unprivileged MSYS link
+# format for this Bash-only fixture; POSIX ln ignores the scoped setting.
+MSYS=winsymlinks:sys ln -s "${foreign}" "${ci_root}/.build/public"
+[ -L "${ci_root}/.build/public" ] || {
+  echo 'publication fixture is not a symlink' >&2; exit 1
+}
 if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh publish clear) >/dev/null 2>&1; then exit 1; fi
 grep -qx preserve "${foreign}/keep.txt"
 

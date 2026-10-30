@@ -198,6 +198,8 @@ pristine 無しの復元を影響範囲に応じて確認し、各成功 build /
 - 実行中の script を編集しない。修正後の source を固定して再実行し、前後 checksum が違う結果は最新 source の PASS としない。
 - test は `bash <script>`、temp path は `pwd -P` を使う。host guard は到達 sentinel と拒否条件の両方を確認する。
   executable bit や Windows fake-bin の未正規化 path に依存しない。
+- Bash 用 symlink fixture は Git Bash の copy fallback を避け、作成後に `-L` で確認する。
+  必要な MSYS link mode は作成 command だけに指定し、権限不足による skip や拒否 assertion の省略で代用しない。
 - LF は `.gitattributes` / `.editorconfig` に従う。raw byte を直接検査して CRLF / bare CR / Control-Z / 大きな入力 /
   Git failure を見逃さず、検証のために working tree を reset / 書換えしない。
 - 独立した Docker 条件は同一 container に集約する。parser は production を実行して値・順序・実 argv を検査する。
