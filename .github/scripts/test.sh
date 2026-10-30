@@ -20,14 +20,20 @@ esac
 export ZMK_TEST_RESULTS="${result_dir}"
 cache_supplied="${ZMK_DOCKER_CACHE_VOLUME:-}"
 cache_owned=0
+suite_complete=0
 export ZMK_DOCKER_CACHE_VOLUME="${ZMK_DOCKER_CACHE_VOLUME:-zmk-test-$(date -u +%Y%m%d%H%M%S)-$$}"
 cleanup_cache() {
   local status=$?
+  if [ "${suite_complete}" != 1 ] && [ "${status}" = 0 ]; then status=1; fi
   if [ "${cache_owned}" = 1 ]; then
     if ! docker volume rm "${ZMK_DOCKER_CACHE_VOLUME}" > "${result_dir}/cache-cleanup.log" 2>&1; then
       echo "Test cache cleanup failed: ${ZMK_DOCKER_CACHE_VOLUME}; see cache-cleanup.log" >&2
       status=1
     fi
+  fi
+  if ! bash "${repo_root}/.github/scripts/check-build-output.sh" publish "tests-${mode}" "${status}" "${result_dir}"; then
+    echo 'Publication report preparation failed.' >&2
+    status=1
   fi
   exit "${status}"
 }
@@ -111,4 +117,5 @@ if ! cmp -s "${result_dir}/source-before.txt" "${result_dir}/source-after.txt"; 
 fi
 rm "${result_dir}/file-list"
 printf '[test] Evidence: %s\n' "${result_dir}"
+suite_complete=1
 exit "${failed}"

@@ -28,6 +28,7 @@ loaded_default_sources=0
 UNIQUE_SLUG=""
 CLASSIFIED_TYPE=""
 CLASSIFIED_VALUE=""
+SOURCE_INDEX=""
 
 usage() {
     cat <<'EOF'
@@ -37,6 +38,7 @@ Usage:
   bash scripts/auto-build-external.sh --path <zmk-config-root> [--source-slug <slug>] [--jobs N] [--source-jobs N]
   bash scripts/auto-build-external.sh --list [sources.txt | source ...]
   bash scripts/auto-build-external.sh --list-json [sources.txt | source ...]
+  bash scripts/auto-build-external.sh --list-indices-json [sources.txt | source ...]
 
 sources.txt accepts one source per line. Each source may be a Git URL or a
 local zmk-config path. Optional prefixes are supported: repo:<url>, path:<dir>.
@@ -50,6 +52,8 @@ Options:
   --settings-reset        Add missing settings_reset targets.
   -S, --snippet NAME      Append a snippet to every target; repeatable.
   -m, --module DIR        Pass an explicit module directory; repeatable.
+  --source-index N       Select one source by its one-based index after resolving the list.
+  --list-indices-json    Print only numeric source indices for a public CI matrix.
 
 See README.md or README.ja.md for environment variables and runner setup.
 EOF
@@ -233,7 +237,7 @@ print_list() {
 }
 
 print_list_json() {
-    local i cache_volume comma=""
+    local i cache_volume comma="" indices_only="${1:-0}"
     if [ ${#source_values[@]} -eq 0 ]; then
         printf '{"include":[]}'
         return 0
@@ -241,9 +245,15 @@ print_list_json() {
 
     printf '{"include":['
     for i in "${!source_values[@]}"; do
+        if [ "${indices_only}" = 1 ]; then
+            printf '%s{"index":%s}' "${comma}" "$((i + 1))"
+            comma=","
+            continue
+        fi
         cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${slugs[$i]}"
-        printf '%s{"slug":"%s","cache_volume":"%s","type":"%s","source":"%s"}' \
+        printf '%s{"index":%s,"slug":"%s","cache_volume":"%s","type":"%s","source":"%s"}' \
             "${comma}" \
+            "$((i + 1))" \
             "$(json_escape "${slugs[$i]}")" \
             "$(json_escape "${cache_volume}")" \
             "$(json_escape "${source_types[$i]}")" \
@@ -404,6 +414,15 @@ while [ "$#" -gt 0 ]; do
         --list-json|--matrix-json)
             mode="list-json"
             ;;
+        --list-indices-json)
+            mode="list-indices-json"
+            ;;
+        --source-index)
+            [ "$#" -ge 2 ] || { echo 'ERROR: --source-index requires a value' >&2; exit 1; }
+            SOURCE_INDEX="$2"
+            validate_positive_int 'source index' "${SOURCE_INDEX}"
+            shift
+            ;;
         --repo)
             [ "$#" -ge 2 ] || { echo "ERROR: --repo requires a value" >&2; exit 1; }
             add_source "repo" "$2"
@@ -501,6 +520,16 @@ if [ ${#source_values[@]} -eq 0 ]; then
     load_default_sources
 fi
 
+if [ -n "${SOURCE_INDEX}" ]; then
+    validate_positive_int 'source index' "${SOURCE_INDEX}"
+    [ "${SOURCE_INDEX}" -le "${#source_values[@]}" ] || { echo 'ERROR: source index is out of range' >&2; exit 1; }
+    while [ "${SOURCE_INDEX#0}" != "${SOURCE_INDEX}" ]; do SOURCE_INDEX="${SOURCE_INDEX#0}"; done
+    selected_index=$((SOURCE_INDEX - 1))
+    source_types=("${source_types[$selected_index]}")
+    source_values=("${source_values[$selected_index]}")
+    slugs=("${slugs[$selected_index]}")
+fi
+
 case "${mode}" in
     list)
         print_list
@@ -508,6 +537,10 @@ case "${mode}" in
         ;;
     list-json)
         print_list_json
+        exit 0
+        ;;
+    list-indices-json)
+        print_list_json 1
         exit 0
         ;;
 esac

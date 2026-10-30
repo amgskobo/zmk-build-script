@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ZMK local build helper for current ZMK config/module layout.
+# Docker build helper for ZMK configs and explicit Zephyr applications.
 set -euo pipefail
 
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -30,7 +30,7 @@ usage() {
     cat <<'EOF'
 Usage:
   ./build.sh <zmk-config-root> [--pristine] [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
-  ./build.sh validate <zmk-config-root> [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
+  ./build.sh validate <zmk-config-root> [--pristine] [--settings-reset] [--jobs N] [-S snippet] [-m module-dir]
   ./build.sh clean
 
 Supported target layout:
@@ -116,6 +116,32 @@ if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
         [ -f "${SOURCE_DIR}/${CONFIG_DIR}/west.yml" ] ||
             fail "current ZMK layout requires ${CONFIG_DIR}/west.yml"
 
+        # An explicit application is a standalone Zephyr app in the input tree.
+        # Resolve it before touching the persistent workspace.
+        APPLICATION_SOURCE="$(python3 - "${SOURCE_DIR}" "${BUILD_YAML}" <<'PY'
+import pathlib
+import sys
+import yaml
+
+root = pathlib.Path(sys.argv[1]).resolve()
+with (root / sys.argv[2]).open(encoding="utf-8") as source:
+    document = yaml.safe_load(source) or {}
+value = document.get("application") if isinstance(document, dict) else None
+if value is None:
+    print("zmk/app")
+else:
+    if not isinstance(value, str) or not value.strip() or "\\" in value:
+        sys.exit("application must be a relative directory in the target repository")
+    path = pathlib.PurePosixPath(value)
+    resolved = (root / path).resolve()
+    if path.is_absolute() or ".." in path.parts or ":" in value or not resolved.is_relative_to(root):
+        sys.exit("application must stay inside the target repository")
+    if not (resolved / "CMakeLists.txt").is_file():
+        sys.exit("application requires CMakeLists.txt: " + value)
+    print(resolved)
+PY
+        )" || fail "invalid application layout"
+
         normalize_target_module_metadata
 
         validate_module_roots "${SOURCE_DIR}" "target" "target"
@@ -130,16 +156,20 @@ if [ "${ZMK_IN_CONTAINER:-0}" = "1" ]; then
             log "Allowing legacy zephyr/ module content in target repo"
         fi
 
-        if [ -f "${SOURCE_DIR}/CMakeLists.txt" ]; then
-            cmake_path="."
-        elif [ -f "${SOURCE_DIR}/zephyr/CMakeLists.txt" ]; then
-            cmake_path="zephyr"
-        fi
+        # Standalone applications own their CMake/Kconfig entry points. Only infer
+        # module build files for ZMK; preserve explicit declarations in either mode.
+        if [ "${APPLICATION_SOURCE}" = "zmk/app" ]; then
+            if [ -f "${SOURCE_DIR}/CMakeLists.txt" ]; then
+                cmake_path="."
+            elif [ -f "${SOURCE_DIR}/zephyr/CMakeLists.txt" ]; then
+                cmake_path="zephyr"
+            fi
 
-        if [ -f "${SOURCE_DIR}/Kconfig" ]; then
-            kconfig_path="Kconfig"
-        elif [ -f "${SOURCE_DIR}/zephyr/Kconfig" ]; then
-            kconfig_path="zephyr/Kconfig"
+            if [ -f "${SOURCE_DIR}/Kconfig" ]; then
+                kconfig_path="Kconfig"
+            elif [ -f "${SOURCE_DIR}/zephyr/Kconfig" ]; then
+                kconfig_path="zephyr/Kconfig"
+            fi
         fi
 
         [ ! -d "${SOURCE_DIR}/boards" ] || need_board_root=1
@@ -249,8 +279,10 @@ PY
             need_build_keys+=(kconfig)
         fi
 
-        [ ${#need_settings[@]} -gt 0 ] || [ ${#need_build_keys[@]} -gt 0 ] || return 0
         local module_yml="${root}/zephyr/module.yml"
+        if [ ! -f "${module_yml}" ] && [ ${#need_settings[@]} -eq 0 ] && [ ${#need_build_keys[@]} -eq 0 ]; then
+            return 0
+        fi
         [ -f "${module_yml}" ] ||
             fail "${label}: root module content requires zephyr/module.yml"
 
@@ -455,7 +487,7 @@ PY
 
     clear_local_overlay_projects() {
         local mod name project_path
-        while IFS= read -r mod; do
+        while IFS= read -r -d '' mod; do
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             if project_path="$(project_path_for_name "${name}")" && [ -e "${WORK_DIR}/${project_path}" ]; then
@@ -466,32 +498,86 @@ PY
     }
 
     clear_recorded_local_overlays() {
-        local name project_path backup_path need_update=1
+        local name project_path state backup_path need_update=1
         [ -f "${LOCAL_OVERLAY_STAMP}" ] || return 1
 
-        while IFS=$'\t' read -r name project_path; do
+        while IFS=$'\t' read -r name project_path state; do
             [ -n "${project_path}" ] || continue
             case "/${project_path}/" in
                 //*|*/../*) fail "invalid recorded module input overlay path: ${project_path}" ;;
             esac
             backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
+            case "${state}" in
+                restored)
+                    mark_overlay_restore_state "${name}" "${project_path}" restored ||
+                        fail "failed to record restored module input overlay: ${name}"
+                    rm -rf "${backup_path}" || fail "failed to remove restored overlay backup: ${name}"
+                    continue ;;
+                ""|refresh) ;;
+                *) fail "invalid recorded module input overlay state" ;;
+            esac
             if [ -d "${backup_path}" ]; then
                 log "Restoring previous module input overlay from backup: ${name} -> ${project_path}"
                 # This function runs in an if condition, which disables implicit errexit.
                 # Stop before discarding recovery state when either copy backend fails.
                 copy_tree "${backup_path}" "${WORK_DIR}/${project_path}" ||
                     fail "failed to restore module input overlay: ${name} -> ${project_path}"
+                mark_overlay_restore_state "${name}" "${project_path}" restored ||
+                    fail "failed to record restored module input overlay: ${name}"
                 rm -rf "${backup_path}" || fail "failed to remove restored overlay backup: ${name}"
             elif [ -e "${WORK_DIR}/${project_path}" ]; then
+                mark_overlay_restore_state "${name}" "${project_path}" refresh ||
+                    fail "failed to record module input overlay refresh: ${name}"
                 log "Clearing previous module input overlay: ${name} -> ${project_path}"
                 rm -rf "${WORK_DIR:?}/${project_path}" || fail "failed to clear previous module input overlay: ${name}"
                 need_update=0
             else
+                mark_overlay_restore_state "${name}" "${project_path}" refresh ||
+                    fail "failed to record module input overlay refresh: ${name}"
                 need_update=0
             fi
         done < "${LOCAL_OVERLAY_STAMP}"
         rm -f "${LOCAL_OVERLAY_STAMP}" || fail "failed to clear module input overlay records"
         return "${need_update}"
+    }
+
+    mark_overlay_restore_state() {
+        python3 - "${LOCAL_OVERLAY_STAMP}" "$1" "$2" "$3" <<'PY'
+import os
+import pathlib
+import sys
+import tempfile
+
+stamp = pathlib.Path(sys.argv[1])
+name, path, state = sys.argv[2:]
+lines = stamp.read_text(encoding="utf-8").splitlines()
+updated = []
+found = False
+for line in lines:
+    fields = line.split("\t")
+    if fields[:2] == [name, path]:
+        fields = [name, path, state]
+        found = True
+    updated.append("\t".join(fields))
+if not found:
+    sys.exit("overlay recovery record is missing")
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=stamp.parent, delete=False) as output:
+        temporary = output.name
+        output.write("\n".join(updated) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, stamp)
+    directory = os.open(stamp.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if temporary and os.path.exists(temporary):
+        os.unlink(temporary)
+PY
     }
 
     backup_module_input_overlay_project() {
@@ -519,6 +605,22 @@ PY
         return 1
     }
 
+    acquire_workspace_lock() {
+        mkdir -p "${WORK_DIR}"
+        # Keep the inode outside the workspace: pruning or build cleanup must not unlink it.
+        # The parent shell retains this open description after Python acquires the lock.
+        exec 9>"${WORK_DIR}/../.zmk-build.lock"
+        python3 - <<'PY'
+import fcntl
+import sys
+
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit("persistent workspace is already in use by another build")
+PY
+    }
+
     ensure_west_workspace() {
         sync_config_to_workspace
         cd "${WORK_DIR}"
@@ -538,7 +640,8 @@ PY
         fi
         clear_local_overlay_projects
 
-        if manifest_changed || [ ! -d zmk ] || ! west list >/dev/null 2>&1 || workspace_projects_missing; then
+        if manifest_changed || { [ "${APPLICATION_SOURCE}" = "zmk/app" ] && [ ! -d zmk ]; } ||
+            ! west list >/dev/null 2>&1 || workspace_projects_missing; then
             need_full_update=1
         fi
 
@@ -581,8 +684,8 @@ PY
     module_input_dirs() {
         local mod
         if [ -d "${EXTERNAL_MODULES_DIR}" ]; then
-            for mod in "${EXTERNAL_MODULES_DIR}"/*; do
-                [ -d "${mod}" ] && printf '%s\n' "${mod}"
+            for mod in "${EXTERNAL_MODULES_DIR}"/* "${EXTERNAL_MODULES_DIR}"/.[!.]* "${EXTERNAL_MODULES_DIR}"/..?*; do
+                [ -d "${mod}" ] && printf '%s\0' "${mod}"
             done
         fi
     }
@@ -600,7 +703,7 @@ EOF
 
     validate_module_inputs() {
         local mod name seen=()
-        while IFS= read -r mod; do
+        while IFS= read -r -d '' mod; do
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             if name_in "${name}" ${seen[@]+"${seen[@]}"}; then
@@ -615,7 +718,7 @@ EOF
         local mod name project_path extra_path
         EXTRA_MODULE_PATHS=()
 
-        while IFS= read -r mod; do
+        while IFS= read -r -d '' mod; do
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             if project_path="$(project_path_for_name "${name}")"; then
@@ -968,9 +1071,9 @@ PY
         fail "no firmware artifact found"
     }
 
-    build_one() {
+    build_one() (
         local board="$1" shield="$2" snippet="$3" cmake_args="$4" artifact="$5"
-        local extra_modules p_arg snippet_item build_dir
+        local extra_modules p_arg snippet_item build_dir status
 
         echo -e "\n${CYAN}>>> Building: ${artifact}${NC}"
         log "BOARD=${board} SHIELD=${shield:-<none>} SNIPPET=${snippet:-<none>}"
@@ -979,23 +1082,46 @@ PY
         p_arg="-p=auto"
         [ "${PRISTINE}" = "1" ] && p_arg="-p"
         build_dir="${BUILD_DIR}/${artifact}"
+        # Each target owns its exit trap, including failures before artifact copy.
+        trap 'status=$?; trap - EXIT
+            if ! rm -rf "${build_dir}"; then
+                log "ERROR: failed to remove target build directory: ${build_dir}" >&2
+                [ "${status}" != "0" ] || status=1
+            fi
+            exit "${status}"' EXIT
         rm -rf "${build_dir}"
 
-        build_cmd=(west build "${p_arg}" -s zmk/app -d "${build_dir}" -b "${board}")
+        if [ "${APPLICATION_SOURCE}" != "zmk/app" ]; then
+            # Do not let an image's ambient package/cache select another Zephyr tree.
+            ZEPHYR_BASE="$(west list zephyr -f '{abspath}')" || fail "cannot resolve Zephyr project"
+            [ -f "${ZEPHYR_BASE}/share/zephyr-package/cmake/ZephyrConfig.cmake" ] ||
+                fail "resolved Zephyr project has no package configuration"
+            export ZEPHYR_BASE
+        fi
+        build_cmd=(west build "${p_arg}" -s "${APPLICATION_SOURCE}" -d "${build_dir}" -b "${board}")
         for snippet_item in ${snippet}; do
             build_cmd+=(-S "${snippet_item}")
         done
         build_cmd+=(--)
         [ -n "${shield}" ] && build_cmd+=(-DSHIELD="${shield}")
-        build_cmd+=(-DZMK_CONFIG="${SOURCE_DIR}/${CONFIG_DIR}")
+        if [ "${APPLICATION_SOURCE}" = "zmk/app" ]; then
+            build_cmd+=(-DZMK_CONFIG="${SOURCE_DIR}/${CONFIG_DIR}")
+        else
+            build_cmd+=(-DZephyr_DIR="${ZEPHYR_BASE}/share/zephyr-package/cmake")
+        fi
         extra_modules="$(extra_modules_arg)"
-        [ -n "${extra_modules}" ] && build_cmd+=(-DZMK_EXTRA_MODULES="${extra_modules}")
+        if [ -n "${extra_modules}" ]; then
+            if [ "${APPLICATION_SOURCE}" = "zmk/app" ]; then
+                build_cmd+=(-DZMK_EXTRA_MODULES="${extra_modules}")
+            else
+                build_cmd+=(-DZEPHYR_EXTRA_MODULES="${extra_modules}")
+            fi
+        fi
         append_cmake_args "${cmake_args}"
 
         "${build_cmd[@]}"
         select_firmware_artifact "${artifact}" "${build_dir}"
-        rm -rf "${build_dir}"
-    }
+    )
 
     wait_for_build_batch() {
         local failed=0 i pid log_path artifact status
@@ -1049,6 +1175,7 @@ PY
         parse_build_yaml "${host_snippets}" > "${targets}"
         [ -s "${targets}" ] || fail "build.yaml contains no build targets"
 
+        acquire_workspace_lock
         ensure_west_workspace
         sync_module_inputs
         cd "${WORK_DIR}"
@@ -1194,32 +1321,14 @@ TARGET_DIR="$(cd "${TARGET_DIR}" && pwd)"
 validate_host_layout() {
     [ -f "${TARGET_DIR}/config/west.yml" ] ||
         die "current ZMK layout requires repo root with config/west.yml"
-    validate_host_module_roots "${TARGET_DIR}" "target" "target"
     [ -f "${TARGET_DIR}/build.yaml" ] || die "build.yaml not found"
 }
 
-validate_host_module_roots() {
-    local root="$1" label="$2" kind="$3"
-    local settings=() build_keys=()
-    [ "${kind}" != "target" ] || return 0
-    if [ "${kind}" = "module" ] && [ -d "${root}/boards" ]; then
-        settings+=(board_root)
-    fi
-    if [ -d "${root}/dts" ]; then
-        settings+=(dts_root)
-    fi
-    if [ -d "${root}/snippets" ]; then
-        settings+=(snippet_root)
-    fi
-    if [ "${kind}" = "module" ] && [ -f "${root}/CMakeLists.txt" ]; then
-        build_keys+=(cmake)
-    fi
-    if [ "${kind}" = "module" ] && [ -f "${root}/Kconfig" ]; then
-        build_keys+=(kconfig)
-    fi
-    [ ${#settings[@]} -gt 0 ] || [ ${#build_keys[@]} -gt 0 ] || return 0
-    local module_yml="${root}/zephyr/module.yml"
-    [ -f "${module_yml}" ] ||
+validate_host_module_metadata() {
+    local root="$1" label="$2"
+    [ -d "${root}/boards" ] || [ -d "${root}/dts" ] || [ -d "${root}/snippets" ] ||
+        [ -f "${root}/CMakeLists.txt" ] || [ -f "${root}/Kconfig" ] || return 0
+    [ -f "${root}/zephyr/module.yml" ] ||
         die "${label}: root module content requires zephyr/module.yml"
 
     # YAML layout and required keys are checked structurally in the container. Grepping
@@ -1249,7 +1358,7 @@ validate_one_module_input() {
     if name_in "${name}" ${VALIDATED_MODULE_NAMES[@]+"${VALIDATED_MODULE_NAMES[@]}"}; then
         die "duplicate module input name: ${name}"
     fi
-    validate_host_module_roots "${mod}" "${label_prefix} ${name}" "module"
+    validate_host_module_metadata "${mod}" "${label_prefix} ${name}"
     VALIDATED_MODULE_NAMES+=("${name}")
 }
 
@@ -1340,22 +1449,91 @@ container_name="${ZMK_CONTAINER_NAME:-${container_name}}"
 container_created=0
 container_id=""
 container_create_output=""
+active_phase_pid=""
+run_signal_status=0
+run_phase=""
+
+handle_run_signal() {
+    trap '' INT TERM
+    run_signal_status="$2"
+    RUN_FAILURE_REASON="interrupted by $1"
+    # Finish create so its returned identity can be acquired before cleanup.
+    [ "${run_phase}" != create ] || return 0
+    exit "${run_signal_status}"
+}
+
+run_logged_command() {
+    local capture="$1" status=0
+    shift
+    (
+        trap - EXIT
+        if [ "${run_phase}" = create ]; then
+            # The entire receipt pipeline must survive a terminal/process-group signal.
+            trap '' INT TERM
+        else
+            trap - INT TERM
+        fi
+        if [ -n "${capture}" ]; then
+            "$@" 2>&1 | tee -a "${LOG_FILE}" "${capture}"
+        else
+            "$@" 2>&1 | tee -a "${LOG_FILE}"
+        fi
+    ) &
+    active_phase_pid=$!
+    if wait "${active_phase_pid}"; then status=0; else status=$?; fi
+    if [ "${run_phase}" = create ] && [ "${run_signal_status}" != 0 ]; then
+        if [ "${status}" -ge 128 ]; then
+            if wait "${active_phase_pid}"; then status=0; else status="${run_signal_status}"; fi
+        elif [ "${status}" != 0 ]; then
+            status="${run_signal_status}"
+        fi
+    fi
+    active_phase_pid=""
+    return "${status}"
+}
 
 cleanup_container() {
     if [ "${container_created}" = "1" ] && [ "${ZMK_KEEP_CONTAINER:-0}" != "1" ]; then
-        docker rm -f "${container_id}" >/dev/null 2>&1 || true
+        if ! docker rm -f "${container_id}" >>"${LOG_FILE}" 2>&1; then
+            echo "ERROR: failed to remove build container: ${container_id}" | tee -a "${LOG_FILE}" >&2
+            return 1
+        fi
+        container_created=0
     fi
+    return 0
 }
 finish_run() {
-    local status="$?"
-    if [ "${status}" -ne 0 ] && [ -n "${artifact_dir:-}" ] && [ "${SUMMARY_WRITTEN:-0}" != "1" ]; then
-        write_summary "FAILED" "${RUN_FAILURE_REASON:-host setup failed}" || true
+    local status="$?" cleanup_failed=0 reason="${RUN_FAILURE_REASON:-host setup failed}"
+    trap - EXIT
+    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] && [ "${run_phase}" != created ]; then
+        if ! docker stop -t 1 "${container_id}" >>"${LOG_FILE}" 2>&1; then
+            echo 'ERROR: failed to stop interrupted build container' >>"${LOG_FILE}"
+            cleanup_failed=1
+        fi
     fi
-    cleanup_container
+    if ! cleanup_container; then
+        cleanup_failed=1
+        if [ "${status}" = 0 ]; then
+            status=1
+            reason="container cleanup failed"
+        else
+            reason="${SUMMARY_REASON:-${reason}}"
+        fi
+    fi
+    if [ -n "${active_phase_pid}" ]; then
+        kill -TERM "${active_phase_pid}" 2>/dev/null || true
+        wait "${active_phase_pid}" 2>/dev/null || true
+    fi
+    if [ "${status}" -ne 0 ] && [ -n "${artifact_dir:-}" ] &&
+        { [ "${SUMMARY_WRITTEN:-0}" != "1" ] || [ "${cleanup_failed}" = 1 ]; }; then
+        write_summary "FAILED" "${reason}" || true
+    fi
     [ -z "${container_create_output}" ] || rm -f "${container_create_output}"
-    return "${status}"
+    exit "${status}"
 }
 trap finish_run EXIT
+trap 'handle_run_signal SIGINT 130' INT
+trap 'handle_run_signal SIGTERM 143' TERM
 
 is_generated_dependency_tree() {
     local path="$1"
@@ -1546,6 +1724,23 @@ write_summary() {
         fi
     } > "${artifact_dir}/build-summary.txt"
     SUMMARY_WRITTEN=1
+    SUMMARY_REASON="${reason}"
+}
+
+reset_cache_volume() {
+    local volumes volume
+    if ! volumes="$(docker volume ls --format '{{.Name}}' 2>&1)"; then
+        printf '%s\n' "${volumes}" | tee -a "${LOG_FILE}" >&2
+        return 1
+    fi
+    while IFS= read -r volume; do
+        [ "${volume}" = "${zmk_cache_volume}" ] || continue
+        if ! docker volume rm "${zmk_cache_volume}" 2>&1 | tee -a "${LOG_FILE}"; then
+            return 1
+        fi
+        return 0
+    done <<< "${volumes}"
+    msg "Cache volume is not present; starting fresh: ${zmk_cache_volume}" | tee -a "${LOG_FILE}"
 }
 
 validate_host_layout
@@ -1567,12 +1762,12 @@ zmk_build_image="$(resolve_docker_image "${resolved_image_tag}")"
 zmk_cache_volume="${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}"
 # ccache lives on the cache volume so that it survives the throw-away build container (see README.md).
 zmk_ccache_dir="${ZMK_CCACHE_DIR:-/workspaces/.ccache}"
-[ "${PRISTINE}" != "1" ] || docker volume rm "${zmk_cache_volume}" 2>/dev/null || true
 RUN_STARTED_AT="$(date +%s)"
 artifact_dir="${SCRIPT_DIR}/.build/${run_id}"
 LOG_FILE="${artifact_dir}/build.log"
 mkdir -p "${artifact_dir}"
-touch "${SCRIPT_DIR}/.build/.gitkeep"
+touch "${LOG_FILE}"
+touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 
 echo -e "${CYAN}Starting ZMK ${MODE}...${NC}"
 msg "Target: ${TARGET_DIR}"
@@ -1584,14 +1779,20 @@ msg "Docker cache volume: ${zmk_cache_volume}"
 msg "Build jobs: ${BUILD_JOBS}"
 msg "Container: ${container_name}"
 
+if [ "${PRISTINE}" = 1 ]; then
+    RUN_FAILURE_REASON="cache reset failed"
+    reset_cache_volume || die "failed to reset Docker cache volume: ${zmk_cache_volume}"
+fi
+
 RUN_FAILURE_REASON="container creation failed"
+run_phase=create
 docker_create_args=(create --name "${container_name}")
 if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
     docker_create_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
 fi
 # Keep platform and default paths on one set of volume/environment arguments.
 container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"
-docker "${docker_create_args[@]}" \
+run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
     -v "${zmk_cache_volume}:/workspaces" \
     -e ZMK_IN_CONTAINER=1 \
     -e PRISTINE="${PRISTINE}" \
@@ -1602,21 +1803,26 @@ docker "${docker_create_args[@]}" \
     -e CCACHE_DIR="${zmk_ccache_dir}" \
     -e CCACHE_IGNOREOPTIONS='-specs=*' \
     -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-    "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log' 2>&1 | tee -a "${LOG_FILE}" "${container_create_output}"
+    "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'
 container_id="$(tr -d '\r' < "${container_create_output}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
 [ -n "${container_id}" ] || die "Docker create did not return a container ID"
 container_created=1
+run_phase=created
+[ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
 rm -f "${container_create_output}"
 container_create_output=""
 RUN_FAILURE_REASON="container start failed"
-docker start "${container_id}" 2>&1 | tee -a "${LOG_FILE}"
+run_phase=start
+run_logged_command "" docker start "${container_id}"
 
 RUN_FAILURE_REASON="source copy failed"
-copy_target_to_container 2>&1 | tee -a "${LOG_FILE}"
+run_phase=copy
+run_logged_command "" copy_target_to_container
 RUN_FAILURE_REASON="${MODE} execution failed"
+run_phase=execute
 
 if [ "${MODE}" = "validate" ]; then
-    if docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh validate "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}" 2>&1 | tee -a "${LOG_FILE}"; then
+    if run_logged_command "" docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh validate "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}"; then
         write_summary "SUCCESS"
         echo -e "${CYAN}${artifact_dir}${NC}"
         exit 0
@@ -1626,13 +1832,14 @@ if [ "${MODE}" = "validate" ]; then
     exit 1
 fi
 
-if ! docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh build "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}" 2>&1 | tee -a "${LOG_FILE}"; then
+if ! run_logged_command "" docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh build "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}"; then
     write_summary "FAILED" "firmware build failed"
     echo -e "${RED}Build failed. See: ${artifact_dir}${NC}" >&2
     exit 1
 fi
 
-if ! copy_artifacts_from_container "${artifact_dir}"; then
+run_phase=artifact
+if ! run_logged_command "" copy_artifacts_from_container "${artifact_dir}"; then
     write_summary "FAILED" "artifact copy failed"
     echo -e "${RED}Artifact copy failed. See: ${artifact_dir}${NC}" >&2
     exit 1

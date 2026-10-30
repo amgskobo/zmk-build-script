@@ -20,14 +20,21 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - name: Initialize publication reports
+        id: publication-init
+        run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell contracts
-        run: bash .github/scripts/test.sh shell
-      - name: Upload test evidence
+        run: bash .github/scripts/check-build-output.sh ci-tests shell
+      - name: Verify publication payload
+        id: publication-check
         if: always()
+        run: bash .github/scripts/check-build-output.sh publish verify
+      - name: Upload test evidence
+        if: ${{ always() && steps.publication-init.outcome == 'success' && steps.publication-check.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: shell-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .build/test-*/**
+          path: .build/public/tests-shell.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
@@ -41,18 +48,25 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
+      - name: Initialize publication reports
+        id: publication-init
+        run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify copy, parser and cache contracts
-        run: bash .github/scripts/test.sh docker
+        run: bash .github/scripts/check-build-output.sh ci-tests docker
       - name: Verify build, module overlays and restoration
-        run: bash .github/scripts/test.sh build
-      - name: Upload test evidence and firmware
+        run: bash .github/scripts/check-build-output.sh ci-tests build
+      - name: Verify publication payload
+        id: publication-check
         if: always()
+        run: bash .github/scripts/check-build-output.sh publish verify
+      - name: Upload publication reports
+        if: ${{ always() && steps.publication-init.outcome == 'success' && steps.publication-check.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: zmk-ci-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .build/test-*/**
-            .build/run-*/**
+            .build/public/tests-docker.txt
+            .build/public/tests-build.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14

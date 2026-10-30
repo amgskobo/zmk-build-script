@@ -87,8 +87,23 @@ assert_contains "${json}" '"slug":"caksoylar-zmk-config"' \
   "json list did not include caksoylar slug"
 assert_contains "${json}" '"type":"repo"' \
   "json list did not include repo type"
+assert_contains "${json}" '"index":1,"slug":' \
+  "json matrix did not start with a numeric public source index"
+assert_contains "${json}" '"index":8,"slug":' \
+  "json matrix indices did not cover every source"
 assert_contains "${json}" '"source":"https://github.com/caksoylar/zmk-config.git"' \
   "json list did not include repo source"
+
+indices="$(bash "${builder}" --list-indices-json "${repos_file}")"
+[ "${indices}" = '{"include":[{"index":1},{"index":2},{"index":3},{"index":4},{"index":5},{"index":6},{"index":7},{"index":8}]}' ] ||
+  fail 'public matrix contains something other than numeric indices'
+selected="$(bash "${builder}" --list "${repos_file}" --source-index 0008)"
+[ "${selected}" = "$(printf '%s\n' "${list}" | tail -n 1)" ] || fail 'indexed selection changed a collision-resolved slug'
+for invalid in '' 0 00 9 bad -1; do
+  if bash "${builder}" --list "${repos_file}" --source-index "${invalid}" >/dev/null 2>&1; then
+    fail 'invalid source index was accepted'
+  fi
+done
 
 path_list="$(bash "${builder}" --list --path "${local_one}" --repo-slug custom-local --path "${local_two}")"
 assert_contains "${path_list}" $'custom-local\tzmk-cache-external-custom-local\tpath\t'"${local_one}" \
@@ -128,12 +143,16 @@ set -e
 
 [ "${failure_status}" -eq 1 ] ||
   fail "missing source did not fail with status 1: ${failure_status}"
-assert_file_contains "${failure_output}" "::error title=External build failed: missing::" \
+assert_file_contains "${failure_output}" "::error title=External source execution failed::path not found" \
   "failure annotation was not emitted"
 assert_file_contains "${failure_output}" "path not found missing" \
   "missing path failure was not printed"
-assert_file_contains "${failure_summary}" '| failure | `missing` | path |' \
+assert_file_contains "${failure_summary}" '| failure | build |' \
   "failure summary row was not written"
+if grep -Fq "${missing_path}" "${failure_summary}" ||
+    grep '^::error ' "${failure_output}" | grep -Fq "${missing_path}"; then
+  fail 'public summary or annotation disclosed a private source path'
+fi
 
 invalid_output="${tmp_dir}/invalid.out"
 set +e
@@ -246,7 +265,11 @@ cat > "${clone_bin}/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${CLONE_TEST_LOG}"
 case "$1" in
-  info|rm) exit 0 ;;
+  info) exit 0 ;;
+  rm)
+    case "${CLONE_TEST_PHASE}" in
+      cleanup|start-cleanup) echo 'injected clone container removal failure' >&2; exit 23 ;;
+    esac ;;
   create)
     [ "${CLONE_TEST_PHASE}" != create ] || exit 23
     counter="${CLONE_TEST_LOG}.count"
@@ -255,9 +278,15 @@ case "$1" in
     attempt=$((attempt + 1))
     printf '%s\n' "${attempt}" > "${counter}"
     printf '%064d\n' "${attempt}" ;;
-  start) [ "${CLONE_TEST_PHASE}" != start ] || exit 23 ;;
+  start)
+    case "${CLONE_TEST_PHASE}" in start|start-cleanup) exit 23 ;; esac ;;
   cp)
-    [ "${CLONE_TEST_PHASE}" = success ] || exit 23
+    if [ "${CLONE_TEST_PHASE}" = partial ]; then
+      mkdir -p "$3"
+      printf 'partial source\n' > "$3/fresh.txt"
+      exit 23
+    fi
+    case "${CLONE_TEST_PHASE}" in success|cleanup) ;; *) exit 23 ;; esac
     mkdir -p "$3"
     printf 'fresh source\n' > "$3/fresh.txt" ;;
   *) exit 99 ;;
@@ -329,8 +358,11 @@ clone_probe="${tmp_dir}/clone-probe.sh"
 cat > "${clone_probe}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+[ "${1:-}" != validate ] || shift
 [ ! -e "$1/stale.txt" ]
 grep -qx 'fresh source' "$1/fresh.txt"
+printf 'builder reached\n' >> "${CLONE_TEST_LOG}"
+exit "${CLONE_BUILD_EXIT:-0}"
 EOF
 chmod +x "${clone_probe}"
 if ! PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=success \
@@ -342,5 +374,146 @@ fi
 [ "$(grep -c '^create ' "${clone_log}")" = 1 ] || fail 'failed cleanup started an extra clone'
 expected_id="$(printf '%064d' 1)"
 grep -qx "rm -f ${expected_id}" "${clone_log}" || fail 'recovered clone lost container ownership'
+
+# A failed clone-container cleanup must stop before another create or builder start.
+for phase in cleanup start-cleanup; do
+  clone_log="${tmp_dir}/clone-${phase}.commands"
+  if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE="${phase}" \
+      bash -c 'source "$1"; WORK_DIR="$2"; BUILD_SCRIPT="$3"; main --repo https://example.invalid/config.git --source-slug cleanup --mode build' \
+      _ "${source_builder}" "${clone_parent}" "${clone_probe}" >"${tmp_dir}/clone-${phase}.out" 2>&1; then
+    fail "clone ${phase} ignored container cleanup failure"
+  fi
+  assert_file_contains "${tmp_dir}/clone-${phase}.out" 'failed to remove clone container' 'clone cleanup diagnostics missing'
+  [ "$(grep -c '^create ' "${clone_log}")" = 1 ] || fail 'clone retried after container cleanup failure'
+  if grep -q 'builder reached' "${clone_log}"; then fail 'builder started after clone cleanup failure'; fi
+  if grep '^rm ' "${clone_log}" | grep -vx "rm -f ${expected_id}"; then fail 'clone cleanup changed its immutable ID'; fi
+done
+
+# Cache deletion belongs to build.sh; both wrapper modes must forward --pristine.
+forward_probe="${tmp_dir}/forward-probe.sh"
+cat > "${forward_probe}" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "${FORWARD_LOG}"
+EOF
+chmod +x "${forward_probe}"
+for mode in build validate; do
+  clone_log="${tmp_dir}/pristine-${mode}.commands"
+  forward_log="${tmp_dir}/pristine-${mode}.args"
+  PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=success FORWARD_LOG="${forward_log}" \
+    bash -c 'source "$1"; BUILD_SCRIPT="$2"; main --path "$3" --source-slug delegated --mode "$4" --pristine' \
+    _ "${source_builder}" "${forward_probe}" "${local_one}" "${mode}" >"${tmp_dir}/pristine-${mode}.out" 2>&1
+  grep -qx -- --pristine "${forward_log}" || fail "${mode} did not forward pristine"
+  if grep -q '^volume ' "${clone_log}"; then fail 'wrapper reset the cache outside builder recording'; fi
+done
+
+# Post-build clone removal must complete before success, and preserve build failure details.
+post_failed=0
+post_target="${clone_parent}/post-cleanup"
+cat > "${clone_bin}/rm" <<'EOF'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ "${arg}" = "${CLONE_FAIL_RM_TARGET}" ] && [ -f "${arg}/fresh.txt" ]; then
+    printf 'host cleanup blocked\n' >> "${CLONE_TEST_LOG}"
+    echo 'injected post-copy host cleanup failure' >&2
+    exit 23
+  fi
+done
+exec "${CLONE_REAL_RM}" "$@"
+EOF
+chmod +x "${clone_bin}/rm"
+for mode in build validate; do
+  for build_status in 0 23; do
+    clone_log="${tmp_dir}/post-${mode}-${build_status}.commands"
+    step_summary="${tmp_dir}/post-${mode}-${build_status}.summary"
+    : > "${step_summary}"
+    if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=success \
+        CLONE_BUILD_EXIT="${build_status}" CLONE_FAIL_RM_TARGET="${post_target}" CLONE_REAL_RM="${clone_real_rm}" \
+        GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="${step_summary}" \
+        bash -c 'source "$1"; WORK_DIR="$2"; BUILD_SCRIPT="$3"; main --repo https://example.invalid/config.git --source-slug post-cleanup --mode "$4"' \
+        _ "${source_builder}" "${clone_parent}" "${clone_probe}" "${mode}" >"${tmp_dir}/post-${mode}-${build_status}.out" 2>&1; then
+      status=0
+    else status=$?; fi
+    reason='clone cleanup failed'
+    [ "${build_status}" = 0 ] || reason="${mode} failed; clone cleanup failed"
+    if [ "${status}" != 1 ] || ! grep -Fq "${reason}" "${step_summary}" ||
+        ! grep -q 'failed to clear clone destination' "${tmp_dir}/post-${mode}-${build_status}.out" ||
+        grep -q '=== SUCCESS:' "${tmp_dir}/post-${mode}-${build_status}.out"; then
+      echo "post-build cleanup ${mode}/${build_status}: failure status/reason lost or success published" >&2
+      post_failed=1
+    fi
+    grep -q 'host cleanup blocked' "${clone_log}" || fail 'post-build cleanup injection was not reached'
+    grep -q 'builder reached' "${clone_log}" || fail 'post-build test never reached the builder'
+    [ -f "${post_target}/fresh.txt" ] || fail 'post-build injection did not retain the blocked copy'
+    "${clone_real_rm}" -rf "${post_target}"
+  done
+done
+
+# A partial docker cp must also retain its clone failure plus a host cleanup failure.
+clone_log="${tmp_dir}/post-partial.commands"
+step_summary="${tmp_dir}/post-partial.summary"
+if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=partial \
+    CLONE_FAIL_RM_TARGET="${post_target}" CLONE_REAL_RM="${clone_real_rm}" \
+    GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="${step_summary}" \
+    bash -c 'source "$1"; WORK_DIR="$2"; BUILD_SCRIPT="$3"; main --repo https://example.invalid/config.git --source-slug post-cleanup' \
+    _ "${source_builder}" "${clone_parent}" "${clone_probe}" >"${tmp_dir}/post-partial.out" 2>&1; then
+  post_failed=1
+fi
+if ! grep -Fq 'clone failed; clone cleanup failed' "${step_summary}"; then
+  echo 'partial clone copy lost its cleanup failure reason' >&2; post_failed=1
+fi
+[ -f "${post_target}/fresh.txt" ] || fail 'partial copy failure injection never reached host'
+if grep -q 'builder reached' "${clone_log}"; then fail 'partial clone reached the builder'; fi
+"${clone_real_rm}" -rf "${post_target}"
+
+# Local source directories are never owned clone copies, including on build failure.
+printf 'fresh source\n' > "${local_one}/fresh.txt"
+for build_status in 0 23; do
+  clone_log="${tmp_dir}/post-local-${build_status}.commands"
+  : > "${clone_log}"
+  if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=success \
+      CLONE_BUILD_EXIT="${build_status}" CLONE_FAIL_RM_TARGET="${local_one}" CLONE_REAL_RM="${clone_real_rm}" \
+      bash -c 'source "$1"; BUILD_SCRIPT="$2"; main --path "$3" --source-slug local-control' \
+      _ "${source_builder}" "${clone_probe}" "${local_one}" >"${tmp_dir}/post-local-${build_status}.out" 2>&1; then
+    status=0
+  else status=$?; fi
+  expected=0
+  [ "${build_status}" = 0 ] || expected=1
+  [ "${status}" = "${expected}" ] || fail 'local source control returned the wrong status'
+  grep -qx 'fresh source' "${local_one}/fresh.txt" || fail 'local source was removed'
+  if grep -q 'host cleanup blocked' "${clone_log}"; then fail 'local source was targeted for cleanup'; fi
+done
+
+# Once host removal is repaired, success and failure paths both remove the copy.
+rm "${clone_bin}/rm"
+for mode in build validate; do
+  for build_status in 0 23; do
+    clone_log="${tmp_dir}/post-repaired-${mode}-${build_status}.commands"
+    step_summary="${tmp_dir}/post-repaired-${mode}-${build_status}.summary"
+    if PATH="${clone_bin}:${PATH}" CLONE_TEST_LOG="${clone_log}" CLONE_TEST_PHASE=success \
+        CLONE_BUILD_EXIT="${build_status}" GITHUB_STEP_SUMMARY="${step_summary}" \
+        bash -c 'source "$1"; WORK_DIR="$2"; BUILD_SCRIPT="$3"; main --repo https://example.invalid/config.git --source-slug post-cleanup --mode "$4"' \
+        _ "${source_builder}" "${clone_parent}" "${clone_probe}" "${mode}" >"${tmp_dir}/post-repaired-${mode}-${build_status}.out" 2>&1; then
+      status=0
+    else status=$?; fi
+    expected=0
+    [ "${build_status}" = 0 ] || expected=1
+    [ "${status}" = "${expected}" ] || fail 'repaired cleanup changed the build result'
+    [ ! -e "${post_target}" ] || fail 'repaired host removal left the clone behind'
+  done
+done
+[ "${post_failed}" = 0 ] || fail 'post-build or partial-clone cleanup failures were accepted'
+
+# Cleanup owns only immediate children of the resolved clone root.
+foreign_clone="${tmp_dir}/foreign clone"
+mkdir -p "${foreign_clone}"
+printf 'preserve foreign content\n' > "${foreign_clone}/keep.txt"
+for rejected in "${foreign_clone}" "${clone_parent}" "${clone_parent}/.."; do
+  if bash -c 'source "$1"; WORK_DIR="$2"; clear_clone_directory "$3"' \
+      _ "${source_builder}" "${clone_parent}" "${rejected}" >"${tmp_dir}/cleanup-root-guard.out" 2>&1; then
+    fail 'cleanup accepted a path outside its owned clone child'
+  fi
+  assert_file_contains "${tmp_dir}/cleanup-root-guard.out" 'refusing to clear path outside clone root' 'cleanup root guard was not reached'
+  grep -qx 'preserve foreign content' "${foreign_clone}/keep.txt" || fail 'foreign cleanup control was removed'
+done
 
 echo "[test-auto-build-external] ok"
