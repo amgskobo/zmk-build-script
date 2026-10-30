@@ -4,7 +4,7 @@
 
 ZMK configuration repository と、明示的に指定した独立 Zephyr application を build する
 Docker + Bash helper です。1 repository の build、依存・compiler cache の再利用、host への
-firmware / log 回収を担当します。保守契約は [AGENTS.md](AGENTS.md) に集約しています。
+firmware / log 回収を担当します。保守契約は [AGENTS.ja.md](AGENTS.ja.md)（[英語の正本](AGENTS.md)） に集約しています。
 
 ## 必要なものと最初の実行
 
@@ -309,7 +309,7 @@ online / busy / label / 登録先を確認し、外部 job から除外する場
 
 ## 保守と検証
 
-変更前に [AGENTS.md](AGENTS.md) を確認します。local / CI は共通の入口を使います。
+変更前に [AGENTS.ja.md](AGENTS.ja.md)（[英語の正本](AGENTS.md)） を確認します。local / CI は共通の入口を使います。
 
 ```bash
 bash .github/scripts/test.sh shell

@@ -1,9 +1,13 @@
 # Agent contract
 
-利用方法・CLI・環境変数・runner 運用は
-[README.ja.md](README.ja.md) と [README.md](README.md)、保守契約はこの file に集約します。
-外部案件の repo 名・commit hash・日付・個別の実測値・一度きりの結果を文書へ追加せず、
-command / source / image identity と raw log は `.build/` の新しい実行記録に残します。
+This is the default, authoritative English contract. [AGENTS.ja.md](AGENTS.ja.md)
+is its Japanese translation. Keep both versions synchronized; if they differ,
+follow this file and correct the translation.
+Usage, CLI options, environment variables and runner operations belong in
+[README.md](README.md) and [README.ja.md](README.ja.md); maintenance rules belong here.
+Do not add external project repository names, commit hashes, dates, individual
+measurements or one-off results to documentation. Record commands, source and
+image identities, and raw logs in a new execution record under `.build/`.
 
 ## Publication privacy and local execution
 
@@ -38,181 +42,268 @@ validation limit. Recheck the final publication snapshot and its artifacts.
 Existing authorization requirements for version-control, publication, device
 writes, resets and data erasure still apply.
 
-## 作業範囲と責務
+## Scope and responsibilities
 
-- 最新の user 指示と既存差分を最初に読み、user changes を保持する。
-- commit / stage / push / PR 作成・更新 / merge / tag / release は、各操作の明示指示がある場合だけ行う。
-  test 成功や milestone を許可と解釈せず、無関係な変更を含めない。
-- 主対象は `build.sh`。helper / workflow / docs はその契約に直接関係する範囲だけ扱い、
-  keyboard / module source、実機 firmware、settings を変更しない。
-- 単体 build で常に有効な機能は `build.sh` に置き、環境変数は opt-out が必要な場合だけ追加する。
-  新しい script / container / fixture を増やす前に既存の責務・scenario へ統合できるか確認する。
-- production host の必須依存は Docker と Bash。標準 Unix tool を使い、追加 install を前提にしない。Git は optional。
-- WSL 全体の memory 回収・停止・設定変更や、他 tool の監視を builder に取り込まない。
-  中間 file の削除、依存 / ccache の再利用、host に残す成果物・証拠を区別する。
+- Read the latest user instructions and existing diff first; preserve user changes.
+- Stage, commit, push, create/update a PR, merge, tag or release only with explicit
+  instructions for that operation. Passing tests or reaching a milestone is not
+  authorization. Do not include unrelated changes.
+- The primary scope is `build.sh`. Change helpers, workflows and documentation only
+  where directly related to its contract. Do not modify keyboard/module sources,
+  firmware on physical devices or settings.
+- Put features that always apply to an individual build in `build.sh`. Add environment
+  variables only when an opt-out is needed. Before adding scripts, containers or
+  fixtures, check whether existing responsibilities and scenarios can accommodate them.
+- Production hosts require Docker and Bash. Use standard Unix tools without assuming
+  additional installations. Git is optional.
+- Do not make the builder reclaim memory, stop or reconfigure WSL as a whole, or monitor
+  other tools. Distinguish intermediate-file deletion, dependency/ccache reuse, and
+  artifacts/evidence retained on the host.
 
-| 場所 | 責務 |
+| Location | Responsibility |
 | --- | --- |
-| `build.sh` | 1 target directory の build / validate / clean、host copy、container workspace、成果物回収 |
-| `scripts/auto-build-external.sh` | source list / JSON matrix、slug 一意化、source process の rolling queue |
-| `scripts/build-external-source.sh` | 1 source の clone / local path 解決、builder 起動、clone cleanup |
-| `scripts/source-common.sh` | wrapper 共通の分類・名前処理、Windows 非互換 clone path の除去 |
-| `repos.txt` | 1 行 1 source。relative path は list file の directory 基準 |
-| `.github/fixtures/` | 標準 firmware、validate 専用 target shapes、module override |
-| `.github/scripts/` | 共通検証入口、runner / LF / output check、既存 helper behavior test |
-| `.github/workflows/` | hosted compatibility、手動 self-hosted smoke、外部 source matrix、heartbeat |
+| `build.sh` | Build/validate/clean one target directory, host copy, container workspace, artifact collection |
+| `scripts/auto-build-external.sh` | Source list/JSON matrix, unique slugs, rolling queue of source processes |
+| `scripts/build-external-source.sh` | Clone/resolve a local path for one source, invoke the builder, clean up the clone |
+| `scripts/source-common.sh` | Shared wrapper classification/naming, removal of Windows-incompatible clone paths |
+| `repos.txt` | One source per line; resolve relative paths against the list file's directory |
+| `.github/fixtures/` | Standard firmware, validation-only target shapes, module overrides |
+| `.github/scripts/` | Shared validation entry point, runner/LF/output checks, existing helper behavior tests |
+| `.github/workflows/` | Hosted compatibility, manual self-hosted smoke, external source matrix, heartbeat |
 
-source 列挙・clone を `build.sh` に戻さない。source 並列、target 並列、Ninja compile 並列を分ける。
-host → container → persistent workspace の 2 段階 copy と host への成果物回収を別の境界として扱う。
+Do not move source enumeration or cloning back into `build.sh`. Keep source,
+target and Ninja compilation parallelism separate. Treat host → container →
+persistent workspace as two copy boundaries, separate from artifact collection
+back to the host.
 
-## Host と source copy
+## Host and source copy
 
-- Windows / macOS / Linux の差分は script が吸収し、Windows は WSL shim を避け Git Bash を明示する。
-  Docker 用の MSYS path 自動変換停止下では native `git.exe` に MSYS path を渡さず、directory へ `cd` する。
-- Bash 3.2 に対応する。`set -u` 下の空配列は `${array[@]+"${array[@]}"}` または要素数で guard する。
-- container 作成前に空 archive で `tar --exclude` を実行する。NUL list は `--null -T` の空入力を実行して確認し、
-  非対応なら Git file list を使わない。短縮 help の省略や help pipe の SIGPIPE を能力不足と解釈しない。
-- Git working tree は tracked と非 ignored untracked を NUL 区切りで copy し、削除済み tracked を除き、
-  ignored tracked は保持する。`ZMK_COPY_IGNORED=1`、Git 無し / 失敗、非 working tree、空一覧では固定除外つき全 copy。
-- 固定除外は `.git` / `.west` / `__pycache__` と top-level の `.zmk` / `.build` / `.cache` / `.ccache` /
-  `.vscode` / `build` / `dist` / `node_modules` / `out` / `tmp` / `zmk_search`。
-  top-level は root entry で選別し、OS ごとの tar anchor 解釈に依存しない。同名の nested content を保持する。
-- `zmk` / `modules` / `tools` / `bootloader` / `optional` は、source に `.west`、対象 tree に `.git` marker が
-  ある場合だけ generated dependency として除外する。名前だけでは除外せず、`local_modules/` は自動探索しない。
+- Absorb Windows/macOS/Linux differences in the scripts. Explicitly use Git Bash on
+  Windows, avoiding WSL shims. With MSYS automatic path conversion disabled for Docker,
+  do not pass MSYS paths to native `git.exe`; change into the directory instead.
+- Support Bash 3.2. Under `set -u`, guard empty arrays with
+  `${array[@]+"${array[@]}"}` or an element-count check.
+- Before creating a container, execute `tar --exclude` with an empty archive. Test NUL
+  list support by executing `--null -T` with empty input; if unsupported, do not use
+  Git file lists. Omitted short-help content or SIGPIPE from a help pipeline does not
+  establish lack of capability.
+- For Git working trees, copy tracked and non-ignored untracked files using NUL
+  delimiters. Exclude deleted tracked files and retain ignored tracked files. Use a
+  full copy with fixed exclusions for `ZMK_COPY_IGNORED=1`, absent/failing Git,
+  non-working trees or empty file lists.
+- Fixed exclusions are `.git`, `.west`, `__pycache__`, and top-level `.zmk`, `.build`,
+  `.cache`, `.ccache`, `.vscode`, `build`, `dist`, `node_modules`, `out`, `tmp` and
+  `zmk_search`. Select top-level exclusions by root entry, without relying on
+  OS-specific tar anchor semantics. Retain nested content with the same names.
+- Exclude `zmk`, `modules`, `tools`, `bootloader` and `optional` as generated
+  dependencies only when the source has `.west` and the corresponding tree has a
+  `.git` marker. Names alone are insufficient. Do not auto-discover `local_modules/`.
 
-## Layout・module・application
+## Layout, modules and applications
 
-- 入口は `build.yaml` と `config/west.yml` を持つ repo root。direct config directory / custom config path は扱わない。
-  board 定義は root / module の `boards/` を標準とし、既存の `config/boards` は compatibility path として許容する。
-- target の legacy `zephyr/` content は warning で許容し、不足 metadata / root `module.yml` は container 内だけで正規化する。
-  host source は変更せず、metadata があれば target root を extra module に追加する。
-- module はすべて `-m` で明示する。`dir/.` も host で path 解決してから、空白を含む basename 全体で重複判定する。
-  明示した隠し directory も同じ一覧で検証・適用し、内部の path 一覧は NUL 区切りで渡す。
-- 明示 module の root `CMakeLists.txt` / `Kconfig` は `build.cmake` / `build.kconfig`、`boards/` / `dts/` / `snippets/` は
-  対応する `build.settings.*_root: .` を要求する。host は必要な metadata file の存在だけを確認する。
-  YAML 構造・key は container 内で workspace 変更 / 依存更新前に strict に検証し、inline map / quoted key を許容する。
-  `proto/zmk` などの nested path を保持する。
-- 通常は `zmk/app`。top-level `application` は repo 内の `CMakeLists.txt` を持つ相対 directory を指定する。
-  absolute / parent traversal / repo 外へ出る symlink を拒否する。standalone は manifest の `zephyr` project から package を
-  解決し、extra module を `ZEPHYR_EXTRA_MODULES`、通常の ZMK は `ZMK_EXTRA_MODULES` へ渡す。
-  standalone でも target の root settings を補完する。明示した module build 宣言は保持し、application の
-  CMake / Kconfig 入口から `build.cmake` / `build.kconfig` を推定しない。
+- The entry point is a repository root containing `build.yaml` and `config/west.yml`.
+  Direct config directories/custom config paths are unsupported. Standard board
+  definitions belong in root/module `boards/`; allow existing `config/boards` as a
+  compatibility path.
+- Allow legacy target `zephyr/` content with a warning. Normalize missing metadata/root
+  `module.yml` only inside the container. Do not modify host sources; add the target
+  root as an extra module when metadata exists.
+- Require explicit `-m` for every module. Resolve host paths, including `dir/.`, before
+  detecting duplicates using the entire basename, including spaces. Validate/apply
+  explicitly supplied hidden directories through the same list. Pass internal path
+  lists using NUL delimiters.
+- Explicit modules with root `CMakeLists.txt`/`Kconfig` require
+  `build.cmake`/`build.kconfig`; `boards/`, `dts/` and `snippets/` require the
+  corresponding `build.settings.*_root: .`. On the host, check only that required
+  metadata files exist. Strictly validate YAML structure/keys inside the container
+  before workspace changes/dependency updates; allow inline maps and quoted keys.
+  Preserve nested paths such as `proto/zmk`.
+- Normally use `zmk/app`. Top-level `application` specifies a repository-relative
+  directory containing `CMakeLists.txt`. Reject absolute paths, parent traversal and
+  symlinks escaping the repository. For standalone applications, resolve the package
+  from the manifest's `zephyr` project and pass extra modules through
+  `ZEPHYR_EXTRA_MODULES`; use `ZMK_EXTRA_MODULES` for normal ZMK. Supplement target
+  root settings for standalone applications too. Preserve explicit module build
+  declarations; do not infer `build.cmake`/`build.kconfig` from the application's
+  CMake/Kconfig entry points.
 
-## Persistent workspace と cache
+## Persistent workspace and cache
 
-- workspace へは `config/` だけ同期し、ZMK の `ZMK_CONFIG` は fresh な container source の `config/` に向ける。
-  manifest 外の root を prune するため volume は repo / tool / 用途ごとに分離する。
-  同じ workspace を変更する build は OS lock で排他し、競合時は同期・依存更新・削除前に停止する。
-  lock file は prune 対象の外に置き、build process の終了時に解放する。保持 container の存在だけで再利用を拒否しない。
-- 前回 overlay を workspace 内 backup から復元してから今回 input を適用する。directory 名が west project 名と一致すれば
-  overlay、それ以外は extra module。destination を変更する前に backup の復元記録を残す。
-- 復元の copy / 削除失敗は明示して返す。if 条件内の関数の errexit に依存せず、失敗時は該当 backup / stamp を残して停止する。
-  overlay path は absolute と親を表す独立した `..` component を拒否し、名前の途中の `..` は許容する。
-  復元済み / 再取得が必要な状態を project ごとに atomic に記録してから backup を整理する。
-  後続の失敗・中断後も復元済み project を再削除しない。旧2列の記録を受け入れる。
-- prune は復元後、完全に成功した `west list` の結果だけで行う。root は空白 / hidden entry を含め配列で完全一致比較し、
-  1 回ずつ整理する。一覧失敗・部分出力では cache を保持して update を要求し、成功後に再確認してから prune / stamp する。
-  削除失敗を無視しない。
-- import を含む `west manifest --resolve` 全体の digest 変更 / 解決失敗、必要な ZMK / project の欠落、`west list` 失敗、
-  復元不能な overlay では update する。入口 file の hash だけで再利用判定しない。
-- update 前に ready marker を無効化し、完全成功時だけ resolved manifest を stamp する。旧記録も再検証する。
-  失敗 / 中断後の非空 checkout や未解決 manifest を ready と扱わない。
-- update は設定回数 retry し、各試行直前に空白を壊さず stale index lock を除去する。失敗後の続行には完全な project 一覧と、
-  最終試行で明示された全失敗 project を満たす local override が必要。unknown / unsupported failure を missing list から推測せず、
-  前の試行の失敗名を混ぜない。local override での続行を upstream update 成功と記録しない。
-- ccache は west workspace の外側、cache volume 上に保存する。`CCACHE_IGNOREOPTIONS=-specs=*` は選択 image 内で
-  SDK specs が固定される前提。SDK / image 変更時は前提を再確認し、revision suffix も image tag 選択へ含める。
-- `--pristine` は build / validate とも builder が volume 全体を削除する。完全な volume 一覧で対象を照合し、未作成なら続行、
-  一覧 / 削除失敗なら container 作成前に停止する。依存 / ccache を含むため overlay 復元 test では使わない。
+- Sync only `config/` into the workspace; point ZMK's `ZMK_CONFIG` at `config/` in the
+  fresh container source. Separate volumes by repository/tool/purpose so roots outside
+  the manifest can be pruned. Serialize builds modifying the same workspace with an
+  OS lock; on contention, stop before sync, dependency updates or deletion. Keep the
+  lock file outside the prune scope and release it when the build process exits.
+  A retained container's existence alone must not prevent reuse.
+- Restore the previous overlay from workspace backups before applying current inputs.
+  A directory whose name matches a west project is an overlay; otherwise it is an
+  extra module. Record backup restoration information before changing the destination.
+- Explicitly propagate restoration copy/deletion failures. Do not rely on errexit in
+  functions invoked as if conditions; retain the affected backup/stamp and stop on
+  failure. Reject absolute overlay paths and standalone parent `..` components;
+  allow `..` within names. Atomically record restored/refetch-required state per project
+  before cleaning backups. Do not delete restored projects again after a later failure
+  or interruption. Accept legacy two-column records.
+- Prune after restoration, using only fully successful `west list` results. Compare
+  roots exactly using arrays, including spaces and hidden entries, and clean each once.
+  On list failure/partial output, retain caches and require an update; after success,
+  recheck before pruning/stamping. Do not ignore deletion failures.
+- Update when the digest of the entire `west manifest --resolve`, including imports,
+  changes, resolution fails, required ZMK/projects are missing, `west list` fails or
+  an overlay cannot be restored. Do not decide reuse from the entry file hash alone.
+- Invalidate the ready marker before updates; stamp the resolved manifest only on
+  complete success. Revalidate legacy records too. Nonempty checkouts after failure/
+  interruption and unresolved manifests are not ready.
+- Retry updates the configured number of times. Before each attempt, remove stale index
+  locks without breaking spaces. Continuing after failure requires a complete project
+  list and local overrides covering every failed project explicitly identified by the
+  final attempt. Do not infer unknown/unsupported failures from a missing-project list
+  or mix in failed names from earlier attempts. Do not record continuation with local
+  overrides as a successful upstream update.
+- Keep ccache on the cache volume, outside the west workspace.
+  `CCACHE_IGNOREOPTIONS=-specs=*` assumes fixed SDK specs within the selected image.
+  Recheck this assumption when changing SDK/image; include revision suffixes when
+  selecting image tags.
+- For both build and validate, the builder deletes the entire volume for `--pristine`.
+  Match against a complete volume list; continue if absent, but stop before container
+  creation on list/deletion failure. This deletes dependencies/ccache too, so do not
+  use it for overlay restoration tests.
 
-## Parser・build・output
+## Parser, build and output
 
-- 公開 CLI / 環境変数の表は README に維持する。正の整数は十進表記として扱い、`00` を含む全ゼロを拒否する。
-- top-level / include matrix、defaults、exclude、skip、alias、artifact placeholder を保持する。
-  exclude は CLI snippet 合成前の YAML 値で評価し、reset target は board ごとに重複させない。
-- None と falsey の型を区別し、scalar list / quote を検証する。board / shield / snippet / CMake 引数の NUL は shell 受け渡し前に拒否。
-  literal list は trim せず、shlex 結果は NUL 区切りで渡し、空引数・引用・前後空白を保持する。
-- artifact 名は安全な file 名へ正規化する。最初の dot より前も検査して Windows 予約名を拒否し、大小文字を無視した重複と
-  log / summary などの予約出力名との衝突も拒否する。
-- target ごとに build directory / log を分ける。並列失敗数は整数 data として保持し、8-bit exit status に詰めない。
-  batch の失敗を回収し、未開始の後続 target を進めず、log 順序を保持する。外部 full / pristine の既定 target 並列は 1。
-- 各 target は subshell EXIT で成功 / compile / artifact 選択・copy 失敗時とも中間 directory を削除し、依存 / ccache を保持する。
-  削除失敗を log に残して成功を失敗に変え、元の build error の終了 status は保持する。
-- firmware は target ごとに 1 個、`.uf2` → 指定 fallback → `.hex` → `.bin` の順。host 列挙 / summary / checker は
-  log / summary 自体を除き同じ拡張子を認識する。拡張子には path / glob / 先頭 dot / hyphen を許可しない。
-- run は `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/`。開始済み run は setup / pristine / create / start / source copy /
-  build / artifact copy / cleanup の失敗にも `build.log`、FAILED summary、Reason と error excerpt を残す。
-  artifact copy の失敗は呼び出し元へ返す。main container log にも build stream を流し、`stdbuf` の `LD_PRELOAD` を子へ伝えない。
-  SIGINT / SIGTERM は理由と終了 status を確定して同じ終了処理へ渡す。保持指定の container は中断時に停止して残す。
-- summary の field は Status、失敗時 Reason、Mode、Target、Docker image / cache volume、Elapsed、Built targets、Pristine、
-  Build jobs、Fallback binary、Extra snippets、Module inputs、Files。主要 field の重複と規則外 run の summary を拒否する。
-- Built targets は CR / ANSI / prefix を除いた log 行から取得し、成功 build のみ firmware 数へ fallback する。
-  checker は成功 status / mode / log / 正の target 数 / firmware 数の完全一致を要求する。旧 fallback 未記録は `bin`。
-  保存先名も独立した `..` component だけを拒否し、`case..name` は許可する。
+- Maintain public CLI/environment-variable tables in the READMEs. Interpret positive
+  integers as decimal; reject all-zero values, including `00`.
+- Preserve top-level/include matrices, defaults, exclude, skip, aliases and artifact
+  placeholders. Evaluate exclude against YAML values before composing CLI snippets;
+  deduplicate reset targets per board.
+- Distinguish None from falsey types; validate scalar lists/quoting. Reject NUL in
+  board/shield/snippet/CMake arguments before shell handoff. Do not trim literal lists.
+  Pass shlex results with NUL delimiters, preserving empty arguments, quoting and
+  leading/trailing spaces.
+- Normalize artifact names to safe filenames. Check the portion before the first dot
+  for Windows reserved names too. Reject case-insensitive duplicates and collisions
+  with reserved output names such as logs/summaries.
+- Separate build directories/logs per target. Keep parallel failure counts as integer
+  data, not packed into an 8-bit exit status. Collect batch failures, do not start
+  subsequent pending targets, and preserve log order. Default target parallelism for
+  external full/pristine builds is 1.
+- Each target uses a subshell EXIT handler to delete intermediate directories on
+  success and compile/artifact-selection/copy failures, retaining dependencies/ccache.
+  Log deletion failures and turn success into failure, preserving the original build
+  error's exit status when one exists.
+- Collect one firmware file per target, preferring `.uf2`, then the configured fallback,
+  then `.hex`, then `.bin`. Host enumeration, summaries and checkers recognize the same
+  extensions, excluding logs/summaries themselves. Extensions must not contain paths,
+  globs, leading dots or hyphens.
+- Runs use `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/`. Once started, retain `build.log`,
+  a FAILED summary, Reason and an error excerpt even on setup/pristine/create/start/
+  source-copy/build/artifact-copy/cleanup failures. Propagate artifact-copy failures
+  to the caller. Stream builds into the main container log too; do not propagate
+  `stdbuf`'s `LD_PRELOAD` to children. For SIGINT/SIGTERM, finalize the reason/exit status
+  and use the same finalization path. Stop and retain containers requested for retention
+  when interrupted.
+- Summary fields are Status, Reason on failure, Mode, Target, Docker image/cache volume,
+  Elapsed, Built targets, Pristine, Build jobs, Fallback binary, Extra snippets, Module
+  inputs and Files. Reject duplicate major fields and summaries in invalid run paths.
+- Derive Built targets from log lines stripped of CR/ANSI/prefixes; fall back to firmware
+  counts only for successful builds. The checker requires successful status, mode, log,
+  a positive target count and an exactly matching firmware count. Legacy records without
+  a fallback field use `bin`. For destination names too, reject only standalone `..`
+  components; allow `case..name`.
 
-## Container・外部 source・workflow
+## Containers, external sources and workflows
 
-- build / clone / test は create が返した immutable ID で start / exec / copy / cleanup を行う。
-  create 失敗時に同名の既存 container を消さず、要求した名前を所有の証拠にしない。
-- container 削除失敗は log / FAILED summary に反映し、先の build failure の理由・exit status を保持する。
-  `ZMK_KEEP_CONTAINER=1` を尊重する。clone container の削除失敗では retry / builder 起動へ進まない。
-- URL / UNC / drive absolute / relative を区別し、slug 衝突を解消する。source ごとに clone / cache / container / artifact を分ける。
-- URL は daemon preflight 後、clone container 内で retry つき取得し、bind mount ではなく `docker cp` で host へ戻す。
-  Windows だけ trailing 空白 / dot、禁止文字・control・newline、予約 device 名を警告つきで除き、合法名と Unix source は保持する。
-- host clone 先の削除失敗では取得 / copy を止め、修復後も古い file を消してから copy する。終了時も clone コピー削除後だけ
-  成功を報告する。先の clone / build failure があれば削除失敗も併記し、解決済み clone root 直下だけを削除する。local source は保持。
-- rolling queue は worker の実 exit を回収する。status file 前の異常終了も失敗とし、他 source は落とさず空き枠へ次を流す。
-  外部 source の layout / API incompatibility と builder defect を分ける。
-- source / input / runner 名などは `env:` 経由で quote し、`${{ ... }}` を shell text に直接埋め込まない。
-  runner が開始前に表示する値には非公開の source 情報を置かず、matrix / step env は数値 index に限定する。
-  source selector は event payload から実行時に非公開 file へ準備し、source の解決・選択は wrapper が行う。
-  `continue-on-error` で build failure を隠さない。
-  CI console と artifact は固定項目の公開用 report に限定する。raw log / firmware は local に保持し、
-  公開用コピーを unchanged raw record と呼ばない。自動 upload は既知の report path だけを許可する。
-- hosted Compatibility は 3 OS shell / Ubuntu Docker、Self-hosted Build は手動 smoke。外部 matrix は custom label で routing し、
-  `runner.os` に応じて Git Bash / Bash を使う。label / Docker access は runner user で確認し、offline による queued を失敗と混同しない。
-- schedule は UTC cron と換算 comment、concurrency / timeout を保持する。Heartbeat の commit / push をこの契約で自動許可しない。
+- Start/exec/copy/clean up build, clone and test containers using the immutable ID
+  returned by create. On create failure, do not delete an existing same-named container;
+  the requested name is not proof of ownership.
+- Reflect container deletion failures in logs/FAILED summaries while preserving prior
+  build failure reasons/exit statuses. Respect `ZMK_KEEP_CONTAINER=1`. Do not proceed
+  to retry/invoke the builder after clone-container deletion fails.
+- Distinguish URLs, UNC paths, absolute drive paths and relative paths; resolve slug
+  collisions. Separate clones/caches/containers/artifacts per source.
+- After daemon preflight, fetch URLs with retries inside a clone container. Return them
+  to the host using `docker cp`, not bind mounts. On Windows only, remove paths with
+  trailing spaces/dots, forbidden characters, control characters/newlines or reserved
+  device names, with warnings. Retain legal names and Unix sources.
+- If deleting the host clone destination fails, stop fetching/copying. After repair,
+  remove old files before copying. At exit, report success only after deleting the clone
+  copy. If clone/build already failed, report deletion failure too. Delete only directly
+  beneath the resolved clone root. Preserve local sources.
+- The rolling queue collects actual worker exit statuses. Abnormal exit before writing
+  a status file is a failure; keep other sources running and dispatch the next source
+  into the free slot. Distinguish external source layout/API incompatibility from
+  builder defects.
+- Pass source/input/runner names through quoted `env:` values; do not embed
+  `${{ ... }}` directly in shell text. Values the runner displays before execution must
+  not contain private source information; limit matrix/step environment values to
+  numeric indices. Prepare source selectors from the event payload into a private file
+  at runtime; wrappers resolve/select sources. Do not hide build failures with
+  `continue-on-error`. Limit CI console output and artifacts to public reports with
+  fixed fields. Retain raw logs/firmware locally; do not call public copies unchanged
+  raw records. Allow automatic uploads only from known report paths.
+- Hosted Compatibility covers shells on three OSes and Ubuntu Docker. Self-hosted Build
+  is a manual smoke test. Route external matrices with custom labels; use Git Bash/Bash
+  according to `runner.os`. Verify labels/Docker access as the runner user. Do not confuse
+  queuing due to an offline runner with failure.
+- Preserve UTC cron schedules, conversion comments, concurrency and timeouts. This
+  contract does not automatically authorize Heartbeat commits/pushes.
 
-## 検証 gate と再発防止
+## Validation gates and regression prevention
 
-不具合は host / copy / workspace / update / overlay / build / artifact / summary / workflow の境界で分類する。
-修正前に失敗する case または識別可能な negative control を既存 helper / fixture に追加し、原因・対応・確認を
-該当する契約と test に反映する。重複した bug 履歴を追加せず、既存の有効な回帰 assertion を削除・緩和しない。
-OS / workflow の片側に同じ問題が残らないか確認する。
+Classify defects by host/copy/workspace/update/overlay/build/artifact/summary/workflow
+boundary. Before fixing, add a case that fails before the fix or an identifiable
+negative control to an existing helper/fixture. Reflect the cause, fix and verification
+in the relevant contract and tests. Do not add duplicate bug histories or remove/weaken
+valid regression assertions. Check whether the same issue remains on another OS/workflow.
 
-| 変更範囲 | 必須確認 |
+| Change scope | Required checks |
 | --- | --- |
-| 文書のみ | LF、`git diff --check`、変更した path / link / CLI 参照。文書のみを理由に firmware suite は実行しない |
-| code / helper / workflow | 該当する syntax、LF、`git diff --check`、関連する behavior / build gate |
-| helper / summary | 該当 behavior test と失敗時の status / reason / output |
-| copy / module / sync / cache | runner preflight、copy helper、関連 validate / firmware、直後の output check |
-| artifact / fallback | firmware fixture と output helper。非 UF2 の選択も確認 |
-| workflow | YAML / run step syntax、関連 helper / step。未公開なら remote CI は未実行 |
+| Documentation only | LF, `git diff --check`, changed paths/links/CLI references; do not run firmware suites solely for documentation changes |
+| Code/helpers/workflows | Applicable syntax, LF, `git diff --check`, related behavior/build gates |
+| Helpers/summaries | Relevant behavior tests and failure status/reason/output |
+| Copy/modules/sync/cache | Runner preflight, copy helper, relevant validate/firmware, immediate output check |
+| Artifacts/fallback | Firmware fixture and output helper; verify non-UF2 selection too |
+| Workflows | YAML/run-step syntax, relevant helpers/steps; remote CI remains unexecuted before publication |
 
-local / CI は `bash .github/scripts/test.sh shell|docker|build|all` を入口とし、層の対応は README に置く。
-標準 validate（通常 / reset）、target shapes と CLI snippet、標準 firmware、project overlay / extra module、
-pristine 無しの復元を影響範囲に応じて確認し、各成功 build / validate の直後に run を明示して output checker を実行する。
+Use `bash .github/scripts/test.sh shell|docker|build|all` as the local/CI entry point;
+keep the layer mapping in the READMEs. As relevant to the change, check standard
+validation (normal/reset), target shapes and CLI snippets, standard firmware,
+project overlays/extra modules and restoration without pristine. Immediately after
+each successful build/validate, run the output checker with the explicit run path.
 
-- 実行ごとに新しい repository 外または directory 全体が Git ignored の記録先を使う。visible な内部保存先は開始前に拒否する。
-  command / status / 時間 / source checksum 前後 / image identity / raw failure を残し、既存証拠を上書きしない。
-- 実行中の script を編集しない。修正後の source を固定して再実行し、前後 checksum が違う結果は最新 source の PASS としない。
-- test は `bash <script>`、temp path は `pwd -P` を使う。host guard は到達 sentinel と拒否条件の両方を確認する。
-  executable bit や Windows fake-bin の未正規化 path に依存しない。
-- Bash 用 symlink fixture は Git Bash の copy fallback を避け、作成後に `-L` で確認する。
-  必要な MSYS link mode は作成 command だけに指定し、権限不足による skip や拒否 assertion の省略で代用しない。
-- LF は `.gitattributes` / `.editorconfig` に従う。raw byte を直接検査して CRLF / bare CR / Control-Z / 大きな入力 /
-  Git failure を見逃さず、検証のために working tree を reset / 書換えしない。
-- 独立した Docker 条件は同一 container に集約する。parser は production を実行して値・順序・実 argv を検査する。
-  update retry / 空白つき stale lock / 部分失敗と復旧は現行 image 内の command boundary を制御して確認する。
-- test container も取得済み ID だけを cleanup する。test cache は専用とし、明示指定の再利用 cache と自動作成 cache の所有を分ける。
-- local / remote CI / 物理動作を分ける。実ネットワーク障害、別 west version、旧 image の実 build、非 amd64 native host、
-  公開後の hosted / self-hosted 実行は、対応する証拠なしに fixture 成功から PASS としない。
+- Use a fresh evidence destination per execution, outside the repository or entirely
+  Git-ignored. Reject visible internal destinations before starting. Record commands,
+  statuses, timing, pre/post source checksums, image identity and raw failures; do not
+  overwrite existing evidence.
+- Do not edit running scripts. Freeze revised sources and rerun; a result with differing
+  pre/post checksums is not a PASS for the latest source.
+- Run tests as `bash <script>` and resolve temporary paths with `pwd -P`. For host guards,
+  check both the reachability sentinel and rejection condition. Do not depend on
+  executable bits or unnormalized Windows fake-bin paths.
+- For Bash symlink fixtures, avoid Git Bash's copy fallback and verify `-L` after creation.
+  Set any required MSYS link mode only on the creation command. Do not substitute
+  permission-related skips or omit rejection assertions.
+- Follow `.gitattributes`/`.editorconfig` for LF. Inspect raw bytes so CRLF, bare CR,
+  Control-Z, large inputs and Git failures are not missed. Do not reset/rewrite the
+  working tree for validation.
+- Consolidate independent Docker conditions into one container. Exercise the production
+  parser and inspect values, order and actual argv. Test update retries, stale locks
+  containing spaces, partial failures and recovery by controlling command boundaries
+  inside the current image.
+- Clean up test containers only by acquired IDs. Use dedicated test caches; distinguish
+  ownership of explicitly selected reusable caches from automatically created caches.
+- Separate local checks, remote CI and physical operation. Fixture success does not
+  establish PASS for real network failures, different west versions, real builds with
+  older images, non-amd64 native hosts or post-publication hosted/self-hosted execution
+  without corresponding evidence.
 
-## 完了判定と報告
+## Completion and reporting
 
-最新 scope、既存差分の保持、不要な新規 file / 意図しない差分、LF / syntax / 必須 check を再確認する。
-変更 file、PASS / FAIL / 未実行と理由、残る環境の境界、commit / push の有無、worktree の状態を報告する。
-公開は各操作の明示指示がある場合だけ行い、公開した場合は関係する remote CI の結果も確認する。
+Recheck the latest scope, preservation of existing changes, unnecessary new files/
+unintended diffs, LF, syntax and required checks. Report changed files, PASS/FAIL/
+unexecuted checks with reasons, remaining environment boundaries, whether commits/
+pushes occurred and the worktree state. Publish only with explicit instructions for
+each operation; after publication, check relevant remote CI results too.
 
 ## Container test execution
 
