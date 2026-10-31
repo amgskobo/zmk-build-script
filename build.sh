@@ -218,6 +218,10 @@ if not isinstance(build, dict):
     print("target: module metadata build must be a map.", file=sys.stderr)
     sys.exit(1)
 
+for key in ("cmake", "kconfig"):
+    if build.get(key) is not None and not isinstance(build[key], str):
+        sys.exit(f"target: build.{key} must be a string")
+
 changed = not os.path.exists(module_yml)
 
 if cmake_path and not build.get("cmake"):
@@ -309,6 +313,10 @@ if not isinstance(build, dict):
     print(f"{label}: zephyr/module.yml build must be a map.", file=sys.stderr)
     sys.exit(1)
 
+for key in ("cmake", "kconfig"):
+    if build.get(key) is not None and not isinstance(build[key], str):
+        sys.exit(f"{label}: build.{key} must be a string")
+
 settings = build.get("settings")
 settings = {} if settings is None else settings
 if not isinstance(settings, dict):
@@ -396,7 +404,25 @@ PY
             [ -z "${projects}" ] || printf '%s\n' "${projects}" >&2
             return 1
         fi
-        printf '%s\n' "${projects}"
+        printf '%s\n' "${projects}" | normalize_project_paths
+    }
+
+    normalize_project_paths() {
+        python3 -c '
+import posixpath
+import sys
+
+rows = []
+for line in sys.stdin.read().split("\n"):
+    if not line:
+        continue
+    name, separator, path = line.partition("\t")
+    path = posixpath.normpath(path)
+    if not separator or path in (".", "..") or path.startswith(("/", "../")):
+        sys.exit("invalid west project path")
+    rows.append(name + "\t" + path)
+sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
+'
     }
 
     prune_workspace_roots() {
@@ -509,8 +535,7 @@ PY
             backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
             case "${state}" in
                 restored)
-                    mark_overlay_restore_state "${name}" "${project_path}" restored ||
-                        fail "failed to record restored module input overlay: ${name}"
+                    # The durable restored record already exists; only finish its cleanup.
                     rm -rf "${backup_path}" || fail "failed to remove restored overlay backup: ${name}"
                     continue ;;
                 ""|refresh) ;;
@@ -694,6 +719,7 @@ PY
         local wanted="$1"
         local line name path
         line="$(cd "${WORK_DIR}" && west list "${wanted}" -f $'{name}\t{path}' 2>/dev/null)" || return 1
+        line="$(printf '%s\n' "${line}" | normalize_project_paths)" || return 1
         IFS=$'\t' read -r name path <<EOF
 ${line}
 EOF
@@ -1091,13 +1117,6 @@ PY
             exit "${status}"' EXIT
         rm -rf "${build_dir}"
 
-        if [ "${APPLICATION_SOURCE}" != "zmk/app" ]; then
-            # Do not let an image's ambient package/cache select another Zephyr tree.
-            ZEPHYR_BASE="$(west list zephyr -f '{abspath}')" || fail "cannot resolve Zephyr project"
-            [ -f "${ZEPHYR_BASE}/share/zephyr-package/cmake/ZephyrConfig.cmake" ] ||
-                fail "resolved Zephyr project has no package configuration"
-            export ZEPHYR_BASE
-        fi
         build_cmd=(west build "${p_arg}" -s "${APPLICATION_SOURCE}" -d "${build_dir}" -b "${board}")
         for snippet_item in ${snippet}; do
             build_cmd+=(-S "${snippet_item}")
@@ -1181,6 +1200,13 @@ PY
         cd "${WORK_DIR}"
         verify_west_update_result
         west zephyr-export || true
+        if [ "${APPLICATION_SOURCE}" != "zmk/app" ]; then
+            # Resolve once after updates/overlays, before launching any target workers.
+            ZEPHYR_BASE="$(west list zephyr -f '{abspath}')" || fail "cannot resolve Zephyr project"
+            [ -f "${ZEPHYR_BASE}/share/zephyr-package/cmake/ZephyrConfig.cmake" ] ||
+                fail "resolved Zephyr project has no package configuration"
+            export ZEPHYR_BASE
+        fi
         rm -rf "${BUILD_DIR}"
         mkdir -p "${BUILD_DIR}"
 
@@ -1454,11 +1480,15 @@ run_signal_status=0
 run_phase=""
 
 handle_run_signal() {
+    if [ "${run_signal_status}" = 0 ]; then
+        run_signal_status="$2"
+        RUN_FAILURE_REASON="interrupted by $1"
+    fi
     trap '' INT TERM
-    run_signal_status="$2"
-    RUN_FAILURE_REASON="interrupted by $1"
-    # Finish create so its returned identity can be acquired before cleanup.
-    [ "${run_phase}" != create ] || return 0
+    # A signal can arrive before the EXIT handler's first body command.
+    case " ${FUNCNAME[*]} " in *" finish_run "*) return 0 ;; esac
+    # Acquire ownership and finish cleanup before honoring a pending interruption.
+    case "${run_phase}" in create|finish) return 0 ;; esac
     exit "${run_signal_status}"
 }
 
@@ -1494,7 +1524,7 @@ run_logged_command() {
 
 cleanup_container() {
     if [ "${container_created}" = "1" ] && [ "${ZMK_KEEP_CONTAINER:-0}" != "1" ]; then
-        if ! docker rm -f "${container_id}" >>"${LOG_FILE}" 2>&1; then
+        if ! (trap '' INT TERM; docker rm -f "${container_id}" >>"${LOG_FILE}" 2>&1); then
             echo "ERROR: failed to remove build container: ${container_id}" | tee -a "${LOG_FILE}" >&2
             return 1
         fi
@@ -1503,35 +1533,57 @@ cleanup_container() {
     return 0
 }
 finish_run() {
-    local status="$?" cleanup_failed=0 reason="${RUN_FAILURE_REASON:-host setup failed}"
+    local status="$1" original_status summary_status phase="$3" reason="$2"
+    original_status="${status}"
+    run_phase=finish
     trap - EXIT
-    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] && [ "${run_phase}" != created ]; then
-        if ! docker stop -t 1 "${container_id}" >>"${LOG_FILE}" 2>&1; then
-            echo 'ERROR: failed to stop interrupted build container' >>"${LOG_FILE}"
-            cleanup_failed=1
-        fi
-    fi
+    # A signal here records cancellation without recursively exiting the EXIT handler.
     if ! cleanup_container; then
-        cleanup_failed=1
         if [ "${status}" = 0 ]; then
             status=1
             reason="container cleanup failed"
-        else
-            reason="${SUMMARY_REASON:-${reason}}"
+        fi
+    fi
+    # Cleanup has completed. Freeze the outcome before publishing the final summary;
+    # late signals cannot turn a committed SUCCESS into a nonzero command exit.
+    trap '' INT TERM
+    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] && [ "${phase}" != created ]; then
+        if ! docker stop -t 1 "${container_id}" >>"${LOG_FILE}" 2>&1; then
+            echo 'ERROR: failed to stop interrupted build container' >>"${LOG_FILE}"
+            [ "${status}" != 0 ] || { status=1; reason="container stop failed"; }
         fi
     fi
     if [ -n "${active_phase_pid}" ]; then
         kill -TERM "${active_phase_pid}" 2>/dev/null || true
         wait "${active_phase_pid}" 2>/dev/null || true
     fi
-    if [ "${status}" -ne 0 ] && [ -n "${artifact_dir:-}" ] &&
-        { [ "${SUMMARY_WRITTEN:-0}" != "1" ] || [ "${cleanup_failed}" = 1 ]; }; then
-        write_summary "FAILED" "${reason}" || true
+    if [ "${original_status}" = 0 ] && [ "${run_signal_status}" != 0 ]; then
+        status="${run_signal_status}"
+        reason="${RUN_FAILURE_REASON}"
     fi
-    [ -z "${container_create_output}" ] || rm -f "${container_create_output}"
+    if [ -n "${container_create_output}" ] && ! rm -f "${container_create_output}"; then
+        echo 'ERROR: failed to remove container receipt' >&2
+        [ "${status}" != 0 ] || { status=1; reason="container receipt cleanup failed"; }
+    fi
+    if [ -n "${artifact_dir:-}" ]; then
+        # Invoke outside an if condition so failures inside the writer honor errexit.
+        set +e
+        if [ "${status}" = 0 ]; then
+            write_summary SUCCESS
+        else
+            write_summary FAILED "${reason}"
+        fi
+        summary_status=$?
+        set -e
+        if [ "${summary_status}" != 0 ]; then
+            echo 'ERROR: failed to write build summary' >&2
+            [ "${status}" != 0 ] || status=1
+        fi
+    fi
     exit "${status}"
 }
-trap finish_run EXIT
+# Snapshot the original result before a signal can interrupt handler entry.
+trap 'finish_run "$?" "${RUN_FAILURE_REASON:-host setup failed}" "${run_phase}"' EXIT
 trap 'handle_run_signal SIGINT 130' INT
 trap 'handle_run_signal SIGTERM 143' TERM
 
@@ -1645,7 +1697,7 @@ copy_artifacts_from_container() {
         echo "failed to copy build output from the container" >&2
         return 1
     fi
-    if ! firmware_files "${artifact_dir}" | grep -q .; then
+    if ! firmware_files "${artifact_dir}" | grep . >/dev/null; then
         echo "no firmware artifact was copied from the container" >&2
         return 1
     fi
@@ -1673,8 +1725,11 @@ firmware_artifact_count() {
         tr -d '[:space:]'
 }
 
-write_summary() {
-    local status="$1" reason="${2:-}" elapsed built_targets
+write_summary() (
+    set -e
+    local status="$1" reason="${2:-}" elapsed built_targets summary_temporary
+    summary_temporary="$(mktemp "${artifact_dir}/summary-tmp-XXXXXX")"
+    trap 'rm -f "${summary_temporary}"' EXIT
     elapsed="$(( $(date +%s) - RUN_STARTED_AT ))"
     built_targets="$(built_target_count)"
     if [ -z "${built_targets}" ] && [ "${MODE}" = "build" ] && [ "${status}" = "SUCCESS" ]; then
@@ -1709,7 +1764,7 @@ write_summary() {
         echo "Files"
         echo "-----"
         echo "- build.log"
-        if firmware_files "${artifact_dir}" | grep -q .; then
+        if firmware_files "${artifact_dir}" | grep . >/dev/null; then
             firmware_files "${artifact_dir}" |
                 sort |
                 while IFS= read -r file; do
@@ -1722,10 +1777,9 @@ write_summary() {
             echo "---------------"
             failure_excerpt
         fi
-    } > "${artifact_dir}/build-summary.txt"
-    SUMMARY_WRITTEN=1
-    SUMMARY_REASON="${reason}"
-}
+    } > "${summary_temporary}"
+    mv -f "${summary_temporary}" "${artifact_dir}/build-summary.txt"
+)
 
 reset_cache_volume() {
     local volumes volume
@@ -1734,6 +1788,7 @@ reset_cache_volume() {
         return 1
     fi
     while IFS= read -r volume; do
+        volume="${volume%$'\r'}"
         [ "${volume}" = "${zmk_cache_volume}" ] || continue
         if ! docker volume rm "${zmk_cache_volume}" 2>&1 | tee -a "${LOG_FILE}"; then
             return 1
@@ -1804,9 +1859,17 @@ run_logged_command "${container_create_output}" docker "${docker_create_args[@]}
     -e CCACHE_IGNOREOPTIONS='-specs=*' \
     -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
     "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'
-container_id="$(tr -d '\r' < "${container_create_output}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+# Keep receipt parsing in this shell: a group signal must not kill an external
+# filter after create succeeded but before ownership was recorded.
+while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
+    receipt_line="${receipt_line%$'\r'}"
+    if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
+        container_id="${receipt_line}"
+        container_created=1
+        break
+    fi
+done < "${container_create_output}"
 [ -n "${container_id}" ] || die "Docker create did not return a container ID"
-container_created=1
 run_phase=created
 [ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
 rm -f "${container_create_output}"
@@ -1823,29 +1886,26 @@ run_phase=execute
 
 if [ "${MODE}" = "validate" ]; then
     if run_logged_command "" docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh validate "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}"; then
-        write_summary "SUCCESS"
         echo -e "${CYAN}${artifact_dir}${NC}"
         exit 0
     fi
-    write_summary "FAILED" "validation failed"
+    RUN_FAILURE_REASON="validation failed"
     echo -e "${RED}Validation failed. See: ${artifact_dir}${NC}" >&2
     exit 1
 fi
 
 if ! run_logged_command "" docker exec "${container_id}" /bin/bash -lc 'set -o pipefail; cd /root/zmk-config && ./build.sh build "$@" 2>&1 | tee -a /tmp/zmk-build-stream.log' _ "${HOST_SNIPPETS}"; then
-    write_summary "FAILED" "firmware build failed"
+    RUN_FAILURE_REASON="firmware build failed"
     echo -e "${RED}Build failed. See: ${artifact_dir}${NC}" >&2
     exit 1
 fi
 
 run_phase=artifact
 if ! run_logged_command "" copy_artifacts_from_container "${artifact_dir}"; then
-    write_summary "FAILED" "artifact copy failed"
+    RUN_FAILURE_REASON="artifact copy failed"
     echo -e "${RED}Artifact copy failed. See: ${artifact_dir}${NC}" >&2
     exit 1
 fi
-
-write_summary "SUCCESS"
 
 echo -e "\n${GREEN}Artifacts:${NC}"
 firmware_files "${artifact_dir}" | sort | while IFS= read -r file; do

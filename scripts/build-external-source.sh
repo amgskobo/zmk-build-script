@@ -115,6 +115,8 @@ docker_host_path() {
 }
 
 emit_failure_annotation() {
+    # Direct callers can publish sanitized notices. CI wrappers capture these
+    # privately and publish their fixed reports instead.
     local slug="$1" source="$2" reason="$3"
     local title message
     title="External ${ZMK_EXTERNAL_MODE} failed: ${slug}"

@@ -340,6 +340,24 @@ printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
 grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/matrix-output"
 grep -qx 'Resolved source count: 2' "${tmp_dir}/matrix-summary"
 if grep -Eq '/synthetic/private|first|second' "${tmp_dir}/matrix-output" "${tmp_dir}/matrix-summary" "${tmp_dir}/matrix-console"; then exit 1; fi
+# A selector is always a list file, never an inferred source or a URL.
+for selector in missing-list.txt https://example.invalid/sources.txt; do
+  printf '%s\n' "${selector}" > "${ci_root}/.build/ci-source-file"
+  rm -f "${tmp_dir}/invalid-matrix-output"
+  if (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/invalid-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/matrix-summary" \
+      bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/invalid-matrix-console" 2>&1; then
+    echo 'CI matrix accepted a missing list or URL selector' >&2; exit 1
+  fi
+  [ ! -e "${tmp_dir}/invalid-matrix-output" ]
+done
+printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
+# CI helpers use their repository root even when invoked from another directory.
+(cd "${tmp_dir}"; GITHUB_OUTPUT="${tmp_dir}/outside-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/matrix-summary" \
+  bash "${ci_root}/.github/scripts/check-build-output.sh" ci-matrix) >"${tmp_dir}/outside-matrix-console" 2>&1
+grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/outside-matrix-output"
+(cd "${ci_root}/.github"; bash scripts/check-build-output.sh ci-check build) \
+  >"${tmp_dir}/relative-check-console" 2>&1
+grep -qx 'Outcome: SUCCESS' "${ci_root}/.build/public/build.txt"
 for invalid in '' 0 3 bad; do
   if (cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-source-index "${invalid}") \
     >"${tmp_dir}/index-console" 2>&1; then echo 'invalid CI source index accepted' >&2; exit 1; fi

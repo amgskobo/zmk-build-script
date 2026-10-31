@@ -384,7 +384,11 @@ case "$1" in
     case "$2" in
       ls)
         printf '%s\n' "${ZMK_DOCKER_CACHE_VOLUME}-other"
-        [ "${LIFECYCLE_PHASE}" = missing ] || printf '%s\n' "${ZMK_DOCKER_CACHE_VOLUME}"
+        if [ "${LIFECYCLE_PHASE}" = present-crlf ]; then
+          printf '%s\r\n' "${ZMK_DOCKER_CACHE_VOLUME}"
+        elif [ "${LIFECYCLE_PHASE}" != missing ]; then
+          printf '%s\n' "${ZMK_DOCKER_CACHE_VOLUME}"
+        fi
         [ "${LIFECYCLE_PHASE}" != list-failure ] || { echo 'injected partial volume list failure' >&2; exit 23; } ;;
       rm)
         [ "${LIFECYCLE_PHASE}" != reset-failure ] || { echo 'injected cache reset failure' >&2; exit 23; } ;;
@@ -410,7 +414,7 @@ case "$1" in
 esac
 EOF
 chmod +x "${fake_bin}/docker"
-for phase in cleanup-failure both-failures keep reset-failure list-failure missing present create-failure; do
+for phase in cleanup-failure both-failures keep reset-failure list-failure missing present present-crlf create-failure; do
   commands="${tmp_dir}/lifecycle-${phase}.commands.log"
   : > "${commands}"
   invocation=(validate "${fixture}")
@@ -420,7 +424,7 @@ for phase in cleanup-failure both-failures keep reset-failure list-failure missi
     both-failures) expected=23; reason='container start failed' ;;
     keep) keep=1 ;;
     reset-failure|list-failure) expected=1; reason='cache reset failed'; invocation+=(--pristine) ;;
-    missing|present) invocation+=(--pristine) ;;
+    missing|present|present-crlf) invocation+=(--pristine) ;;
     create-failure) expected=23; reason='container creation failed' ;;
   esac
   PATH="${fake_bin}:${PATH}" LIFECYCLE_PHASE="${phase}" LIFECYCLE_COMMANDS="${commands}" \
@@ -468,7 +472,7 @@ for phase in cleanup-failure both-failures keep reset-failure list-failure missi
       if grep -q '^volume rm ' "${commands}"; then
         echo "lifecycle ${phase}: removed an absent or unverified volume" >&2; lifecycle_failed=1
       fi ;;
-    present|reset-failure)
+    present|present-crlf|reset-failure)
       if ! grep -qx 'volume rm lifecycle-cache' "${commands}"; then lifecycle_failed=1; fi ;;
   esac
 done
@@ -678,6 +682,116 @@ for phase in create start probe; do
   fi
 done
 
+# Exercise large artifact streams and finalization with the same fake-daemon boundary.
+finalization_failed=0
+cat > "${fake_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+if [ "${NEW_PHASE}" = cleanup-entry ] && [ "$1" = rm ]; then
+  : > "${NEW_REACHED}"
+  while [ ! -f "${NEW_RELEASE}" ]; do sleep .01; done
+fi
+printf '%s\n' "$*" >> "${NEW_CALLS}"
+case "$1" in
+  create)
+    if [ "${NEW_CRLF:-0}" = 1 ]; then printf '%s\r\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    else printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi ;;
+  start) [ "${NEW_INITIAL_FAILURE:-0}" != 1 ] || exit 23 ;;
+  exec)
+    case "$*" in
+      *'tar -C /root/zmk-config/.build'*) tar -C "${NEW_PAYLOAD}" -cf - . ;;
+      *'tar --no-same-owner'*|*'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
+      *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
+      *'./build.sh build'*) printf 'Build complete: %s target(s).\n' "${NEW_COUNT}" ;;
+      *'mkdir -p /root/zmk-config'*) ;;
+      *) exit 99 ;;
+    esac ;;
+  rm)
+    if [ "${NEW_PHASE}" = cleanup-rm ]; then
+      : > "${NEW_REACHED}"
+      while [ ! -f "${NEW_RELEASE}" ]; do sleep .01; done
+    fi
+    [ -z "${NEW_COMPLETE:-}" ] || : > "${NEW_COMPLETE}" ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${fake_bin}/docker"
+for count in 1 512; do
+  payload="${tmp_dir}/firmware-${count}"
+  mkdir -p "${payload}"
+  padding=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  for number in $(seq 1 "${count}"); do
+    printf 'synthetic firmware\n' > "${payload}/target-${number}-${padding}.bin"
+  done
+  PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT="${count}" NEW_PAYLOAD="${payload}" \
+      NEW_CALLS="${tmp_dir}/firmware-${count}.commands.log" \
+      bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-${count}.log" 2>&1 &
+  build_pid=$!
+  if wait "${build_pid}"; then status=0; else status=$?; fi
+  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+  if [ "${status}" != 0 ] || ! grep -qx 'Status: SUCCESS' "${summary}" ||
+      [ "$(grep -c '^- target-' "${summary}")" != "${count}" ]; then
+    echo "artifact stream ${count}: successful firmware collection was rejected or omitted" >&2
+    finalization_failed=1
+  else
+    bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
+  fi
+done
+
+# A failing external receipt filter must not lose ownership after a successful create.
+real_tr="$(command -v tr)"
+cat > "${fake_bin}/tr" <<'EOF'
+#!/usr/bin/env bash
+input="$(mktemp)"
+trap 'rm -f "${input}"' EXIT
+cat > "${input}"
+receipt="$(cat "${input}")"; receipt="${receipt%$'\r'}"
+if [ "${receipt}" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]; then
+  echo 'injected receipt filter failure' >&2; exit 23
+fi
+"${NEW_REAL_TR}" "$@" < "${input}"
+EOF
+chmod +x "${fake_bin}/tr"
+for crlf in 0 1; do
+  calls="${tmp_dir}/receipt-${crlf}.commands.log"
+  if PATH="${fake_bin}:${PATH}" NEW_REAL_TR="${real_tr}" NEW_PHASE=receipt NEW_CRLF="${crlf}" NEW_CALLS="${calls}" \
+      bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/receipt-${crlf}.log" 2>&1; then
+    status=0
+  else status=$?; fi
+  if [ "${status}" != 0 ] || ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${calls}"; then
+    echo 'receipt parsing lost the created container identity' >&2; finalization_failed=1
+  fi
+done
+rm "${fake_bin}/tr"
+
+# Pause before the daemon mutation and while its client is in flight.
+for phase in cleanup-entry cleanup-rm; do
+  for initial_failure in 0 1; do
+    prefix="${tmp_dir}/finalize-${phase}-${initial_failure}"
+    PATH="${fake_bin}:${PATH}" NEW_PHASE="${phase}" \
+        NEW_INITIAL_FAILURE="${initial_failure}" NEW_CALLS="${prefix}.commands.log" \
+        NEW_REACHED="${prefix}.reached" NEW_RELEASE="${prefix}.release" NEW_COMPLETE="${prefix}.complete" \
+        bash "${tool_root}/build.sh" validate "${fixture}" >"${prefix}.log" 2>&1 &
+    build_pid=$!
+    for attempt in $(seq 1 100); do [ ! -f "${prefix}.reached" ] || break; sleep .05; done
+    [ -f "${prefix}.reached" ] || { kill -TERM "${build_pid}" 2>/dev/null || true; exit 1; }
+    kill -TERM "${build_pid}"
+    : > "${prefix}.release"
+    if wait "${build_pid}"; then status=0; else status=$?; fi
+    summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+    expected=143 reason='interrupted by SIGTERM'
+    [ "${initial_failure}" != 1 ] || { expected=23; reason='container start failed'; }
+    if [ "${status}" != "${expected}" ] || [ ! -f "${prefix}.complete" ] ||
+        ! grep -qx 'Status: FAILED' "${summary}" || ! grep -qx "Reason: ${reason}" "${summary}"; then
+      echo "finalization ${phase}/${initial_failure}: cleanup, status or final summary lost" >&2
+      finalization_failed=1
+    fi
+    if bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}" >/dev/null 2>&1; then
+      echo 'interrupted finalization passed the output checker' >&2; finalization_failed=1
+    fi
+  done
+done
+[ "${finalization_failed}" = 0 ] || exit 1
+
 # Visible evidence would checksum itself and turn log writes into false source drift.
 runner_fixture="${tmp_dir}/runner-fixture"
 mkdir -p "${runner_fixture}/.github/scripts"
@@ -776,18 +890,21 @@ assert_env "${last_container}" CCACHE_DIR /workspaces/elsewhere
 copy_ignored=
 ccache_dir=
 
-# Exercise parser/schema cases inside the existing validate container; no extra build container.
-docker exec -i "${last_container}" sh -c 'cat > /tmp/test-build-container.py' < "${repo_root}/.github/scripts/test-build-container.py"
-docker exec -i "${last_container}" sh -c 'cat > /tmp/target-shapes.yaml' < "${repo_root}/.github/fixtures/target-shapes-zmk-config/build.yaml"
-docker exec -i "${last_container}" sh -c 'cat > /tmp/source-common.sh' < "${repo_root}/scripts/source-common.sh"
-docker exec -i "${last_container}" sh -c 'cat > /tmp/auto-build-external.sh' < "${repo_root}/scripts/auto-build-external.sh"
-docker exec -i "${last_container}" sh -c 'cat > /tmp/auto-build.yml' < "${repo_root}/.github/workflows/auto-build.yml"
-docker exec -i "${last_container}" sh -c 'cat > /tmp/check-build-output.sh' < "${repo_root}/.github/scripts/check-build-output.sh"
-docker exec "${last_container}" mkdir -p /tmp/workflows
-for workflow in "${repo_root}/.github/workflows/"*.yml; do
-  docker exec -i "${last_container}" sh -c 'cat > "/tmp/workflows/$1"' _ "${workflow##*/}" < "${workflow}"
-done
-docker exec "${last_container}" python3 -u /tmp/test-build-container.py /tmp/target-shapes.yaml
+# Stage the complete contract input set once in the existing validation container.
+(cd "${repo_root}" && tar cf - .github/scripts/test-build-container.py \
+  .github/fixtures/target-shapes-zmk-config/build.yaml scripts/source-common.sh \
+  scripts/auto-build-external.sh .github/scripts/check-build-output.sh .github/workflows/*.yml) |
+  docker exec -i "${last_container}" bash -c '
+    set -eu
+    mkdir -p /tmp/contract-inputs /tmp/workflows
+    tar xf - -C /tmp/contract-inputs
+    cp /tmp/contract-inputs/.github/scripts/test-build-container.py /tmp/
+    cp /tmp/contract-inputs/.github/fixtures/target-shapes-zmk-config/build.yaml /tmp/target-shapes.yaml
+    cp /tmp/contract-inputs/scripts/*.sh /tmp/
+    cp /tmp/contract-inputs/.github/scripts/check-build-output.sh /tmp/
+    cp /tmp/contract-inputs/.github/workflows/*.yml /tmp/workflows/
+    cp /tmp/workflows/auto-build.yml /tmp/
+    exec python3 -u /tmp/test-build-container.py /tmp/target-shapes.yaml'
 
 # Round-trip the actual pruned Linux tree through the same host-path helper as external clone.
 (
