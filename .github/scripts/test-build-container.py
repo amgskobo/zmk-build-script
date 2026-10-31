@@ -200,6 +200,15 @@ class ContainerContracts(unittest.TestCase):
         resolver = workflow['jobs']['sources']['steps']
         self.assertTrue(any('ci-matrix' in step.get('run', '') for step in resolver))
 
+    def test_external_json_round_trips_all_shell_representable_control_bytes(self):
+        for number in range(1, 32):
+            with self.subTest(number=number):
+                value = '/synthetic/control' + chr(number) + 'path'
+                result = subprocess.run(['bash', '/tmp/auto-build-external.sh', '--list-json', '--path', value],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)['include'][0]['source'], value)
+
     def test_normal_defaults_aliases_and_order(self):
         self.expect_targets({'defaults': {'cmake-args': '-DDEFAULT=1'}, 'include': [
             {'board': 'A', 'shield': 'left', 'artifact-name': 'one'},
@@ -313,6 +322,36 @@ class ContainerContracts(unittest.TestCase):
         for name in ('alpha beta', 'beta'):
             (self.modules / name).mkdir()
         self.expect_targets({'board': 'A'}, [target('A-zmk')])
+
+    def test_module_build_paths_require_strings_before_workspace_changes(self):
+        for key in ('cmake', 'kconfig'):
+            for value in (True, 17, ['.'], {'path': '.'}):
+                with self.subTest(key=key, value=value):
+                    case = self.make_workspace(prior_overlay=False)
+                    module = case.inputs / 'typed-module'
+                    (module / 'zephyr').mkdir(parents=True)
+                    (module / 'CMakeLists.txt').touch()
+                    (module / 'Kconfig').touch()
+                    declaration = {'cmake': '.', 'kconfig': 'Kconfig'}
+                    declaration[key] = value
+                    (module / 'zephyr/module.yml').write_text(yaml.safe_dump({'build': declaration}))
+                    result = subprocess.run(['bash', str(BUILD), 'validate'], env=case.env,
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('build.' + key + ' must be a string', result.stderr)
+                    result, output = self.run_workspace(case)
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertEqual(case.commands.read_text(), '', output)
+                    self.assertFalse((case.source / 'zephyr').exists())
+
+    def test_target_build_paths_are_not_replaced_when_their_type_is_invalid(self):
+        (self.root / 'CMakeLists.txt').touch()
+        for value in (False, 0, ['.'], {'path': '.'}):
+            with self.subTest(value=value):
+                (self.root / 'module.yml').write_text(yaml.safe_dump({'build': {'cmake': value}}))
+                metadata = self.root / 'zephyr/module.yml'
+                if metadata.exists(): metadata.unlink()
+                self.expect_error({'board': 'A'}, 'build.cmake must be a string')
 
     def test_distinct_extra_module_names_reach_west(self):
         case = self.make_workspace(prior_overlay=False)
@@ -590,6 +629,7 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             self.assertTrue((case / 'reached').exists())
                             os.killpg(process.pid, signum)
                             time.sleep(.05)
+                            os.killpg(process.pid, signum)
                             (case / 'release').touch()
                             output, _ = process.communicate(timeout=5)
                             self.assertEqual(process.returncode, 128 + signum, output)
@@ -606,6 +646,159 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             try: os.killpg(process.pid, signal.SIGKILL)
                             except ProcessLookupError: pass
                             if process.poll() is None: process.wait(timeout=3)
+
+    def test_finalization_group_signals_complete_cleanup_and_publish_final_status(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys, time
+if sys.argv[1] == 'create': print('a' * 64)
+elif sys.argv[1] == 'start': sys.exit(int(os.environ['FINAL_INITIAL_STATUS']))
+elif sys.argv[1] == 'exec':
+    if 'mkdir -p /root/zmk-config' in ' '.join(sys.argv): pass
+    elif './build.sh validate' in ' '.join(sys.argv): print('build.yaml is valid.')
+    else: sys.stdin.buffer.read()
+elif sys.argv[1] == 'rm':
+    pathlib.Path(os.environ['FINAL_REACHED']).touch()
+    while not pathlib.Path(os.environ['FINAL_RELEASE']).exists(): time.sleep(.01)
+    pathlib.Path(os.environ['FINAL_COMPLETE']).touch()
+else: sys.exit(99)
+''')
+        docker.chmod(0o755)
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for initial in (0, 23):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(initial=initial, signal=signum):
+                    folder = self.root / ('finish-%s-%s' % (initial, signum))
+                    folder.mkdir()
+                    env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                               PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                               FINAL_INITIAL_STATUS=str(initial), FINAL_REACHED=str(folder / 'reached'),
+                               FINAL_RELEASE=str(folder / 'release'), FINAL_COMPLETE=str(folder / 'complete'))
+                    process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                               start_new_session=True, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not (folder / 'reached').exists() and time.monotonic() < deadline:
+                            self.assertIsNone(process.poll())
+                            time.sleep(.01)
+                        self.assertTrue((folder / 'reached').exists())
+                        os.killpg(process.pid, signum)
+                        time.sleep(.05)
+                        (folder / 'release').touch()
+                        output, _ = process.communicate(timeout=5)
+                        self.assertTrue((folder / 'complete').exists(), output)
+                        self.assertEqual(process.returncode, initial or 128 + signum, output)
+                        summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
+                        self.assertEqual(len(summaries), 1)
+                        summary = summaries[0].read_text()
+                        self.assertIn('Status: FAILED', summary)
+                        reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
+                        self.assertIn('Reason: ' + reason, summary)
+                    finally:
+                        (folder / 'release').touch()
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        if process.poll() is None: process.wait(timeout=3)
+
+    def test_finalization_entry_signals_preserve_cleanup_and_the_original_failure(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'docker').write_text('''#!/usr/bin/env bash
+case "$1" in
+  create) printf '%064d\\n' 0 ;;
+  start) exit "${ENTRY_INITIAL_STATUS}" ;;
+  exec)
+    case "$*" in
+      *'mkdir -p /root/zmk-config'*) ;;
+      *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
+      *) cat >/dev/null ;;
+    esac ;;
+  rm) : > "${ENTRY_CLEANED}" ;;
+  *) exit 99 ;;
+esac
+''')
+        (binary / 'docker').chmod(0o755)
+        hook = self.root / 'entry-hook.sh'
+        hook.write_text('''set -T
+trap 'if [ "${FUNCNAME[0]:-}" = finish_run ]; then trap - DEBUG; : > "$ENTRY_REACHED"; kill -s "$ENTRY_SIGNAL" "$$"; fi' DEBUG
+''')
+        for initial in (0, 23):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(initial=initial, signal=signum):
+                    folder = self.root / ('entry-%s-%s' % (initial, signum))
+                    folder.mkdir()
+                    env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                               PATH=str(binary) + os.pathsep + os.environ['PATH'], BASH_ENV=str(hook),
+                               ENTRY_INITIAL_STATUS=str(initial), ENTRY_SIGNAL=str(int(signum)),
+                               ENTRY_REACHED=str(folder / 'reached'), ENTRY_CLEANED=str(folder / 'cleaned'))
+                    process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    output, _ = process.communicate(timeout=10)
+                    self.assertTrue((folder / 'reached').exists(), output)
+                    self.assertTrue((folder / 'cleaned').exists(), output)
+                    self.assertEqual(process.returncode, initial or 128 + signum, output)
+                    summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
+                    self.assertEqual(len(summaries), 1, output)
+                    summary = summaries[0].read_text()
+                    self.assertIn('Status: FAILED', summary)
+                    reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
+                    self.assertIn('Reason: ' + reason, summary)
+
+    def test_summary_publication_is_atomic_and_commits_the_outcome(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'docker').write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+if sys.argv[1] == 'create': print('a' * 64)
+elif sys.argv[1] == 'start': pass
+elif sys.argv[1] == 'exec':
+    if 'mkdir -p /root/zmk-config' in ' '.join(sys.argv): pass
+    elif './build.sh validate' in ' '.join(sys.argv): print('build.yaml is valid.')
+    else: sys.stdin.buffer.read()
+elif sys.argv[1] == 'rm': pathlib.Path(os.environ['PUBLISH_CLEANED']).touch()
+else: sys.exit(99)
+''')
+        (binary / 'mv').write_text('''#!/usr/bin/env python3
+import os, pathlib, signal, subprocess, sys
+if sys.argv[-1].endswith('/build-summary.txt'):
+    pathlib.Path(os.environ['PUBLISH_REACHED']).touch()
+    assert pathlib.Path(os.environ['PUBLISH_CLEANED']).exists(), 'summary preceded cleanup'
+    if os.environ['PUBLISH_CASE'] == 'io-failure': sys.exit(23)
+    status = subprocess.call([os.environ['PUBLISH_REAL_MV']] + sys.argv[1:])
+    os.kill(int(pathlib.Path(os.environ['PUBLISH_PID']).read_text()), signal.SIGTERM)
+    sys.exit(status)
+os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
+''')
+        for file in binary.iterdir(): file.chmod(0o755)
+        for name in ('late-signal', 'io-failure'):
+            with self.subTest(name=name):
+                folder = self.root / name
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'], PUBLISH_CASE=name,
+                           PUBLISH_CLEANED=str(folder / 'cleaned'), PUBLISH_REACHED=str(folder / 'reached'),
+                           PUBLISH_PID=str(folder / 'pid'), PUBLISH_REAL_MV=shutil.which('mv'))
+                process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                (folder / 'pid').write_text(str(process.pid))
+                output, _ = process.communicate(timeout=10)
+                self.assertTrue((folder / 'reached').exists(), output)
+                self.assertTrue((folder / 'cleaned').exists(), output)
+                runs = list((BUILD.parent / '.build').glob('*-pid-%s' % process.pid))
+                self.assertEqual(len(runs), 1)
+                summary = runs[0] / 'build-summary.txt'
+                if name == 'late-signal':
+                    self.assertEqual(process.returncode, 0, output)
+                    self.assertIn('Status: SUCCESS', summary.read_text())
+                else:
+                    self.assertNotEqual(process.returncode, 0, output)
+                    self.assertFalse(summary.exists(), output)
+                self.assertFalse(list(runs[0].glob('summary-tmp-*')))
 
     def test_restore_copy_failure_preserves_recovery_state(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project', True)
@@ -950,6 +1143,37 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                 self.assertFalse((case.workspace / name).exists(), output)
                 self.assertEqual(output.count('Removing stale workspace entry: ' + name + '\n'), 1)
         self.assertFalse(case.counter.exists())
+
+    def test_pruning_normalizes_in_workspace_parent_components(self):
+        for path in ('project', './project', 'modules/../project', 'case..name/project'):
+            with self.subTest(path=path):
+                case = self.make_workspace(project_path=path, prior_overlay=False)
+                result, output = self.run_workspace(case)
+                self.assertEqual(result.returncode, 71, output)
+                self.assertTrue(case.project.resolve().is_dir(), output)
+                self.assertFalse(case.counter.exists(), output)
+
+    def test_standalone_resolves_zephyr_once_for_all_targets(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                case = self.make_workspace(prior_overlay=False, jobs=jobs, document={
+                    'application': '.', 'include': [
+                        {'board': 'A', 'artifact-name': 'app-' + str(i)} for i in range(3)]})
+                (case.source / 'CMakeLists.txt').touch()
+                zephyr = case.workspace / 'zephyr'
+                package = zephyr / 'share/zephyr-package/cmake'
+                package.mkdir(parents=True)
+                (package / 'ZephyrConfig.cmake').touch()
+                west = pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'west'
+                text = west.read_text().replace("projects = [('zmk', 'zmk'),", "projects = [('zephyr', 'zephyr'), ('zmk', 'zmk'),")
+                text = text.replace("    fault = os.environ.get('PROBE_LIST_FAILURE')", "    if wanted == 'zephyr':\n        print(str(pathlib.Path(os.environ['WORK_DIR']) / 'zephyr'))\n        sys.exit(0)\n    fault = os.environ.get('PROBE_LIST_FAILURE')")
+                west.write_text(text)
+                case.env['PROBE_BUILD_EXIT'] = '0'
+                result, output = self.run_workspace(case)
+                self.assertEqual(result.returncode, 0, output)
+                calls = [json.loads(line) for line in case.commands.with_suffix('.argv.jsonl').read_text().splitlines()]
+                self.assertEqual(sum(args[:2] == ['list', 'zephyr'] for args in calls), 1)
+                self.assertEqual(sum(args[0] == 'build' for args in calls), 3)
 
     def test_recorded_overlay_restores_before_obsolete_root_is_pruned(self):
         case = self.make_workspace()

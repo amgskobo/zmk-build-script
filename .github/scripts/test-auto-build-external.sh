@@ -99,6 +99,18 @@ indices="$(bash "${builder}" --list-indices-json "${repos_file}")"
   fail 'public matrix contains something other than numeric indices'
 selected="$(bash "${builder}" --list "${repos_file}" --source-index 0008)"
 [ "${selected}" = "$(printf '%s\n' "${list}" | tail -n 1)" ] || fail 'indexed selection changed a collision-resolved slug'
+for format in --list-json --list-indices-json; do
+  selected="$(bash "${builder}" "${format}" "${repos_file}" --source-index 0008)"
+  assert_contains "${selected}" '"index":8' 'JSON selection renumbered the original source index'
+done
+# Every JSON control byte must be escaped, including legal bytes inside Unix paths.
+for number in $(seq 1 31); do
+  printf -v octal '%03o' "${number}"
+  printf -v character '%b' "\\${octal}"
+  value="synthetic${character}path"
+  json="$(bash "${builder}" --list-json --path "${value}")"
+  case "${json}" in *"${character}"*) fail 'JSON output contains an unescaped control byte' ;; esac
+done
 for invalid in '' 0 00 9 bad -1; do
   if bash "${builder}" --list "${repos_file}" --source-index "${invalid}" >/dev/null 2>&1; then
     fail 'invalid source index was accepted'

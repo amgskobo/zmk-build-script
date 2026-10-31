@@ -218,12 +218,19 @@ load_default_sources() {
 }
 
 json_escape() {
-    local value="$1"
+    local value="$1" number=1 octal character escaped
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
     value="${value//$'\r'/\\r}"
     value="${value//$'\n'/\\n}"
     value="${value//$'\t'/\\t}"
+    while [ "${number}" -le 31 ]; do
+        printf -v octal '%03o' "${number}"
+        printf -v character '%b' "\\${octal}"
+        printf -v escaped '\\u%04x' "${number}"
+        value="${value//"${character}"/"${escaped}"}"
+        number=$((number + 1))
+    done
     printf '%s' "${value}"
 }
 
@@ -237,7 +244,7 @@ print_list() {
 }
 
 print_list_json() {
-    local i cache_volume comma="" indices_only="${1:-0}"
+    local i index cache_volume comma="" indices_only="${1:-0}"
     if [ ${#source_values[@]} -eq 0 ]; then
         printf '{"include":[]}'
         return 0
@@ -245,15 +252,16 @@ print_list_json() {
 
     printf '{"include":['
     for i in "${!source_values[@]}"; do
+        index="${SOURCE_INDEX:-$((i + 1))}"
         if [ "${indices_only}" = 1 ]; then
-            printf '%s{"index":%s}' "${comma}" "$((i + 1))"
+            printf '%s{"index":%s}' "${comma}" "${index}"
             comma=","
             continue
         fi
         cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${slugs[$i]}"
         printf '%s{"index":%s,"slug":"%s","cache_volume":"%s","type":"%s","source":"%s"}' \
             "${comma}" \
-            "$((i + 1))" \
+            "${index}" \
             "$(json_escape "${slugs[$i]}")" \
             "$(json_escape "${cache_volume}")" \
             "$(json_escape "${source_types[$i]}")" \
@@ -521,7 +529,6 @@ if [ ${#source_values[@]} -eq 0 ]; then
 fi
 
 if [ -n "${SOURCE_INDEX}" ]; then
-    validate_positive_int 'source index' "${SOURCE_INDEX}"
     [ "${SOURCE_INDEX}" -le "${#source_values[@]}" ] || { echo 'ERROR: source index is out of range' >&2; exit 1; }
     while [ "${SOURCE_INDEX#0}" != "${SOURCE_INDEX}" ]; do SOURCE_INDEX="${SOURCE_INDEX#0}"; done
     selected_index=$((SOURCE_INDEX - 1))

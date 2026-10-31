@@ -44,6 +44,8 @@ writes, resets and data erasure still apply.
 
 ## Scope and responsibilities
 
+### Task boundaries
+
 - Read the latest user instructions and existing diff first; preserve user changes.
 - Stage, commit, push, create/update a PR, merge, tag or release only with explicit
   instructions for that operation. Passing tests or reaching a milestone is not
@@ -59,6 +61,8 @@ writes, resets and data erasure still apply.
 - Do not make the builder reclaim memory, stop or reconfigure WSL as a whole, or monitor
   other tools. Distinguish intermediate-file deletion, dependency/ccache reuse, and
   artifacts/evidence retained on the host.
+
+### File responsibilities
 
 | Location | Responsibility |
 | --- | --- |
@@ -78,6 +82,8 @@ back to the host.
 
 ## Host and source copy
 
+### Host compatibility and capabilities
+
 - Absorb Windows/macOS/Linux differences in the scripts. Explicitly use Git Bash on
   Windows, avoiding WSL shims. With MSYS automatic path conversion disabled for Docker,
   do not pass MSYS paths to native `git.exe`; change into the directory instead.
@@ -87,6 +93,9 @@ back to the host.
   list support by executing `--null -T` with empty input; if unsupported, do not use
   Git file lists. Omitted short-help content or SIGPIPE from a help pipeline does not
   establish lack of capability.
+
+### File selection
+
 - For Git working trees, copy tracked and non-ignored untracked files using NUL
   delimiters. Exclude deleted tracked files and retain ignored tracked files. Use a
   full copy with fixed exclusions for `ZMK_COPY_IGNORED=1`, absent/failing Git,
@@ -101,6 +110,8 @@ back to the host.
 
 ## Layout, modules and applications
 
+### Repository layout
+
 - The entry point is a repository root containing `build.yaml` and `config/west.yml`.
   Direct config directories/custom config paths are unsupported. Standard board
   definitions belong in root/module `boards/`; allow existing `config/boards` as a
@@ -108,6 +119,9 @@ back to the host.
 - Allow legacy target `zephyr/` content with a warning. Normalize missing metadata/root
   `module.yml` only inside the container. Do not modify host sources; add the target
   root as an extra module when metadata exists.
+
+### Explicit modules
+
 - Require explicit `-m` for every module. Resolve host paths, including `dir/.`, before
   detecting duplicates using the entire basename, including spaces. Validate/apply
   explicitly supplied hidden directories through the same list. Pass internal path
@@ -117,7 +131,12 @@ back to the host.
   corresponding `build.settings.*_root: .`. On the host, check only that required
   metadata files exist. Strictly validate YAML structure/keys inside the container
   before workspace changes/dependency updates; allow inline maps and quoted keys.
+  Declared `build.cmake` / `build.kconfig` paths must be strings, including before
+  target normalization.
   Preserve nested paths such as `proto/zmk`.
+
+### Applications
+
 - Normally use `zmk/app`. Top-level `application` specifies a repository-relative
   directory containing `CMakeLists.txt`. Reject absolute paths, parent traversal and
   symlinks escaping the repository. For standalone applications, resolve the package
@@ -129,12 +148,17 @@ back to the host.
 
 ## Persistent workspace and cache
 
+### Workspace ownership
+
 - Sync only `config/` into the workspace; point ZMK's `ZMK_CONFIG` at `config/` in the
   fresh container source. Separate volumes by repository/tool/purpose so roots outside
   the manifest can be pruned. Serialize builds modifying the same workspace with an
   OS lock; on contention, stop before sync, dependency updates or deletion. Keep the
   lock file outside the prune scope and release it when the build process exits.
   A retained container's existence alone must not prevent reuse.
+
+### Overlay restoration and pruning
+
 - Restore the previous overlay from workspace backups before applying current inputs.
   A directory whose name matches a west project is an overlay; otherwise it is an
   extra module. Record backup restoration information before changing the destination.
@@ -146,8 +170,13 @@ back to the host.
   or interruption. Accept legacy two-column records.
 - Prune after restoration, using only fully successful `west list` results. Compare
   roots exactly using arrays, including spaces and hidden entries, and clean each once.
+  Normalize in-workspace parent components before selecting roots; reject paths
+  escaping the workspace.
   On list failure/partial output, retain caches and require an update; after success,
   recheck before pruning/stamping. Do not ignore deletion failures.
+
+### Dependency reuse and updates
+
 - Update when the digest of the entire `west manifest --resolve`, including imports,
   changes, resolution fails, required ZMK/projects are missing, `west list` fails or
   an overlay cannot be restored. Do not decide reuse from the entry file hash alone.
@@ -160,6 +189,9 @@ back to the host.
   final attempt. Do not infer unknown/unsupported failures from a missing-project list
   or mix in failed names from earlier attempts. Do not record continuation with local
   overrides as a successful upstream update.
+
+### Cache lifecycle
+
 - Keep ccache on the cache volume, outside the west workspace.
   `CCACHE_IGNOREOPTIONS=-specs=*` assumes fixed SDK specs within the selected image.
   Recheck this assumption when changing SDK/image; include revision suffixes when
@@ -170,6 +202,8 @@ back to the host.
   use it for overlay restoration tests.
 
 ## Parser, build and output
+
+### CLI and YAML
 
 - Maintain public CLI/environment-variable tables in the READMEs. Interpret positive
   integers as decimal; reject all-zero values, including `00`.
@@ -183,6 +217,9 @@ back to the host.
 - Normalize artifact names to safe filenames. Check the portion before the first dot
   for Windows reserved names too. Reject case-insensitive duplicates and collisions
   with reserved output names such as logs/summaries.
+
+### Target execution
+
 - Separate build directories/logs per target. Keep parallel failure counts as integer
   data, not packed into an 8-bit exit status. Collect batch failures, do not start
   subsequent pending targets, and preserve log order. Default target parallelism for
@@ -191,6 +228,9 @@ back to the host.
   success and compile/artifact-selection/copy failures, retaining dependencies/ccache.
   Log deletion failures and turn success into failure, preserving the original build
   error's exit status when one exists.
+
+### Artifacts and summaries
+
 - Collect one firmware file per target, preferring `.uf2`, then the configured fallback,
   then `.hex`, then `.bin`. Host enumeration, summaries and checkers recognize the same
   extensions, excluding logs/summaries themselves. Extensions must not contain paths,
@@ -202,6 +242,10 @@ back to the host.
   `stdbuf`'s `LD_PRELOAD` to children. For SIGINT/SIGTERM, finalize the reason/exit status
   and use the same finalization path. Stop and retain containers requested for retention
   when interrupted.
+  Defer signals through ID acquisition, exit-handler entry and cleanup. Publish
+  one atomic final summary after cleanup; preserve earlier build failures, and
+  commit the exit status before summary publication.
+  Firmware existence probes must drain the enumerator without inducing SIGPIPE.
 - Summary fields are Status, Reason on failure, Mode, Target, Docker image/cache volume,
   Elapsed, Built targets, Pristine, Build jobs, Fallback binary, Extra snippets, Module
   inputs and Files. Reject duplicate major fields and summaries in invalid run paths.
@@ -213,14 +257,22 @@ back to the host.
 
 ## Containers, external sources and workflows
 
+### Container ownership
+
 - Start/exec/copy/clean up build, clone and test containers using the immutable ID
   returned by create. On create failure, do not delete an existing same-named container;
   the requested name is not proof of ownership.
 - Reflect container deletion failures in logs/FAILED summaries while preserving prior
   build failure reasons/exit statuses. Respect `ZMK_KEEP_CONTAINER=1`. Do not proceed
   to retry/invoke the builder after clone-container deletion fails.
+
+### External sources
+
 - Distinguish URLs, UNC paths, absolute drive paths and relative paths; resolve slug
   collisions. Separate clones/caches/containers/artifacts per source.
+  JSON output escapes all shell-representable control bytes and retains original
+  indices after selection. CI source selectors always identify list files; reject
+  missing lists during matrix resolution.
 - After daemon preflight, fetch URLs with retries inside a clone container. Return them
   to the host using `docker cp`, not bind mounts. On Windows only, remove paths with
   trailing spaces/dots, forbidden characters, control characters/newlines or reserved
@@ -233,6 +285,9 @@ back to the host.
   a status file is a failure; keep other sources running and dispatch the next source
   into the free slot. Distinguish external source layout/API incompatibility from
   builder defects.
+
+### Workflows
+
 - Pass source/input/runner names through quoted `env:` values; do not embed
   `${{ ... }}` directly in shell text. Values the runner displays before execution must
   not contain private source information; limit matrix/step environment values to
@@ -247,63 +302,6 @@ back to the host.
   queuing due to an offline runner with failure.
 - Preserve UTC cron schedules, conversion comments, concurrency and timeouts. This
   contract does not automatically authorize Heartbeat commits/pushes.
-
-## Validation gates and regression prevention
-
-Classify defects by host/copy/workspace/update/overlay/build/artifact/summary/workflow
-boundary. Before fixing, add a case that fails before the fix or an identifiable
-negative control to an existing helper/fixture. Reflect the cause, fix and verification
-in the relevant contract and tests. Do not add duplicate bug histories or remove/weaken
-valid regression assertions. Check whether the same issue remains on another OS/workflow.
-
-| Change scope | Required checks |
-| --- | --- |
-| Documentation only | LF, `git diff --check`, changed paths/links/CLI references; do not run firmware suites solely for documentation changes |
-| Code/helpers/workflows | Applicable syntax, LF, `git diff --check`, related behavior/build gates |
-| Helpers/summaries | Relevant behavior tests and failure status/reason/output |
-| Copy/modules/sync/cache | Runner preflight, copy helper, relevant validate/firmware, immediate output check |
-| Artifacts/fallback | Firmware fixture and output helper; verify non-UF2 selection too |
-| Workflows | YAML/run-step syntax, relevant helpers/steps; remote CI remains unexecuted before publication |
-
-Use `bash .github/scripts/test.sh shell|docker|build|all` as the local/CI entry point;
-keep the layer mapping in the READMEs. As relevant to the change, check standard
-validation (normal/reset), target shapes and CLI snippets, standard firmware,
-project overlays/extra modules and restoration without pristine. Immediately after
-each successful build/validate, run the output checker with the explicit run path.
-
-- Use a fresh evidence destination per execution, outside the repository or entirely
-  Git-ignored. Reject visible internal destinations before starting. Record commands,
-  statuses, timing, pre/post source checksums, image identity and raw failures; do not
-  overwrite existing evidence.
-- Do not edit running scripts. Freeze revised sources and rerun; a result with differing
-  pre/post checksums is not a PASS for the latest source.
-- Run tests as `bash <script>` and resolve temporary paths with `pwd -P`. For host guards,
-  check both the reachability sentinel and rejection condition. Do not depend on
-  executable bits or unnormalized Windows fake-bin paths.
-- For Bash symlink fixtures, avoid Git Bash's copy fallback and verify `-L` after creation.
-  Set any required MSYS link mode only on the creation command. Do not substitute
-  permission-related skips or omit rejection assertions.
-- Follow `.gitattributes`/`.editorconfig` for LF. Inspect raw bytes so CRLF, bare CR,
-  Control-Z, large inputs and Git failures are not missed. Do not reset/rewrite the
-  working tree for validation.
-- Consolidate independent Docker conditions into one container. Exercise the production
-  parser and inspect values, order and actual argv. Test update retries, stale locks
-  containing spaces, partial failures and recovery by controlling command boundaries
-  inside the current image.
-- Clean up test containers only by acquired IDs. Use dedicated test caches; distinguish
-  ownership of explicitly selected reusable caches from automatically created caches.
-- Separate local checks, remote CI and physical operation. Fixture success does not
-  establish PASS for real network failures, different west versions, real builds with
-  older images, non-amd64 native hosts or post-publication hosted/self-hosted execution
-  without corresponding evidence.
-
-## Completion and reporting
-
-Recheck the latest scope, preservation of existing changes, unnecessary new files/
-unintended diffs, LF, syntax and required checks. Report changed files, PASS/FAIL/
-unexecuted checks with reasons, remaining environment boundaries, whether commits/
-pushes occurred and the worktree state. Publish only with explicit instructions for
-each operation; after publication, check relevant remote CI results too.
 
 ## Container test execution
 
@@ -321,7 +319,7 @@ matrices. Hardware acceptance needs documented device access; report unavailable
 container transports as BLOCKED rather than substituting host execution or mocked
 acceptance. Export only reviewed evidence and retain the publication privacy rule.
 
-## Fast container test execution
+### Fast container test execution
 
 Use prepared container environments, persistent caches and bounded parallelism
 to reduce execution time. Preserve every required scenario, assertion, negative
@@ -368,3 +366,64 @@ control, sanitizer, supported-core variant and repeat.
 Quick and full retain their existing contracts. Interface/infrastructure changes
 still require the complete owner matrix. Evaluate speed changes using equivalent
 inputs and checks, report cold and warm runs separately, and retain failures.
+
+## Validation gates and regression prevention
+
+Classify defects by host/copy/workspace/update/overlay/build/artifact/summary/workflow
+boundary. Before fixing, add a case that fails before the fix or an identifiable
+negative control to an existing helper/fixture. Reflect the cause, fix and verification
+in the relevant contract and tests. Do not add duplicate bug histories or remove/weaken
+valid regression assertions. Check whether the same issue remains on another OS/workflow.
+
+### Required checks
+
+| Change scope | Required checks |
+| --- | --- |
+| Documentation only | LF, `git diff --check`, changed paths/links/CLI references; do not run firmware suites solely for documentation changes |
+| Code/helpers/workflows | Applicable syntax, LF, `git diff --check`, related behavior/build gates |
+| Helpers/summaries | Relevant behavior tests and failure status/reason/output |
+| Copy/modules/sync/cache | Runner preflight, copy helper, relevant validate/firmware, immediate output check |
+| Artifacts/fallback | Firmware fixture and output helper; verify non-UF2 selection too |
+| Workflows | YAML/run-step syntax, relevant helpers/steps; remote CI remains unexecuted before publication |
+
+Use `bash .github/scripts/test.sh shell|docker|build|all` as the local/CI entry point;
+keep the layer mapping in the READMEs. As relevant to the change, check standard
+validation (normal/reset), target shapes and CLI snippets, standard firmware,
+project overlays/extra modules and restoration without pristine. Immediately after
+each successful build/validate, run the output checker with the explicit run path.
+
+### Evidence and regression fixtures
+
+- Use a fresh evidence destination per execution, outside the repository or entirely
+  Git-ignored. Reject visible internal destinations before starting. Record commands,
+  statuses, timing, pre/post source checksums, image identity and raw failures; do not
+  overwrite existing evidence.
+- Do not edit running scripts. Freeze revised sources and rerun; a result with differing
+  pre/post checksums is not a PASS for the latest source.
+- Run tests as `bash <script>` and resolve temporary paths with `pwd -P`. For host guards,
+  check both the reachability sentinel and rejection condition. Do not depend on
+  executable bits or unnormalized Windows fake-bin paths.
+- For Bash symlink fixtures, avoid Git Bash's copy fallback and verify `-L` after creation.
+  Set any required MSYS link mode only on the creation command. Do not substitute
+  permission-related skips or omit rejection assertions.
+- Follow `.gitattributes`/`.editorconfig` for LF. Inspect raw bytes so CRLF, bare CR,
+  Control-Z, large inputs and Git failures are not missed. Do not reset/rewrite the
+  working tree for validation.
+- Consolidate independent Docker conditions into one container. Exercise the production
+  parser and inspect values, order and actual argv. Test update retries, stale locks
+  containing spaces, partial failures and recovery by controlling command boundaries
+  inside the current image.
+- Clean up test containers only by acquired IDs. Use dedicated test caches; distinguish
+  ownership of explicitly selected reusable caches from automatically created caches.
+- Separate local checks, remote CI and physical operation. Fixture success does not
+  establish PASS for real network failures, different west versions, real builds with
+  older images, non-amd64 native hosts or post-publication hosted/self-hosted execution
+  without corresponding evidence.
+
+## Completion and reporting
+
+Recheck the latest scope, preservation of existing changes, unnecessary new files/
+unintended diffs, LF, syntax and required checks. Report changed files, PASS/FAIL/
+unexecuted checks with reasons, remaining environment boundaries, whether commits/
+pushes occurred and the worktree state. Publish only with explicit instructions for
+each operation; after publication, check relevant remote CI results too.

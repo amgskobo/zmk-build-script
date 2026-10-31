@@ -3,6 +3,15 @@ set -euo pipefail
 
 mode="${1:-}"
 run_dir="${2:-}"
+PUBLIC_REPORT_KINDS=(tests-shell tests-docker tests-build tests-all build validate)
+
+public_report_kind() {
+  local candidate
+  for candidate in "${PUBLIC_REPORT_KINDS[@]}"; do
+    [ "$1" != "${candidate}" ] || return 0
+  done
+  return 1
+}
 
 public_case_label() {
   case "$1" in syntax|lf|whitespace|lf-contract|output-contract|external-contract|host-contract|host-help|container-help|tools|docker-contract|firmware|docker-dependent) return 0 ;; esac
@@ -26,7 +35,7 @@ publish_report() {
   [ ! -L .build ] && [ ! -L "${public_dir}" ] || { echo 'Publication directory must not be a symlink.' >&2; return 1; }
   mkdir -p "${public_dir}" || return 1
   if [ "${kind}" = clear ]; then
-    for file in tests-shell tests-docker tests-build tests-all build validate; do
+    for file in "${PUBLIC_REPORT_KINDS[@]}"; do
       rm -f "${public_dir}/${file}.txt" || return 1
     done
     rm -f .build/ci-source.status .build/ci-source.record || return 1
@@ -34,7 +43,7 @@ publish_report() {
   fi
   if [ "${kind}" = verify ]; then
     local reports=0 header modes outcomes codes notices line report_status report_outcome has_failure
-    for label in tests-shell tests-docker tests-build tests-all build validate; do
+    for label in "${PUBLIC_REPORT_KINDS[@]}"; do
       file="${public_dir}/${label}.txt"
       [ ! -L "${file}" ] || { echo 'Publication report must not be a symlink.' >&2; return 1; }
       [ ! -e "${file}" ] || [ -f "${file}" ] || return 1
@@ -64,7 +73,7 @@ publish_report() {
     [ "${reports}" -gt 0 ] || { echo 'No publication reports were produced.' >&2; return 1; }
     return 0
   fi
-  case "${kind}" in tests-shell|tests-docker|tests-build|tests-all|build|validate) ;; *) echo 'Invalid publication mode.' >&2; return 1 ;; esac
+  public_report_kind "${kind}" || { echo 'Invalid publication mode.' >&2; return 1; }
   case "${status}" in ''|*[!0-9]*) echo 'Invalid publication exit status.' >&2; return 1 ;; esac
   [ "${status}" -le 255 ] || { echo 'Invalid publication exit status.' >&2; return 1; }
   temporary="$(mktemp "${public_dir}/.report.XXXXXX")" || return 1
@@ -112,6 +121,7 @@ run_indexed_source() {
 case "${mode}" in
   ci-tests|ci-tools|ci-lf|ci-syntax|ci-source|ci-source-index|ci-matrix|ci-check)
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+    cd "${repo_root}"
     mkdir -p .build
     ci_execution="$(mktemp -d .build/ci-execution.XXXXXX)"
     status=0
@@ -120,7 +130,7 @@ case "${mode}" in
         (
           source_file="$(cat .build/ci-source-file)" || exit 1
           [ -n "${source_file}" ] || exit 1
-          bash "${repo_root}/scripts/auto-build-external.sh" --list-indices-json "${source_file}" \
+          bash "${repo_root}/scripts/auto-build-external.sh" --list-indices-json --sources-file "${source_file}" \
             > "${ci_execution}/matrix.json" || exit "$?"
           matrix="$(cat "${ci_execution}/matrix.json")" || exit 1
           [ "${matrix}" != '{"include":[]}' ] || exit 1
@@ -146,6 +156,7 @@ case "${mode}" in
         printf '1\n' > .build/ci-source.status
         printf '%s\n' "${ci_execution}/command.log" > .build/ci-source.record
         if [ "${mode}" = ci-source-index ]; then
+          # Capture direct-script notices privately; CI publishes only fixed reports.
           GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= run_indexed_source "${1:-}" \
             > "${ci_execution}/command.log" 2>&1 || status=$?
         else
@@ -155,7 +166,7 @@ case "${mode}" in
         printf '%s\n' "${status}" > .build/ci-source.status ;;
       ci-check)
         case "${2:-}" in build|validate) ;; *) echo 'Invalid output mode.' >&2; exit 2 ;; esac
-        bash "${BASH_SOURCE[0]}" "$2" > "${ci_execution}/command.log" 2>&1 || status=$?
+        bash "${repo_root}/.github/scripts/check-build-output.sh" "$2" > "${ci_execution}/command.log" 2>&1 || status=$?
         source_status="$(cat .build/ci-source.status 2>/dev/null || true)"
         [ "${source_status}" = 0 ] || status=1
         publish_report "$2" "${status}" || status=1 ;;
