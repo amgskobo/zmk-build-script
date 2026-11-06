@@ -1400,46 +1400,33 @@ validate_module_inputs() {
     done
 }
 
-trim_manifest_scalar() {
-    local value="$1"
-    value="${value%%#*}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    case "${value}" in
-        \"*\") value="${value#\"}"; value="${value%\"}" ;;
-        \'*\') value="${value#\'}"; value="${value%\'}" ;;
-    esac
-    printf '%s\n' "${value}"
-}
-
 detect_zmk_revision() {
-    local manifest="${TARGET_DIR}/config/west.yml" revision
-    [ -f "${manifest}" ] || return 1
-    revision="$(
-        awk '
-            function clean_scalar(value) {
-                sub(/[[:space:]]*#.*/, "", value)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
-                    value = substr(value, 2, length(value) - 2)
-                }
-                return value
-            }
-            /^[[:space:]]*-[[:space:]]*name[[:space:]]*:/ {
-                name = $0
-                sub(/^[[:space:]]*-[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", name)
-                in_zmk = (clean_scalar(name) == "zmk")
-                next
-            }
-            in_zmk && /^[[:space:]]*revision[[:space:]]*:/ {
-                sub(/^[[:space:]]*revision[[:space:]]*:[[:space:]]*/, "", $0)
-                print
-                exit
-            }
-        ' "${manifest}"
-    )"
-    [ -n "${revision}" ] || return 1
-    trim_manifest_scalar "${revision}"
+    local line found=0
+    image_probe_output="$(mktemp "${TMPDIR:-/tmp}/zmk-image-revision.XXXXXX")"
+    RUN_FAILURE_REASON="manifest image selection failed"
+    run_phase=select
+    # Use west's YAML/schema/default semantics without requiring Python on the host.
+    # Imports need dependency checkouts and are intentionally not fetched here.
+    run_logged_command "${image_probe_output}" docker exec -i "${container_id}" python3 -c '
+import sys
+import yaml
+from west.manifest import ImportFlag, Manifest
+
+manifest = Manifest.from_data(yaml.safe_load(sys.stdin.read()), import_flags=ImportFlag.IGNORE)
+revision = next((p.revision for p in manifest.projects if p.name == "zmk"), "")
+if not isinstance(revision, str) or any(ord(c) < 32 for c in revision):
+    sys.exit("invalid ZMK revision")
+print("ZMK_IMAGE_REVISION=" + revision)
+' < "${TARGET_DIR}/config/west.yml"
+    while IFS= read -r line || [ -n "${line}" ]; do
+        line="${line%$'\r'}"
+        case "${line}" in
+            ZMK_IMAGE_REVISION=*) detected_zmk_revision="${line#ZMK_IMAGE_REVISION=}"; found=1 ;;
+        esac
+    done < "${image_probe_output}"
+    [ "${found}" = 1 ] || die "manifest inspection did not return a ZMK revision"
+    rm -f "${image_probe_output}"
+    image_probe_output=""
 }
 
 docker_tag_for_zmk_revision() {
@@ -1475,6 +1462,7 @@ container_name="${ZMK_CONTAINER_NAME:-${container_name}}"
 container_created=0
 container_id=""
 container_create_output=""
+image_probe_output=""
 active_phase_pid=""
 run_signal_status=0
 run_phase=""
@@ -1488,7 +1476,7 @@ handle_run_signal() {
     # A signal can arrive before the EXIT handler's first body command.
     case " ${FUNCNAME[*]} " in *" finish_run "*) return 0 ;; esac
     # Acquire ownership and finish cleanup before honoring a pending interruption.
-    case "${run_phase}" in create|finish) return 0 ;; esac
+    case "${run_phase}" in create|cleanup|finish) return 0 ;; esac
     exit "${run_signal_status}"
 }
 
@@ -1508,7 +1496,7 @@ run_logged_command() {
         else
             "$@" 2>&1 | tee -a "${LOG_FILE}"
         fi
-    ) &
+    ) <&0 &
     active_phase_pid=$!
     if wait "${active_phase_pid}"; then status=0; else status=$?; fi
     if [ "${run_phase}" = create ] && [ "${run_signal_status}" != 0 ]; then
@@ -1523,7 +1511,7 @@ run_logged_command() {
 }
 
 cleanup_container() {
-    if [ "${container_created}" = "1" ] && [ "${ZMK_KEEP_CONTAINER:-0}" != "1" ]; then
+    if [ "${container_created}" = "1" ] && { [ "${1:-0}" = 1 ] || [ "${ZMK_KEEP_CONTAINER:-0}" != "1" ]; }; then
         if ! (trap '' INT TERM; docker rm -f "${container_id}" >>"${LOG_FILE}" 2>&1); then
             echo "ERROR: failed to remove build container: ${container_id}" | tee -a "${LOG_FILE}" >&2
             return 1
@@ -1564,6 +1552,10 @@ finish_run() {
     if [ -n "${container_create_output}" ] && ! rm -f "${container_create_output}"; then
         echo 'ERROR: failed to remove container receipt' >&2
         [ "${status}" != 0 ] || { status=1; reason="container receipt cleanup failed"; }
+    fi
+    if [ -n "${image_probe_output}" ] && ! rm -f "${image_probe_output}"; then
+        echo 'ERROR: failed to remove manifest inspection receipt' >&2
+        [ "${status}" != 0 ] || { status=1; reason="manifest inspection cleanup failed"; }
     fi
     if [ -n "${artifact_dir:-}" ]; then
         # Invoke outside an if condition so failures inside the writer honor errexit.
@@ -1810,8 +1802,9 @@ requested_image_tag="${ZMK_BUILD_IMAGE_TAG:-auto}"
 resolved_image_tag="${requested_image_tag}"
 detected_zmk_revision=""
 if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = "auto" ]; then
-    detected_zmk_revision="$(detect_zmk_revision || true)"
-    resolved_image_tag="$(docker_tag_for_zmk_revision "${detected_zmk_revision}")"
+    # Start with the repository's stable image for structural manifest inspection.
+    # It also becomes the build container when stable is the selected toolchain.
+    resolved_image_tag=stable
 fi
 zmk_build_image="$(resolve_docker_image "${resolved_image_tag}")"
 zmk_cache_volume="${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}"
@@ -1826,9 +1819,6 @@ touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 
 echo -e "${CYAN}Starting ZMK ${MODE}...${NC}"
 msg "Target: ${TARGET_DIR}"
-if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = "auto" ]; then
-    msg "Detected ZMK revision: ${detected_zmk_revision:-<unknown>} (Docker tag: ${resolved_image_tag})"
-fi
 msg "Docker image: ${zmk_build_image}"
 msg "Docker cache volume: ${zmk_cache_volume}"
 msg "Build jobs: ${BUILD_JOBS}"
@@ -1839,44 +1829,67 @@ if [ "${PRISTINE}" = 1 ]; then
     reset_cache_volume || die "failed to reset Docker cache volume: ${zmk_cache_volume}"
 fi
 
-RUN_FAILURE_REASON="container creation failed"
-run_phase=create
-docker_create_args=(create --name "${container_name}")
-if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
-    docker_create_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
-fi
-# Keep platform and default paths on one set of volume/environment arguments.
-container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"
-run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
-    -v "${zmk_cache_volume}:/workspaces" \
-    -e ZMK_IN_CONTAINER=1 \
-    -e PRISTINE="${PRISTINE}" \
-    -e SETTINGS_RESET="${SETTINGS_RESET}" \
-    -e BUILD_JOBS="${BUILD_JOBS}" \
-    -e ZMK_WEST_UPDATE_ATTEMPTS="${ZMK_WEST_UPDATE_ATTEMPTS:-3}" \
-    -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
-    -e CCACHE_DIR="${zmk_ccache_dir}" \
-    -e CCACHE_IGNOREOPTIONS='-specs=*' \
-    -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-    "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'
-# Keep receipt parsing in this shell: a group signal must not kill an external
-# filter after create succeeded but before ownership was recorded.
-while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
-    receipt_line="${receipt_line%$'\r'}"
-    if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
-        container_id="${receipt_line}"
-        container_created=1
-        break
+start_build_container() {
+    local receipt_line
+    container_id=""
+    container_created=0
+    RUN_FAILURE_REASON="container creation failed"
+    run_phase=create
+    docker_create_args=(create --name "${container_name}")
+    if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
+        docker_create_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
     fi
-done < "${container_create_output}"
-[ -n "${container_id}" ] || die "Docker create did not return a container ID"
-run_phase=created
-[ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
-rm -f "${container_create_output}"
-container_create_output=""
-RUN_FAILURE_REASON="container start failed"
-run_phase=start
-run_logged_command "" docker start "${container_id}"
+    # Keep platform and default paths on one set of volume/environment arguments.
+    container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"
+    run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
+        -v "${zmk_cache_volume}:/workspaces" \
+        -e ZMK_IN_CONTAINER=1 \
+        -e PRISTINE="${PRISTINE}" \
+        -e SETTINGS_RESET="${SETTINGS_RESET}" \
+        -e BUILD_JOBS="${BUILD_JOBS}" \
+        -e ZMK_WEST_UPDATE_ATTEMPTS="${ZMK_WEST_UPDATE_ATTEMPTS:-3}" \
+        -e ZMK_FALLBACK_BINARY="${ZMK_FALLBACK_BINARY:-bin}" \
+        -e CCACHE_DIR="${zmk_ccache_dir}" \
+        -e CCACHE_IGNOREOPTIONS='-specs=*' \
+        -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
+        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'
+    # Keep receipt parsing in this shell: a group signal must not kill an external
+    # filter after create succeeded but before ownership was recorded.
+    while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
+        receipt_line="${receipt_line%$'\r'}"
+        if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
+            container_id="${receipt_line}"
+            container_created=1
+            break
+        fi
+    done < "${container_create_output}"
+    [ -n "${container_id}" ] || die "Docker create did not return a container ID"
+    run_phase=created
+    [ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
+    rm -f "${container_create_output}"
+    container_create_output=""
+    RUN_FAILURE_REASON="container start failed"
+    run_phase=start
+    run_logged_command "" docker start "${container_id}"
+}
+
+start_build_container
+if [ -z "${ZMK_BUILD_IMAGE:-}" ] && [ "${requested_image_tag}" = auto ]; then
+    detect_zmk_revision
+    resolved_image_tag="$(docker_tag_for_zmk_revision "${detected_zmk_revision}")"
+    msg "Detected ZMK revision: ${detected_zmk_revision:-<unknown>} (Docker tag: ${resolved_image_tag})"
+    if [ "${resolved_image_tag}" != stable ]; then
+        # A bootstrap container is never retained in place of the selected builder.
+        RUN_FAILURE_REASON="image selection container cleanup failed"
+        run_phase=cleanup
+        cleanup_container 1 || die "failed to remove manifest inspection container"
+        run_phase=selected
+        [ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
+        zmk_build_image="$(resolve_docker_image "${resolved_image_tag}")"
+        msg "Selected Docker image: ${zmk_build_image}"
+        start_build_container
+    fi
+fi
 
 RUN_FAILURE_REASON="source copy failed"
 run_phase=copy

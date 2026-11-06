@@ -3,6 +3,9 @@ set -euo pipefail
 
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL="*"
+# Lifecycle/copy cases select their image explicitly; automatic selection has its
+# own real-parser cases in the container suite.
+export ZMK_BUILD_IMAGE="${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 mode="${1:-docker}"
@@ -893,8 +896,8 @@ ccache_dir=
 # Stage the complete contract input set once in the existing validation container.
 (cd "${repo_root}" && tar cf - .github/scripts/test-build-container.py \
   .github/fixtures/target-shapes-zmk-config/build.yaml scripts/source-common.sh \
-  scripts/auto-build-external.sh .github/scripts/check-build-output.sh .github/workflows/*.yml) |
-  docker exec -i "${last_container}" bash -c '
+  scripts/auto-build-external.sh scripts/build-external-source.sh .github/scripts/check-build-output.sh .github/workflows/*.yml) |
+  docker exec -i -e ZMK_BUILD_IMAGE="${ZMK_BUILD_IMAGE}" "${last_container}" bash -c '
     set -eu
     mkdir -p /tmp/contract-inputs /tmp/workflows
     tar xf - -C /tmp/contract-inputs

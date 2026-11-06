@@ -308,11 +308,10 @@ builder_args_for_source() {
 }
 
 run_source_processes() {
-    local failed=0 completed=0 active=0 next_index=0 i status_dir
+    local failed=0 completed=0 active=0 next_index=0 i stop_status=0 monitor_was_set=0
     local pids=()
     local pid_indexes=()
     local statuses=()
-    local status_files=()
     local args=()
 
     if [ ${#source_values[@]} -eq 0 ]; then
@@ -320,46 +319,53 @@ run_source_processes() {
         return 0
     fi
 
-    status_dir="$(mktemp -d)"
+    case $- in *m*) monitor_was_set=1 ;; esac
+    trap 'stop_status=130' INT
+    trap 'stop_status=143' TERM
+
+    stop_source_processes() {
+        local pid
+        trap '' INT TERM
+        echo "External build interrupted; waiting for source workers." >&2
+        for pid in ${pids[@]+"${pids[@]}"}; do
+            # Each worker has its own process group, including clone/build children.
+            kill -TERM -- "-${pid}" 2>/dev/null || true
+        done
+        for pid in ${pids[@]+"${pids[@]}"}; do wait "${pid}" 2>/dev/null || true; done
+        exit "${stop_status}"
+    }
 
     for i in "${!source_values[@]}"; do
         statuses[$i]="pending"
     done
 
     start_source_process() {
-        local source_index="$1" status_file
+        local source_index="$1"
         args=()
         while IFS= read -r -d '' arg; do
             args+=("${arg}")
         done < <(builder_args_for_source "${source_index}")
 
-        status_file="${status_dir}/${source_index}.status"
-        rm -f "${status_file}"
         echo "Started ${slugs[$source_index]} (${source_types[$source_index]}): ${source_values[$source_index]}"
-        (
-            set +e
-            bash "${SOURCE_BUILDER}" "${args[@]}"
-            status="$?"
-            printf '%s\n' "${status}" > "${status_file}"
-            exit "${status}"
-        ) &
+        # Bash 3.2 job control supplies a group without a host setsid dependency.
+        set -m
+        bash "${SOURCE_BUILDER}" "${args[@]}" <&0 &
         pids+=("$!")
+        [ "${monitor_was_set}" = 1 ] || set +m
         pid_indexes+=("${source_index}")
-        status_files+=("${status_file}")
         statuses[$source_index]="running"
         active=$((active + 1))
     }
 
     collect_finished_sources() {
-        local wait_for_one="$1" found j pid source_index status_file status wait_status
+        local wait_for_one="$1" found j pid source_index status wait_status
         while :; do
+            [ "${stop_status}" = 0 ] || return 0
             found=0
             if [ ${#pids[@]} -gt 0 ]; then
                 for j in "${!pids[@]}"; do
-                    status_file="${status_files[$j]}"
                     pid="${pids[$j]}"
-                    # A killed worker cannot publish its status file. Reap it instead of waiting forever.
-                    if [ ! -f "${status_file}" ] && kill -0 "${pid}" 2>/dev/null; then
+                    if kill -0 "${pid}" 2>/dev/null; then
                         continue
                     fi
                     source_index="${pid_indexes[$j]}"
@@ -378,7 +384,6 @@ run_source_processes() {
                     echo "Finished ${slugs[$source_index]}: ${statuses[$source_index]}"
                     unset "pids[$j]"
                     unset "pid_indexes[$j]"
-                    unset "status_files[$j]"
                     completed=$((completed + 1))
                     active=$((active - 1))
                     found=1
@@ -392,15 +397,18 @@ run_source_processes() {
 
     echo "Starting ${#source_values[@]} source build process(es) (source jobs=${SOURCE_JOBS})"
     while [ "${completed}" -lt "${#source_values[@]}" ]; do
+        [ "${stop_status}" = 0 ] || stop_source_processes
         while [ "${active}" -lt "${SOURCE_JOBS}" ] && [ "${next_index}" -lt "${#source_values[@]}" ]; do
+            [ "${stop_status}" = 0 ] || stop_source_processes
             start_source_process "${next_index}"
             next_index=$((next_index + 1))
         done
         collect_finished_sources 1
+        [ "${stop_status}" = 0 ] || stop_source_processes
         collect_finished_sources 0
     done
 
-    rm -rf "${status_dir}"
+    trap - INT TERM
 
     echo ""
     echo "External build summary:"

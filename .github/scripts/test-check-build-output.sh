@@ -367,6 +367,49 @@ if (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/empty-output" GITHUB_STEP_SUMMARY
     bash .github/scripts/check-build-output.sh ci-matrix) >/dev/null 2>&1; then exit 1; fi
 [ ! -e "${tmp_dir}/empty-output" ]
 foreign="${tmp_dir}/foreign-publication"
+# Private evidence must survive the cleanup performed by the next checkout.
+echo '[output-contract] private evidence retention'
+archive_root="${tmp_dir}/private archives"
+(cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-archive "${archive_root}") \
+  >"${tmp_dir}/archive-console" 2>&1
+archive="$(cat "${ci_root}/.build/ci-evidence.record")"
+grep -qx COMPLETE "${archive}/archive-status.txt"
+test -f "${archive}/.build/${run_name}/private-device.bin"
+grep -qx 'synthetic private build log' "${archive}/.build/${run_name}/build.log"
+if grep -Eq 'private archives|synthetic-private|private-device|secret=' "${tmp_dir}/archive-console"; then
+  echo 'private archive details reached the CI console' >&2; exit 1
+fi
+if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-archive .build/nested-archive) \
+    >"${tmp_dir}/archive-rejected-console" 2>&1; then
+  echo 'private evidence was archived inside checkout' >&2; exit 1
+fi
+[ ! -e "${ci_root}/.build/nested-archive" ]
+archive_bin="${tmp_dir}/archive-bin"
+mkdir "${archive_bin}"
+cat > "${archive_bin}/tar" <<'EOF'
+#!/usr/bin/env bash
+echo 'injected archive copy failure' >&2
+exit 23
+EOF
+chmod +x "${archive_bin}/tar"
+if (cd "${ci_root}"; PATH="${archive_bin}:${PATH}" \
+    bash .github/scripts/check-build-output.sh ci-archive "${archive_root}") \
+    >"${tmp_dir}/archive-failure-console" 2>&1; then
+  echo 'private archive copy failure was accepted' >&2; exit 1
+fi
+partial_archive="$(cat "${ci_root}/.build/ci-evidence.record")"
+[ "${partial_archive}" != "${archive}" ]
+grep -qx FAILED "${partial_archive}/archive-status.txt"
+grep -qx COMPLETE "${archive}/archive-status.txt"
+if grep -Eq 'injected|private archives|synthetic-private|secret=' "${tmp_dir}/archive-failure-console"; then
+  echo 'private archive failure diagnostics reached the CI console' >&2; exit 1
+fi
+git -C "${ci_root}" init -q
+git -C "${ci_root}" clean -ffdx -- .build >"${tmp_dir}/archive-checkout-clean.log"
+[ ! -e "${ci_root}/.build" ]
+grep -qx 'synthetic private build log' "${archive}/.build/${run_name}/build.log"
+test -f "${archive}/.build/${run_name}/private-device.bin"
+mkdir -p "${ci_root}/.build"
 mkdir -p "${foreign}"
 printf 'preserve\n' > "${foreign}/keep.txt"
 rm -rf "${ci_root}/.build/public"

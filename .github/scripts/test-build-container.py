@@ -176,6 +176,11 @@ class ContainerContracts(unittest.TestCase):
             document = yaml.load(source, Loader=yaml.BaseLoader)
             for job in document['jobs'].values():
                 self.assertNotIn('inputs.', job.get('name', ''))
+                steps = job.get('steps', [])
+                if any('check-build-output.sh ci-' in s.get('run', '') for s in steps):
+                    archives = [s for s in steps if 'check-build-output.sh ci-archive' in s.get('run', '')]
+                    self.assertTrue(archives, path)
+                    self.assertTrue(all('always()' in s['if'] for s in archives))
                 for step in job.get('steps', []):
                     if step.get('name', '').startswith('Show selected runner'):
                         self.assertNotIn('${EXTERNAL_', step['run'])
@@ -188,6 +193,282 @@ class ContainerContracts(unittest.TestCase):
                         self.assertIn('publication-init', step['if'])
                         self.assertIn('publication-check', step['if'])
         self.assertEqual(uploads, 6)
+
+    def make_image_selection_daemon(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
+args = sys.argv[1:]
+calls = pathlib.Path(os.environ["IMAGE_CALLS"])
+with calls.open("a") as out: out.write(json.dumps(args) + "\\n")
+if args[0] == "create":
+    count = sum(json.loads(row)[0] == "create" for row in calls.read_text().splitlines())
+    print(chr(96 + count) * 64)
+elif args[0] == "exec":
+    if "python3" in args:
+        sys.exit(subprocess.call(args[args.index("python3"):]))
+    if any("./build.sh validate" in arg for arg in args): print("build.yaml is valid.")
+    else: sys.stdin.buffer.read()
+elif args[0] == "rm":
+    if os.environ.get("IMAGE_REMOVE_FAIL"): sys.exit(23)
+    if os.environ.get("IMAGE_REMOVE_GATE"):
+        pathlib.Path(os.environ["IMAGE_REMOVE_GATE"]).touch()
+        while not pathlib.Path(os.environ["IMAGE_REMOVE_RELEASE"]).exists(): time.sleep(.01)
+elif args[0] != "start": sys.exit(99)
+''')
+        docker.chmod(0o755)
+        return binary
+
+    def test_auto_image_selection_uses_west_manifest_structure(self):
+        binary = self.make_image_selection_daemon()
+        documents = [
+            ('name-first', 'manifest:\n  projects:\n    - name: zmk\n      url: https://example.invalid/zmk\n      revision: v0.3-branch+dya\n', '3.5-branch'),
+            ('name-second', 'manifest:\n  projects:\n    - url: https://example.invalid/zmk\n      name: zmk\n      revision: v0.3-branch+dya\n', '3.5-branch'),
+            ('inline', 'manifest: {projects: [{url: https://example.invalid/zmk, revision: "v4.1.0-rc1", name: zmk}]}\n', '4.1-branch'),
+            ('defaults', 'manifest: {defaults: {revision: v0.3.9}, projects: [{url: https://example.invalid/zmk, name: zmk}]}\n', '3.5-branch'),
+            ('quoted', '"manifest": {"projects": [{"name": zmk, "url": https://example.invalid/zmk, "revision": main}]}\n', 'stable'),
+            ('standalone', 'manifest: {projects: []}\n', 'stable'),
+        ]
+        from west.manifest import ImportFlag, Manifest
+        for name, document, tag in documents:
+            with self.subTest(name=name):
+                # Validate the input independently of the builder's shell transport.
+                Manifest.from_data(yaml.safe_load(document), import_flags=ImportFlag.IGNORE)
+                case = self.root / name
+                (case / 'config').mkdir(parents=True)
+                (case / 'config/west.yml').write_text(document)
+                (case / 'build.yaml').write_text('board: A\n')
+                calls = case / 'calls'
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE_TAG='auto',
+                           ZMK_BUILD_IMAGE_REPOSITORY='synthetic/build', ZMK_KEEP_CONTAINER='0',
+                           IMAGE_CALLS=str(calls))
+                env.pop('ZMK_BUILD_IMAGE', None)
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(case)], env=env,
+                                           text=True, capture_output=True, timeout=15)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                images = [row[-4] for row in commands if row[0] == 'create']
+                self.assertEqual(images[-1], 'synthetic/build:' + tag)
+                created = [chr(97 + i) * 64 for i in range(len(images))]
+                removed = [row[-1] for row in commands if row[0] == 'rm']
+                self.assertEqual(removed, created)
+
+    def test_auto_image_selection_failure_stops_before_copy_or_replacement(self):
+        binary = self.make_image_selection_daemon()
+        for name, document, extra, reason in (
+            ('invalid', 'manifest: {projects: false}\n', {}, 'manifest image selection failed'),
+            ('cleanup', 'manifest: {projects: [{name: zmk, url: https://example.invalid/zmk, revision: v0.3}]}\n',
+             {'IMAGE_REMOVE_FAIL': '1'}, 'image selection container cleanup failed'),
+        ):
+            with self.subTest(name=name):
+                case = self.root / name
+                (case / 'config').mkdir(parents=True)
+                (case / 'config/west.yml').write_text(document)
+                (case / 'build.yaml').write_text('board: A\n')
+                calls = case / 'calls'
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE_TAG='auto', IMAGE_CALLS=str(calls),
+                           ZMK_KEEP_CONTAINER='1', **extra)
+                env.pop('ZMK_BUILD_IMAGE', None)
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(case)], env=env,
+                                           text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(completed.returncode, 0)
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                self.assertEqual(sum(row[0] == 'create' for row in commands), 1)
+                self.assertFalse(any('tar' in row or any('./build.sh validate' in arg for arg in row)
+                                     for row in commands))
+                summaries = [p for p in (BUILD.parent / '.build').glob('*/build-summary.txt')
+                             if 'Target: ' + str(case) + '\n' in p.read_text()]
+                self.assertEqual(len(summaries), 1)
+                self.assertIn('Status: FAILED', summaries[0].read_text())
+                self.assertIn('Reason: ' + reason, summaries[0].read_text())
+
+    def test_auto_image_override_skips_manifest_inspection(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for name, override, tag, expected in (
+            ('full', 'synthetic/build@sha256:' + 'd' * 64, 'auto', 'synthetic/build@sha256:' + 'd' * 64),
+            ('tag', '', '3.5-branch', 'synthetic/build:3.5-branch'),
+        ):
+            with self.subTest(name=name):
+                calls = self.root / (name + '.calls')
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE=override, ZMK_BUILD_IMAGE_TAG=tag,
+                           ZMK_BUILD_IMAGE_REPOSITORY='synthetic/build', ZMK_KEEP_CONTAINER='0',
+                           IMAGE_CALLS=str(calls))
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                           text=True, capture_output=True, timeout=10)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                self.assertEqual([row[-4] for row in commands if row[0] == 'create'], [expected])
+                self.assertFalse(any('python3' in row for row in commands))
+
+    def test_auto_image_switch_cancellation_finishes_bootstrap_cleanup(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'config/west.yml').write_text(
+            'manifest: {projects: [{name: zmk, url: https://example.invalid/zmk, revision: v0.3}]}\n')
+        (self.root / 'build.yaml').write_text('board: A\n')
+        calls, gate, release = (self.root / name for name in ('calls', 'gate', 'release'))
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE_TAG='auto', ZMK_KEEP_CONTAINER='1',
+                   IMAGE_CALLS=str(calls), IMAGE_REMOVE_GATE=str(gate), IMAGE_REMOVE_RELEASE=str(release))
+        env.pop('ZMK_BUILD_IMAGE', None)
+        process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                   start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not gate.exists() and time.monotonic() < deadline:
+                self.assertIsNone(process.poll())
+                time.sleep(.01)
+            self.assertTrue(gate.exists())
+            os.killpg(process.pid, signal.SIGTERM)
+            release.touch()
+            output, _ = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 143, output)
+            commands = [json.loads(row) for row in calls.read_text().splitlines()]
+            self.assertEqual(sum(row[0] == 'create' for row in commands), 1)
+            self.assertEqual([row for row in commands if row[0] == 'rm'], [['rm', '-f', 'a' * 64]])
+            summary = next((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid)).read_text()
+            self.assertIn('Status: FAILED', summary)
+            self.assertIn('Reason: interrupted by SIGTERM', summary)
+        finally:
+            release.touch()
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            if process.poll() is None: process.wait(timeout=5)
+
+    def external_cancellation_fixture(self, name):
+        case = self.root / name
+        (case / 'scripts').mkdir(parents=True)
+        for script in ('auto-build-external.sh', 'build-external-source.sh', 'source-common.sh'):
+            shutil.copyfile('/tmp/' + script, case / 'scripts' / script)
+        builder = case / 'build.sh'
+        builder.write_text('''#!/usr/bin/env bash
+set -eu
+target="$1"
+child=""
+finish() {
+    trap '' INT TERM
+    [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true
+    [ -z "$child" ] || wait "$child" 2>/dev/null || true
+    : > "$target/cleanup-complete"
+    exit 143
+}
+trap finish TERM
+printf '%s\\n' "$$" > "$target/builder.pid"
+sleep 30 &
+child=$!
+: > "$target/started"
+wait "$child"
+''')
+        builder.chmod(0o755)
+        for number in range(3):
+            (case / str(number)).mkdir()
+        return case
+
+    def test_external_queue_cancellation_stops_active_workers_before_return(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signum):
+                case = self.external_cancellation_fixture('queue-' + str(signum))
+                args = ['bash', str(case / 'scripts/auto-build-external.sh'), '--source-jobs', '2']
+                for number in range(3): args.extend(['--path', str(case / str(number))])
+                with (case / 'console').open('w') as output:
+                    process = subprocess.Popen(args, start_new_session=True, stdout=output, stderr=output)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not all((case / str(i) / 'started').exists() for i in range(2)) and time.monotonic() < deadline:
+                            self.assertIsNone(process.poll())
+                            time.sleep(.01)
+                        self.assertTrue(all((case / str(i) / 'started').exists() for i in range(2)))
+                        process.send_signal(signum)
+                        self.assertEqual(process.wait(timeout=5), 128 + signum, (case / 'console').read_text())
+                        for number in range(2):
+                            self.assertTrue((case / str(number) / 'cleanup-complete').exists(), (case / 'console').read_text())
+                        self.assertFalse((case / '2/started').exists())
+                    finally:
+                        for pid in case.glob('*/builder.pid'):
+                            try: os.kill(int(pid.read_text()), signal.SIGTERM)
+                            except ProcessLookupError: pass
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        if process.poll() is None: process.wait(timeout=5)
+
+    def test_external_source_cancellation_waits_for_builder_cleanup(self):
+        case = self.external_cancellation_fixture('single-source')
+        with (case / 'console').open('w') as output:
+            process = subprocess.Popen(['bash', str(case / 'scripts/build-external-source.sh'),
+                                        '--path', str(case / '0')], start_new_session=True,
+                                       stdout=output, stderr=output)
+            try:
+                deadline = time.monotonic() + 5
+                while not (case / '0/started').exists() and time.monotonic() < deadline:
+                    self.assertIsNone(process.poll())
+                    time.sleep(.01)
+                self.assertTrue((case / '0/started').exists())
+                process.terminate()
+                self.assertEqual(process.wait(timeout=5), 143, (case / 'console').read_text())
+                self.assertTrue((case / '0/cleanup-complete').exists())
+                self.assertTrue((case / '0').is_dir())
+            finally:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                if process.poll() is None: process.wait(timeout=5)
+
+    def test_external_clone_cancellation_acquires_and_removes_created_identity(self):
+        case = self.external_cancellation_fixture('clone-cancel')
+        binary = case / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, signal, sys, time
+root = pathlib.Path(os.environ["CLONE_CANCEL_CASE"])
+with (root / "calls").open("a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1] == "create":
+    # Keep creation pending, but expose the actual cancellation delivery.
+    signal.signal(signal.SIGTERM, lambda *_: (root / "signal-received").touch())
+    (root / "group").write_text(str(os.getpgrp()))
+    (root / "reached").touch()
+    while not (root / "release").exists(): time.sleep(.01)
+    print("c" * 64)
+elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
+''')
+        docker.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   CLONE_CANCEL_CASE=str(case))
+        with (case / 'console').open('w') as output:
+            process = subprocess.Popen(['bash', str(case / 'scripts/auto-build-external.sh'),
+                                        '--repo', 'https://example.invalid/config.git'],
+                                       env=env, start_new_session=True, stdout=output, stderr=output)
+            try:
+                deadline = time.monotonic() + 5
+                while not (case / 'reached').exists() and time.monotonic() < deadline:
+                    self.assertIsNone(process.poll())
+                    time.sleep(.01)
+                self.assertTrue((case / 'reached').exists())
+                process.terminate()
+                deadline = time.monotonic() + 5
+                while not (case / 'signal-received').exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue((case / 'signal-received').exists(), (case / 'console').read_text())
+                (case / 'release').touch()
+                self.assertEqual(process.wait(timeout=5), 143, (case / 'console').read_text())
+                calls = [json.loads(row) for row in (case / 'calls').read_text().splitlines()]
+                self.assertEqual(sum(row[0] == 'create' for row in calls), 1, calls)
+                self.assertEqual([row for row in calls if row[0] == 'rm'], [['rm', '-f', 'c' * 64]])
+                self.assertFalse(any(row[0] in ('start', 'cp') for row in calls))
+                self.assertFalse(any((case / '.build/external').iterdir()))
+            finally:
+                (case / 'release').touch()
+                group = case / 'group'
+                if group.exists():
+                    try: os.killpg(int(group.read_text()), signal.SIGKILL)
+                    except ProcessLookupError: pass
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                if process.poll() is None: process.wait(timeout=5)
 
     def test_external_workflow_keeps_source_values_out_of_runner_details(self):
         workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)

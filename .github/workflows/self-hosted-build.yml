@@ -50,6 +50,9 @@ jobs:
             bash .github/scripts/check-build-output.sh ci-tests shell
             bash .github/scripts/check-build-output.sh ci-tests docker
           fi
+      - name: Preserve private evidence
+        if: always()
+        run: bash .github/scripts/check-build-output.sh ci-archive
       - name: Verify publication payload
         id: publication-check
         if: always()
@@ -88,6 +91,9 @@ jobs:
             bash .github/scripts/check-build-output.sh ci-tests shell
             bash .github/scripts/check-build-output.sh ci-tests docker
           fi
+      - name: Preserve private evidence
+        if: always()
+        run: bash .github/scripts/check-build-output.sh ci-archive
       - name: Verify publication payload
         id: publication-check
         if: always()
@@ -126,6 +132,9 @@ jobs:
             bash .github/scripts/check-build-output.sh ci-tests shell
             bash .github/scripts/check-build-output.sh ci-tests docker
           fi
+      - name: Preserve private evidence
+        if: always()
+        run: bash .github/scripts/check-build-output.sh ci-archive
       - name: Verify publication payload
         id: publication-check
         if: always()

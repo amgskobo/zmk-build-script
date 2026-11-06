@@ -72,6 +72,14 @@ variables select it. With tag `auto`, `config/west.yml`'s ZMK revision maps to:
 | `v0.3` / `0.3` series, including patch and suffix revisions | `3.5-branch` |
 | `v4.1` / `4.1` series, including patch and suffix revisions | `4.1-branch` |
 
+In auto mode, the repository's `stable` image first reads the manifest with west,
+including quoted/reordered keys, inline mappings and `defaults.revision`.
+This requires no host Python installation. Image selection reads the direct
+manifest without fetching imports. If another toolchain is selected, the initial
+container is removed before the selected builder starts; workspace synchronization
+and dependency updates happen in the selected builder. An explicit full image or
+non-auto image tag skips this inspection.
+
 Image selection determines the firmware toolchain. Host platform support depends
 on the selected image and Docker; set
 `ZMK_DOCKER_PLATFORM=linux/amd64` when needed. Local checks do not establish native
@@ -358,12 +366,16 @@ image. Use a separate cache or `--pristine` after changing the image or SDK.
 | Dependencies and ccache | Reused on the dedicated volume. `--pristine` deletes the entire selected volume, including ccache. |
 | Host-side URL clone copies | Removed before source success is reported; local-path sources are retained. |
 | Host firmware, logs and test evidence | Kept under this tool's `.build/`. `./build.sh clean` removes everything there except `.gitkeep`. |
+| CI private archives | Saved outside checkout, separately from `.build/` cleanup; see the CI helpers below. |
 
 Cleanup failures fail the affected target, run or source job. In `build.sh`, earlier
 build errors retain their reason and exit status. External wrappers report source
 failure with a nonzero status and record cleanup errors alongside clone/build failures.
 `--pristine` stops before container creation if listing or removing the selected
 volume fails. It can also reset a cache during validation.
+A stopped retained container still holds its volume. Find holders with
+`docker ps -a --filter volume=your-cache-volume` and explicitly remove an unneeded
+retained container before retrying `--pristine`.
 File cleanup does not force WSL's memory cache back to Windows; WSL memory
 reclamation belongs to the host operating system.
 
@@ -381,6 +393,11 @@ FAILED summary.
 The final summary is published atomically after cleanup. Its outcome is then
 committed, so late signals during summary publication do not change the exit status.
 Require both a zero command exit status and a successful output check.
+
+The external queue forwards cancellation to active source process groups, waits
+for their workers and stops dispatching pending sources. A directly invoked source
+worker also forwards cancellation to its builder and waits for finalization.
+Clone creation acquires the returned container ID before honoring cancellation.
 
 ### Firmware and output checks
 
@@ -465,6 +482,20 @@ provide the same boundary for external builds. `publish clear` initializes the
 known report files before a job, and `publish verify` checks the final payload
 before upload. Both steps must succeed for the upload to run.
 
+An `always()` step runs `ci-archive` to preserve `.build/` in a fresh execution
+directory under `../.zmk-build-evidence/`, outside checkout. This keeps private logs,
+summaries and firmware available after the next checkout's cleanup on a persistent
+runner. `.build/ci-evidence.record` points to the saved directory until checkout
+cleanup removes that receipt. Each archive includes run context and an
+`archive-status.txt`: `COMPLETE` means the copy finished; `INCOMPLETE` or `FAILED`
+identifies an interrupted or failed copy. Archive failure fails its CI step.
+
+`bash .github/scripts/check-build-output.sh ci-archive ARCHIVE_ROOT` selects another
+private root whose parent directory already exists. The root must be outside
+checkout and must not be a symlink. Execution directories are never overwritten;
+runner administrators manage archive access and retention. Archives are excluded
+from automatic uploads and remain temporary on hosted runners.
+
 Every test invocation also writes its report;
 `publish tests-shell|tests-docker|tests-build|tests-all EXIT RAW_DIRECTORY` can
 regenerate a test report, and `publish build|validate EXIT` records an external
@@ -495,8 +526,8 @@ bash .github/scripts/test.sh all
 
 | Layer | Scope |
 | --- | --- |
-| `shell` | Bash syntax, LF/checkout, whitespace, output checks, source queue/failures, host guards and help. Git is required for this test layer. |
-| `docker` | Actual source copy, metadata, production parser, controlled workspace/update/overlay failures, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
+| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Git is required for this test layer. |
+| `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
 | `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets; exact outputs and dependency identities. |
 | `all` | Run the `shell`, `docker` and `build` layers in that order. |
 

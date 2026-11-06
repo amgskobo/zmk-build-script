@@ -218,7 +218,7 @@ done
 printf 'start %s\n' "${slug}" >> "${FAKE_LOG}"
 case "${slug}" in
   slow) sleep 2 ;;
-  killed) kill -KILL "${PPID}"; exit 0 ;;
+  killed) kill -KILL "$$"; exit 0 ;;
   failed) exit 7 ;;
 esac
 printf 'end %s\n' "${slug}" >> "${FAKE_LOG}"
@@ -268,6 +268,51 @@ assert_file_contains "${tmp_dir}/killed.out" 'killed: failure' 'killed source wa
 assert_file_contains "${tmp_dir}/killed.out" 'failed: failure' 'ordinary child failure was not preserved'
 assert_file_contains "${tmp_dir}/killed.out" 'after-kill: success' 'queue did not continue after worker death'
 assert_file_contains "${tmp_dir}/killed.out" '=== Done: 2 failure(s) ===' 'worker failure total was incorrect'
+
+# Exercise process-group cancellation in the native Linux/macOS/Git Bash matrix.
+cancel_root="${tmp_dir}/cancellation"
+mkdir "${cancel_root}"
+cat > "${cancel_root}/worker.sh" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+slug=
+child=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --source-slug ]; then slug="$2"; shift; fi
+  shift
+done
+stop() {
+  trap '' INT TERM
+  [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true
+  [ -z "$child" ] || wait "$child" 2>/dev/null || true
+  : > "${CANCEL_ROOT}/${slug}.stopped"
+  exit 143
+}
+trap stop TERM
+sleep 30 &
+child=$!
+: > "${CANCEL_ROOT}/${slug}.started"
+wait "$child"
+EOF
+CANCEL_ROOT="${cancel_root}" ZMK_EXTERNAL_SOURCE_BUILDER="${cancel_root}/worker.sh" \
+  bash "${builder}" --path "${local_one}" --source-slug first \
+    --path "${local_two}" --source-slug second --path "${local_three}" --source-slug pending \
+    --source-jobs 2 >"${cancel_root}/console" 2>&1 &
+coordinator=$!
+(sleep 30; kill -KILL "${coordinator}" 2>/dev/null || true) &
+cancel_timer=$!
+for attempt in $(seq 1 100); do
+  [ ! -f "${cancel_root}/first.started" ] || [ ! -f "${cancel_root}/second.started" ] || break
+  sleep .05
+done
+kill -TERM "${coordinator}"
+if wait "${coordinator}"; then cancel_status=0; else cancel_status=$?; fi
+kill "${cancel_timer}" 2>/dev/null || true
+wait "${cancel_timer}" 2>/dev/null || true
+[ "${cancel_status}" = 143 ] || fail "coordinator cancellation returned ${cancel_status}"
+[ -f "${cancel_root}/first.stopped" ] && [ -f "${cancel_root}/second.stopped" ] || \
+  fail 'coordinator returned before active workers stopped'
+[ ! -f "${cancel_root}/pending.started" ] || fail 'cancellation started a pending source'
 
 # Clone setup must never remove a pre-existing name after create fails. Later failures
 # must remove only containers created by this process, including each failed retry.

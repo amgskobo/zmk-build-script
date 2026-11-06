@@ -73,6 +73,11 @@ jobs:
         shell: bash
         run: bash .github/scripts/check-build-output.sh ci-matrix
 
+      - name: Preserve private evidence
+        if: always()
+        shell: bash
+        run: bash .github/scripts/check-build-output.sh ci-archive
+
   build-runner:
     name: Source ${{ matrix.source.index }}
     needs: sources
@@ -190,6 +195,16 @@ jobs:
         if: ${{ runner.os == 'Windows' && always() }}
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
         run: bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}"
+
+      - name: Preserve private evidence (Unix)
+        if: ${{ runner.os != 'Windows' && always() }}
+        shell: bash
+        run: bash .github/scripts/check-build-output.sh ci-archive
+
+      - name: Preserve private evidence (Windows)
+        if: ${{ runner.os == 'Windows' && always() }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        run: bash .github/scripts/check-build-output.sh ci-archive
 
       - name: Verify publication payload (Unix)
         id: publication-check-unix

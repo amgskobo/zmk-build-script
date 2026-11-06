@@ -20,6 +20,8 @@ ZMK_EXTERNAL_SETTINGS_RESET="${ZMK_EXTERNAL_SETTINGS_RESET:-0}"
 SOURCE_TYPE=""
 SOURCE_VALUE=""
 SOURCE_SLUG=""
+SOURCE_SIGNAL_STATUS=0
+SOURCE_BUILD_PID=""
 build_snippets=()
 build_modules=()
 positionals=()
@@ -130,7 +132,7 @@ emit_failure_annotation() {
 
 public_failure_reason() {
     case "$1" in
-        'clone failed'|'build failed'|'validate failed'|'clone cleanup failed'|\
+        'clone failed'|'build failed'|'validate failed'|'clone cleanup failed'|'interrupted'|'interrupted; clone cleanup failed'|\
         'clone failed; clone cleanup failed'|'build failed; clone cleanup failed'|'validate failed; clone cleanup failed') printf '%s' "$1" ;;
         'path not found:'*) printf '%s' 'path not found' ;;
         *) printf '%s' 'source execution failed' ;;
@@ -168,6 +170,12 @@ cleanup_clone_container() {
     clone_container_id=""
 }
 
+request_source_stop() {
+    [ "${SOURCE_SIGNAL_STATUS}" != 0 ] || SOURCE_SIGNAL_STATUS="$1"
+    trap '' INT TERM
+    [ -z "${SOURCE_BUILD_PID}" ] || kill -TERM "${SOURCE_BUILD_PID}" 2>/dev/null || true
+}
+
 clear_clone_directory() {
     local clone_dir="$1" root parent
     root="$(cd "${WORK_DIR}" && pwd -P)" || return 1
@@ -200,17 +208,19 @@ clone_repo_with_docker() {
     echo "[source:${slug}] Cloning: ${source}"
     attempt=1
     while [ "${attempt}" -le "${ZMK_EXTERNAL_CLONE_ATTEMPTS}" ]; do
+        [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || return "${SOURCE_SIGNAL_STATUS}"
         if ! clear_clone_directory "${clone_dir}"; then
             trap - EXIT
             return 1
         fi
-        if clone_container_id="$(docker_no_pathconv create --name "${clone_container_name}" \
+        if clone_container_id="$(trap '' INT TERM; docker_no_pathconv create --name "${clone_container_name}" \
             "${ZMK_EXTERNAL_CLONE_IMAGE}" \
             /bin/bash -lc "$(declare -f prune_windows_clone_paths)"'
                 git clone --depth=1 "$1" /tmp/source || exit "$?"
                 [ "$2" != 1 ] || prune_windows_clone_paths /tmp/source "$3"
             ' \
-            _ "${source}" "${prune_clone_paths}" "${slug}" | tr -d '\r')"; then
+            _ "${source}" "${prune_clone_paths}" "${slug}")"; then
+            clone_container_id="${clone_container_id%$'\r'}"
             if [ "${#clone_container_id}" -ne 64 ] || [[ "${clone_container_id}" == *[!0-9a-f]* ]]; then
                 echo "ERROR: Docker create did not return a clone container ID" >&2
                 clone_container_id=""
@@ -218,11 +228,16 @@ clone_repo_with_docker() {
                 return 1
             fi
             clone_container_created=1
+            if [ "${SOURCE_SIGNAL_STATUS}" != 0 ]; then
+                cleanup_clone_container || return 1
+                return "${SOURCE_SIGNAL_STATUS}"
+            fi
             if docker_no_pathconv start -a "${clone_container_id}"; then
                 break
             fi
         fi
         cleanup_clone_container || return 1
+        [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || return "${SOURCE_SIGNAL_STATUS}"
         if ! clear_clone_directory "${clone_dir}"; then
             trap - EXIT
             return 1
@@ -234,6 +249,10 @@ clone_repo_with_docker() {
         echo "[source:${slug}] Clone failed; retrying (${attempt}/${ZMK_EXTERNAL_CLONE_ATTEMPTS})" >&2
         attempt="$((attempt + 1))"
     done
+    if [ "${SOURCE_SIGNAL_STATUS}" != 0 ]; then
+        cleanup_clone_container || return 1
+        return "${SOURCE_SIGNAL_STATUS}"
+    fi
     mkdir -p "${clone_dir}"
     clone_dir_for_docker="$(docker_host_path "${clone_dir}")"
     if ! docker_no_pathconv cp "${clone_container_id}:/tmp/source/." "${clone_dir_for_docker}"; then
@@ -245,6 +264,7 @@ clone_repo_with_docker() {
 
     cleanup_clone_container || return 1
     trap - EXIT
+    [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || return "${SOURCE_SIGNAL_STATUS}"
 }
 
 build_single_source() {
@@ -275,10 +295,12 @@ build_single_source() {
         clone_dir="${WORK_DIR}/${SOURCE_SLUG}"
         if ! clone_repo_with_docker "${SOURCE_VALUE}" "${SOURCE_SLUG}" "${clone_dir}"; then
             reason="clone failed"
-            clear_clone_directory "${clone_dir}" || reason="clone failed; clone cleanup failed"
+            [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || reason="interrupted"
+            clear_clone_directory "${clone_dir}" || reason="${reason}; clone cleanup failed"
             echo "=== FAILED: clone ${SOURCE_SLUG} ===" >&2
             emit_failure_annotation "${SOURCE_SLUG}" "${SOURCE_VALUE}" "${reason}"
             write_github_step_summary "failure" "${reason}"
+            [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || return "${SOURCE_SIGNAL_STATUS}"
             return 1
         fi
         target_dir="${clone_dir}"
@@ -320,13 +342,33 @@ build_single_source() {
         build_env+=(ZMK_CONTAINER_NAME="zmk-build-${container_slug:0:80}-pid-$$")
     fi
 
-    if env "${build_env[@]}" "${build_command[@]}"; then
-        build_status=0
+    if [ "${SOURCE_SIGNAL_STATUS}" = 0 ]; then
+        env "${build_env[@]}" "${build_command[@]}" <&0 &
+        SOURCE_BUILD_PID=$!
+        [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || kill -TERM "${SOURCE_BUILD_PID}" 2>/dev/null || true
     else
-        build_status=$?
+        build_status="${SOURCE_SIGNAL_STATUS}"
     fi
+    if [ -n "${SOURCE_BUILD_PID}" ]; then
+        if wait "${SOURCE_BUILD_PID}"; then
+            build_status=0
+        else
+            build_status=$?
+        fi
+        if [ "${SOURCE_SIGNAL_STATUS}" != 0 ]; then
+            # A trap can interrupt wait before the builder has finalized its container.
+            wait "${SOURCE_BUILD_PID}" 2>/dev/null || true
+            build_status="${SOURCE_SIGNAL_STATUS}"
+        fi
+    fi
+    SOURCE_BUILD_PID=""
     if [ "${SOURCE_TYPE}" = repo ]; then
         clear_clone_directory "${clone_dir}" || cleanup_failed=1
+    fi
+    # Cleanup is complete; commit one outcome before publishing source success.
+    trap '' INT TERM
+    if [ "${build_status}" = 0 ] && [ "${SOURCE_SIGNAL_STATUS}" != 0 ]; then
+        build_status="${SOURCE_SIGNAL_STATUS}"
     fi
     if [ "${build_status}" = 0 ] && [ "${cleanup_failed}" = 0 ]; then
         echo "=== SUCCESS: ${SOURCE_SLUG} ==="
@@ -339,16 +381,24 @@ build_single_source() {
     if [ "${build_status}" = 0 ]; then
         reason="clone cleanup failed"
         failure_phase=cleanup
-    elif [ "${cleanup_failed}" != 0 ]; then
-        reason="${reason}; clone cleanup failed"
+    else
+        if [ "${SOURCE_SIGNAL_STATUS}" != 0 ]; then
+            reason="interrupted"
+            failure_phase=interrupted
+        fi
+        [ "${cleanup_failed}" = 0 ] || reason="${reason}; clone cleanup failed"
     fi
     echo "=== FAILED: ${failure_phase} ${SOURCE_SLUG} ===" >&2
     emit_failure_annotation "${SOURCE_SLUG}" "${SOURCE_VALUE}" "${reason}"
     write_github_step_summary "failure" "${reason}"
+    [ "${SOURCE_SIGNAL_STATUS}" = 0 ] || return "${SOURCE_SIGNAL_STATUS}"
     return 1
 }
 
 main() {
+    SOURCE_SIGNAL_STATUS=0
+    trap 'request_source_stop 130' INT
+    trap 'request_source_stop 143' TERM
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --repo)

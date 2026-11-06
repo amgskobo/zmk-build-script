@@ -25,6 +25,9 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell contracts
         run: bash .github/scripts/check-build-output.sh ci-tests shell
+      - name: Preserve private evidence
+        if: always()
+        run: bash .github/scripts/check-build-output.sh ci-archive
       - name: Verify publication payload
         id: publication-check
         if: always()
@@ -55,6 +58,9 @@ jobs:
         run: bash .github/scripts/check-build-output.sh ci-tests docker
       - name: Verify build, module overlays and restoration
         run: bash .github/scripts/check-build-output.sh ci-tests build
+      - name: Preserve private evidence
+        if: always()
+        run: bash .github/scripts/check-build-output.sh ci-archive
       - name: Verify publication payload
         id: publication-check
         if: always()

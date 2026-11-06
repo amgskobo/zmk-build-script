@@ -67,6 +67,12 @@ tag が `auto` の場合は `config/west.yml` 内の ZMK revision で選びま�
 | patch / suffix を含む `v0.3` / `0.3` 系列 | `3.5-branch` |
 | patch / suffix を含む `v4.1` / `4.1` 系列 | `4.1-branch` |
 
+auto mode は、まず repository の `stable` image 内で west を使って manifest を読み、
+key の引用・順序変更、inline map、`defaults.revision` を解釈します。host への Python install は不要です。
+image 選択では直接の manifest を読み、import は取得しません。別の toolchain を選ぶ場合は、最初の container を
+削除してから選択した builder を起動します。workspace 同期と依存更新は選択した builder 内で行います。
+image 全体または `auto` 以外の tag を明示すると、この事前確認を省略します。
+
 image 名は firmware toolchain を表します。host platform 対応は選択 image と Docker に依存し、必要なら
 `ZMK_DOCKER_PLATFORM=linux/amd64` を指定します。local 検証を ARM64 native host や旧 image の
 実 firmware build の確認として扱いません。
@@ -332,10 +338,14 @@ ccache は west workspace の外側、cache volume 上に保存します。`CCAC
 | 依存と ccache | 専用 volume で再利用します。`--pristine` は ccache を含む対象 volume 全体を削除します。 |
 | URL clone の host 側コピー | source の成功報告前に削除します。local path の source は保持します。 |
 | host の firmware / log / 検証記録 | この tool の `.build/` に保持します。`./build.sh clean` は `.gitkeep` 以外をすべて削除します。 |
+| CI の非公開 archive | checkout の外に保存し、`.build/` の cleanup とは別に管理します。後述の CI helper を参照してください。 |
 
 削除失敗は該当 target / run / source job を失敗にします。`build.sh` は先の build error の理由と終了 status を保持します。
 外部 wrapper は source の失敗を非ゼロ status で通知し、clone / build failure と削除失敗を併記します。
 `--pristine` の volume 一覧取得・削除失敗では container 作成前に停止します。
+停止済みの保持 container も volume を使用中として扱われます。
+`docker ps -a --filter volume=your-cache-volume` で参照元を調べ、不要な保持 container を明示的に削除してから
+`--pristine` を再実行します。
 validate に指定した場合も cache を初期化します。
 file 削除は WSL の memory cache を Windows へ強制返却する処理ではなく、memory 回収は host OS が担当します。
 
@@ -348,6 +358,10 @@ container 作成中（image の自動 pull を含む）は中断を遅延し、p
 先の build error があれば理由と終了 status を保持し、それ以外の中断は FAILED summary にします。
 最終 summary は cleanup 後に atomic に公開します。この時点で結果を確定するため、summary 公開中の遅い signal は
 終了 status を変更しません。成功判定には command の終了 status がゼロであることと、output check の成功の両方が必要です。
+
+外部 source の queue は、実行中の source process group へ中断を伝え、worker の終了を回収し、
+未開始の source を追加起動しません。単体の source worker も builder へ中断を伝えて終了処理を待ちます。
+clone container の作成中は、返された ID を回収してから中断を処理します。
 
 ### firmwareと成果物確認
 
@@ -421,6 +435,18 @@ CI は `bash .github/scripts/check-build-output.sh ci-tests <mode>` から[共�
 `publish clear` で既知の report file を初期化し、`publish verify` で最終 payload を検査します。
 両方の成功時だけ upload します。
 
+`always()` step の `ci-archive` は、`.build/` を checkout 外の `../.zmk-build-evidence/` 配下にある
+新しい実行 directory へ保存します。永続 runner では、次の checkout の cleanup 後も非公開の log、
+summary、firmware を確認できます。`.build/ci-evidence.record` は保存先を示し、この参照 file 自体は
+checkout cleanup で消えます。archive には run context と `archive-status.txt` を記録し、
+copy 完了時は `COMPLETE`、中断・失敗時は `INCOMPLETE` または `FAILED` とします。
+archive 作成の失敗は CI step の失敗として返します。
+
+`bash .github/scripts/check-build-output.sh ci-archive ARCHIVE_ROOT` で別の非公開保存先を指定できます。
+親 directory は事前に用意し、保存先は checkout 外で symlink ではない directory を選びます。
+実行 directory は上書きせず、アクセス権と保持期間は runner 管理側で管理します。
+archive は自動 upload の対象に含めず、hosted runner では一時的な保存です。
+
 各 test 実行も report を生成します。
 再生成には `publish tests-shell|tests-docker|tests-build|tests-all EXIT RAW_DIRECTORY`、
 外部 command の結果には `publish build|validate EXIT` を使い、終了 status と既知の case 名 / status だけをコピーします。
@@ -447,8 +473,8 @@ bash .github/scripts/test.sh all
 
 | 層 | 確認範囲 |
 | --- | --- |
-| `shell` | Bash 構文、LF / checkout、空白、成果物判定、source queue / 失敗、host guard / help。この検証層には Git が必要です。 |
-| `docker` | 実 source copy、metadata、production parser、workspace / update / overlay の制御した失敗、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
+| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。この検証層には Git が必要です。 |
+| `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
 | `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application、成果物数と依存 identity。 |
 | `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
 
