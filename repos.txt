@@ -1,8 +1,9 @@
-https://github.com/urob/zmk-config.git
-https://github.com/folke/zmk-config.git
-https://github.com/kumamuk-git/zmk-config-roBa.git
-https://github.com/t-ogura/zmk-config-prospector.git
-https://github.com/kureyakey/zmk-config-zonkey.git
-https://github.com/sayu-hub/zmk-config-moNa2-v2.git
-https://github.com/4mplelab/zmk-config-LisM.git
+# Git URL followed by a full commit SHA; update deliberately after integration checks.
+https://github.com/urob/zmk-config.git ef2095c2da74a7d213cd457c0b54d04a9d901131
+https://github.com/folke/zmk-config.git 8f17186714c10d317fbf6484a52aae8904a4dfca
+https://github.com/kumamuk-git/zmk-config-roBa.git 01ba7ebb90a80aa2c0b394941b662af56f39ca9b
+https://github.com/t-ogura/zmk-config-prospector.git 391cd16a33ca0e2b62199d298273ed36cc6de2f9
+https://github.com/kureyakey/zmk-config-zonkey.git 49657dd17d4e2b94cf1d7bf803f2333e76e43459
+https://github.com/sayu-hub/zmk-config-moNa2-v2.git b62082ac44647dff6ae89578f514824b6359071a
+https://github.com/4mplelab/zmk-config-LisM.git 8e1fd16cc9fcae7dd7a92494dc0d48aa482e3e45
 

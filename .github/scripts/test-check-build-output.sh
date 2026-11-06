@@ -24,7 +24,11 @@ write_summary() {
 }
 
 run_ok() {
-  local mode="$1" run_arg="${2:-}"
+  local mode="$1" run_arg="${2:-}" expected_file="${3:-}"
+  if [ -n "${expected_file}" ]; then
+    (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" --expect "${expected_file}" >/dev/null)
+    return
+  fi
   if [ -n "${run_arg}" ]; then
     (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" >/dev/null)
   else
@@ -33,12 +37,13 @@ run_ok() {
 }
 
 run_fail() {
-  local mode="$1" expected="$2" run_arg="${3:-}"
+  local mode="$1" expected="$2" run_arg="${3:-}" expected_file="${4:-}"
   if [ -n "${run_arg}" ]; then
     check_cmd=(bash "${checker}" "${mode}" "${run_arg}")
   else
     check_cmd=(bash "${checker}" "${mode}")
   fi
+  [ -z "${expected_file}" ] || check_cmd+=(--expect "${expected_file}")
   if (cd "${case_root}" && "${check_cmd[@]}" >"${tmp_dir}/stdout" 2>"${tmp_dir}/stderr"); then
     echo "check-build-output.sh ${mode} unexpectedly succeeded" >&2
     exit 1
@@ -250,6 +255,74 @@ EOF
   run_fail build "duplicate summary field: ${field}"
 done
 
+# Caller-owned expectations catch wrong outputs even when their count is unchanged.
+# Keep these values independent of the summary and of the production target parser.
+reset_case
+expected_file="${tmp_dir}/expected output"
+printf '%s\0' image synthetic/build:stable target /synthetic/config cache synthetic-cache \
+  artifact left.uf2 artifact right.bin > "${expected_file}"
+strict_summary() {
+  write_summary <<EOF
+Status: SUCCESS
+Mode: build
+Built targets: 2
+Docker image: ${1:-synthetic/build:stable}
+Target: ${2:-/synthetic/config}
+Docker cache volume: ${3:-synthetic-cache}
+EOF
+}
+strict_summary
+printf 'synthetic firmware\n' > "${run_path}/left.uf2"
+printf 'synthetic firmware\n' > "${run_path}/right.bin"
+run_ok build "${run_path}" "${expected_file}"
+strict_summary synthetic/build:wrong
+run_fail build 'expected Docker image' "${run_path}" "${expected_file}"
+strict_summary
+mv "${run_path}/left.uf2" "${run_path}/wrong-target.uf2"
+run_fail build 'unexpected firmware name' "${run_path}" "${expected_file}"
+mv "${run_path}/wrong-target.uf2" "${run_path}/left.uf2"
+strict_summary synthetic/build:stable /synthetic/wrong
+run_fail build 'expected Target' "${run_path}" "${expected_file}"
+strict_summary synthetic/build:stable /synthetic/config wrong-cache
+run_fail build 'expected Docker cache volume' "${run_path}" "${expected_file}"
+strict_summary
+printf 'Docker image: synthetic/build:stable\n' >> "${run_path}/build-summary.txt"
+run_fail build 'duplicate expected summary field' "${run_path}" "${expected_file}"
+strict_summary
+: > "${run_path}/left.uf2"
+run_fail build 'empty expected firmware' "${run_path}" "${expected_file}"
+printf 'synthetic firmware\n' > "${run_path}/left.uf2"
+
+for invalid in duplicate-image duplicate-artifact unknown-key truncated-value truncated-key no-image no-artifact path-artifact reserved-artifact; do
+  case "${invalid}" in
+    duplicate-image) printf '%s\0' image synthetic/build:stable image synthetic/build:stable artifact left.uf2 ;;
+    duplicate-artifact) printf '%s\0' image synthetic/build:stable artifact left.uf2 artifact left.uf2 ;;
+    unknown-key) printf '%s\0' image synthetic/build:stable unknown value ;;
+    truncated-value) printf 'image\0synthetic/build:stable' ;;
+    truncated-key) printf 'image' ;;
+    no-image) printf '%s\0' artifact left.uf2 ;;
+    no-artifact) printf '%s\0' image synthetic/build:stable ;;
+    path-artifact) printf '%s\0' image synthetic/build:stable artifact ../left.uf2 ;;
+    reserved-artifact) printf '%s\0' image synthetic/build:stable artifact build.log ;;
+  esac > "${tmp_dir}/invalid expectation"
+  run_fail build 'Invalid output expectations' "${run_path}" "${tmp_dir}/invalid expectation"
+done
+printf '%s\0' image synthetic/build:stable artifact left.uf2 > "${tmp_dir}/too-few.expect"
+run_fail build 'expected artifact count' "${run_path}" "${tmp_dir}/too-few.expect"
+run_fail build 'Cannot read output expectations' "${run_path}" "${tmp_dir}/missing.expect"
+
+# Metadata-only checks can use the same contract without expecting firmware.
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+Docker image: synthetic/build:stable
+Target: /synthetic/config
+Docker cache volume: synthetic-cache
+EOF
+printf '%s\0' image synthetic/build:stable target /synthetic/config > "${tmp_dir}/validate.expect"
+run_ok validate "${run_path}" "${tmp_dir}/validate.expect"
+run_fail validate 'Invalid output expectations' "${run_path}" "${expected_file}"
+
 # Dots inside a directory name are legal; only a complete parent-traversal component is rejected.
 reset_case
 write_summary <<'EOF'
@@ -340,6 +413,24 @@ printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
 grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/matrix-output"
 grep -qx 'Resolved source count: 2' "${tmp_dir}/matrix-summary"
 if grep -Eq '/synthetic/private|first|second' "${tmp_dir}/matrix-output" "${tmp_dir}/matrix-summary" "${tmp_dir}/matrix-console"; then exit 1; fi
+# A selector is always a list file, never an inferred source or a URL.
+for selector in missing-list.txt https://example.invalid/sources.txt; do
+  printf '%s\n' "${selector}" > "${ci_root}/.build/ci-source-file"
+  rm -f "${tmp_dir}/invalid-matrix-output"
+  if (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/invalid-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/matrix-summary" \
+      bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/invalid-matrix-console" 2>&1; then
+    echo 'CI matrix accepted a missing list or URL selector' >&2; exit 1
+  fi
+  [ ! -e "${tmp_dir}/invalid-matrix-output" ]
+done
+printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
+# CI helpers use their repository root even when invoked from another directory.
+(cd "${tmp_dir}"; GITHUB_OUTPUT="${tmp_dir}/outside-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/matrix-summary" \
+  bash "${ci_root}/.github/scripts/check-build-output.sh" ci-matrix) >"${tmp_dir}/outside-matrix-console" 2>&1
+grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/outside-matrix-output"
+(cd "${ci_root}/.github"; bash scripts/check-build-output.sh ci-check build) \
+  >"${tmp_dir}/relative-check-console" 2>&1
+grep -qx 'Outcome: SUCCESS' "${ci_root}/.build/public/build.txt"
 for invalid in '' 0 3 bad; do
   if (cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-source-index "${invalid}") \
     >"${tmp_dir}/index-console" 2>&1; then echo 'invalid CI source index accepted' >&2; exit 1; fi
@@ -349,6 +440,49 @@ if (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/empty-output" GITHUB_STEP_SUMMARY
     bash .github/scripts/check-build-output.sh ci-matrix) >/dev/null 2>&1; then exit 1; fi
 [ ! -e "${tmp_dir}/empty-output" ]
 foreign="${tmp_dir}/foreign-publication"
+# Private evidence must survive the cleanup performed by the next checkout.
+echo '[output-contract] private evidence retention'
+archive_root="${tmp_dir}/private archives"
+(cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-archive "${archive_root}") \
+  >"${tmp_dir}/archive-console" 2>&1
+archive="$(cat "${ci_root}/.build/ci-evidence.record")"
+grep -qx COMPLETE "${archive}/archive-status.txt"
+test -f "${archive}/.build/${run_name}/private-device.bin"
+grep -qx 'synthetic private build log' "${archive}/.build/${run_name}/build.log"
+if grep -Eq 'private archives|synthetic-private|private-device|secret=' "${tmp_dir}/archive-console"; then
+  echo 'private archive details reached the CI console' >&2; exit 1
+fi
+if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-archive .build/nested-archive) \
+    >"${tmp_dir}/archive-rejected-console" 2>&1; then
+  echo 'private evidence was archived inside checkout' >&2; exit 1
+fi
+[ ! -e "${ci_root}/.build/nested-archive" ]
+archive_bin="${tmp_dir}/archive-bin"
+mkdir "${archive_bin}"
+cat > "${archive_bin}/tar" <<'EOF'
+#!/usr/bin/env bash
+echo 'injected archive copy failure' >&2
+exit 23
+EOF
+chmod +x "${archive_bin}/tar"
+if (cd "${ci_root}"; PATH="${archive_bin}:${PATH}" \
+    bash .github/scripts/check-build-output.sh ci-archive "${archive_root}") \
+    >"${tmp_dir}/archive-failure-console" 2>&1; then
+  echo 'private archive copy failure was accepted' >&2; exit 1
+fi
+partial_archive="$(cat "${ci_root}/.build/ci-evidence.record")"
+[ "${partial_archive}" != "${archive}" ]
+grep -qx FAILED "${partial_archive}/archive-status.txt"
+grep -qx COMPLETE "${archive}/archive-status.txt"
+if grep -Eq 'injected|private archives|synthetic-private|secret=' "${tmp_dir}/archive-failure-console"; then
+  echo 'private archive failure diagnostics reached the CI console' >&2; exit 1
+fi
+git -C "${ci_root}" init -q
+git -C "${ci_root}" clean -ffdx -- .build >"${tmp_dir}/archive-checkout-clean.log"
+[ ! -e "${ci_root}/.build" ]
+grep -qx 'synthetic private build log' "${archive}/.build/${run_name}/build.log"
+test -f "${archive}/.build/${run_name}/private-device.bin"
+mkdir -p "${ci_root}/.build"
 mkdir -p "${foreign}"
 printf 'preserve\n' > "${foreign}/keep.txt"
 rm -rf "${ci_root}/.build/public"

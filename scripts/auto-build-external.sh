@@ -19,6 +19,7 @@ ZMK_EXTERNAL_SETTINGS_RESET="${ZMK_EXTERNAL_SETTINGS_RESET:-0}"
 
 source_types=()
 source_values=()
+source_revisions=()
 slugs=()
 used_slugs=()
 build_snippets=()
@@ -40,13 +41,15 @@ Usage:
   bash scripts/auto-build-external.sh --list-json [sources.txt | source ...]
   bash scripts/auto-build-external.sh --list-indices-json [sources.txt | source ...]
 
-sources.txt accepts one source per line. Each source may be a Git URL or a
-local zmk-config path. Optional prefixes are supported: repo:<url>, path:<dir>.
+sources.txt accepts one source per line. Git URLs may be followed by a space or
+TAB and a full commit SHA. Local paths, including spaces, remain one value.
+Optional prefixes are supported: repo:<url>, path:<dir>.
 Actual builds are one build-external-source.sh process per source.
 --jobs controls target-level parallelism inside each source.
 --source-jobs controls how many sources the local wrapper starts at once.
 
 Options:
+  --revision SHA         Pin the preceding --repo to a full commit SHA.
   --mode build|validate   Select firmware build or configuration validation (default: build).
   --pristine              Reset the selected source cache before building.
   --settings-reset        Add missing settings_reset targets.
@@ -159,12 +162,13 @@ classify_source() {
 }
 
 add_source() {
-    local type="$1" value="$2" slug_override="${3:-}" base slug
+    local type="$1" value="$2" slug_override="${3:-}" revision="${4:-}" base slug
     [ -n "${value}" ] || return 0
     case "${type}" in
         repo|path) ;;
         *) echo "ERROR: source type must be repo or path: ${type}" >&2; exit 1 ;;
     esac
+    validate_source_revision "${revision}" || exit 1
     if [ -n "${slug_override}" ]; then
         base="$(sanitize_slug "${slug_override}")"
     elif [ "${type}" = "repo" ]; then
@@ -176,6 +180,7 @@ add_source() {
     slug="${UNIQUE_SLUG}"
     source_types+=("${type}")
     source_values+=("${value}")
+    source_revisions+=("${revision}")
     slugs+=("${slug}")
 }
 
@@ -189,7 +194,7 @@ add_auto_source() {
 }
 
 load_sources_file() {
-    local file="$1" line trimmed file_dir type value
+    local file="$1" line trimmed file_dir type value revision
     if [ ! -f "${file}" ]; then
         echo "ERROR: source list not found: ${file}" >&2
         echo "Create a file with one Git URL or local path per line." >&2
@@ -204,10 +209,16 @@ load_sources_file() {
         classify_source "${trimmed}"
         type="${CLASSIFIED_TYPE}"
         value="${CLASSIFIED_VALUE}"
+        revision=""
+        if [ "${type}" = repo ]; then
+            value="$(trim_line "${value}")"
+            revision="$(trim_line "${value#"${value%%[[:space:]]*}"}")"
+            value="${value%%[[:space:]]*}"
+        fi
         if [ "${type}" = "path" ]; then
             value="$(resolve_list_path "${file_dir}" "${value}")"
         fi
-        add_source "${type}" "${value}"
+        add_source "${type}" "${value}" "" "${revision}"
     done < "${file}"
 }
 
@@ -218,12 +229,19 @@ load_default_sources() {
 }
 
 json_escape() {
-    local value="$1"
+    local value="$1" number=1 octal character escaped
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
     value="${value//$'\r'/\\r}"
     value="${value//$'\n'/\\n}"
     value="${value//$'\t'/\\t}"
+    while [ "${number}" -le 31 ]; do
+        printf -v octal '%03o' "${number}"
+        printf -v character '%b' "\\${octal}"
+        printf -v escaped '\\u%04x' "${number}"
+        value="${value//"${character}"/"${escaped}"}"
+        number=$((number + 1))
+    done
     printf '%s' "${value}"
 }
 
@@ -232,12 +250,12 @@ print_list() {
     [ ${#source_values[@]} -gt 0 ] || return 0
     for i in "${!source_values[@]}"; do
         cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${slugs[$i]}"
-        printf '%s\t%s\t%s\t%s\n' "${slugs[$i]}" "${cache_volume}" "${source_types[$i]}" "${source_values[$i]}"
+        printf '%s\t%s\t%s\t%s\t%s\n' "${slugs[$i]}" "${cache_volume}" "${source_types[$i]}" "${source_values[$i]}" "${source_revisions[$i]}"
     done
 }
 
 print_list_json() {
-    local i cache_volume comma="" indices_only="${1:-0}"
+    local i index cache_volume comma="" indices_only="${1:-0}"
     if [ ${#source_values[@]} -eq 0 ]; then
         printf '{"include":[]}'
         return 0
@@ -245,19 +263,21 @@ print_list_json() {
 
     printf '{"include":['
     for i in "${!source_values[@]}"; do
+        index="${SOURCE_INDEX:-$((i + 1))}"
         if [ "${indices_only}" = 1 ]; then
-            printf '%s{"index":%s}' "${comma}" "$((i + 1))"
+            printf '%s{"index":%s}' "${comma}" "${index}"
             comma=","
             continue
         fi
         cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${slugs[$i]}"
-        printf '%s{"index":%s,"slug":"%s","cache_volume":"%s","type":"%s","source":"%s"}' \
+        printf '%s{"index":%s,"slug":"%s","cache_volume":"%s","type":"%s","source":"%s","revision":"%s"}' \
             "${comma}" \
-            "$((i + 1))" \
+            "${index}" \
             "$(json_escape "${slugs[$i]}")" \
             "$(json_escape "${cache_volume}")" \
             "$(json_escape "${source_types[$i]}")" \
-            "$(json_escape "${source_values[$i]}")"
+            "$(json_escape "${source_values[$i]}")" \
+            "${source_revisions[$i]}"
         comma=","
     done
     printf ']}\n'
@@ -279,6 +299,7 @@ builder_args_for_source() {
     local i="$1" snippet module
     if [ "${source_types[$i]}" = "repo" ]; then
         printf '%s\0%s\0' --repo "${source_values[$i]}"
+        [ -z "${source_revisions[$i]}" ] || printf '%s\0%s\0' --revision "${source_revisions[$i]}"
     else
         printf '%s\0%s\0' --path "${source_values[$i]}"
     fi
@@ -300,11 +321,10 @@ builder_args_for_source() {
 }
 
 run_source_processes() {
-    local failed=0 completed=0 active=0 next_index=0 i status_dir
+    local failed=0 completed=0 active=0 next_index=0 i stop_status=0 monitor_was_set=0
     local pids=()
     local pid_indexes=()
     local statuses=()
-    local status_files=()
     local args=()
 
     if [ ${#source_values[@]} -eq 0 ]; then
@@ -312,46 +332,53 @@ run_source_processes() {
         return 0
     fi
 
-    status_dir="$(mktemp -d)"
+    case $- in *m*) monitor_was_set=1 ;; esac
+    trap 'stop_status=130' INT
+    trap 'stop_status=143' TERM
+
+    stop_source_processes() {
+        local pid
+        trap '' INT TERM
+        echo "External build interrupted; waiting for source workers." >&2
+        for pid in ${pids[@]+"${pids[@]}"}; do
+            # Each worker has its own process group, including clone/build children.
+            kill -TERM -- "-${pid}" 2>/dev/null || true
+        done
+        for pid in ${pids[@]+"${pids[@]}"}; do wait "${pid}" 2>/dev/null || true; done
+        exit "${stop_status}"
+    }
 
     for i in "${!source_values[@]}"; do
         statuses[$i]="pending"
     done
 
     start_source_process() {
-        local source_index="$1" status_file
+        local source_index="$1"
         args=()
         while IFS= read -r -d '' arg; do
             args+=("${arg}")
         done < <(builder_args_for_source "${source_index}")
 
-        status_file="${status_dir}/${source_index}.status"
-        rm -f "${status_file}"
         echo "Started ${slugs[$source_index]} (${source_types[$source_index]}): ${source_values[$source_index]}"
-        (
-            set +e
-            bash "${SOURCE_BUILDER}" "${args[@]}"
-            status="$?"
-            printf '%s\n' "${status}" > "${status_file}"
-            exit "${status}"
-        ) &
+        # Bash 3.2 job control supplies a group without a host setsid dependency.
+        set -m
+        bash "${SOURCE_BUILDER}" "${args[@]}" <&0 &
         pids+=("$!")
+        [ "${monitor_was_set}" = 1 ] || set +m
         pid_indexes+=("${source_index}")
-        status_files+=("${status_file}")
         statuses[$source_index]="running"
         active=$((active + 1))
     }
 
     collect_finished_sources() {
-        local wait_for_one="$1" found j pid source_index status_file status wait_status
+        local wait_for_one="$1" found j pid source_index status wait_status
         while :; do
+            [ "${stop_status}" = 0 ] || return 0
             found=0
             if [ ${#pids[@]} -gt 0 ]; then
                 for j in "${!pids[@]}"; do
-                    status_file="${status_files[$j]}"
                     pid="${pids[$j]}"
-                    # A killed worker cannot publish its status file. Reap it instead of waiting forever.
-                    if [ ! -f "${status_file}" ] && kill -0 "${pid}" 2>/dev/null; then
+                    if kill -0 "${pid}" 2>/dev/null; then
                         continue
                     fi
                     source_index="${pid_indexes[$j]}"
@@ -370,7 +397,6 @@ run_source_processes() {
                     echo "Finished ${slugs[$source_index]}: ${statuses[$source_index]}"
                     unset "pids[$j]"
                     unset "pid_indexes[$j]"
-                    unset "status_files[$j]"
                     completed=$((completed + 1))
                     active=$((active - 1))
                     found=1
@@ -384,15 +410,18 @@ run_source_processes() {
 
     echo "Starting ${#source_values[@]} source build process(es) (source jobs=${SOURCE_JOBS})"
     while [ "${completed}" -lt "${#source_values[@]}" ]; do
+        [ "${stop_status}" = 0 ] || stop_source_processes
         while [ "${active}" -lt "${SOURCE_JOBS}" ] && [ "${next_index}" -lt "${#source_values[@]}" ]; do
+            [ "${stop_status}" = 0 ] || stop_source_processes
             start_source_process "${next_index}"
             next_index=$((next_index + 1))
         done
         collect_finished_sources 1
+        [ "${stop_status}" = 0 ] || stop_source_processes
         collect_finished_sources 0
     done
 
-    rm -rf "${status_dir}"
+    trap - INT TERM
 
     echo ""
     echo "External build summary:"
@@ -433,6 +462,16 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || { echo "ERROR: --path requires a value" >&2; exit 1; }
             add_source "path" "$(resolve_cli_path "$2")"
             last_source_index="$((${#source_values[@]} - 1))"
+            shift
+            ;;
+        --revision)
+            [ "$#" -ge 2 ] || { echo 'ERROR: --revision requires a value' >&2; exit 1; }
+            if [ -z "${last_source_index}" ] || [ "${source_types[$last_source_index]}" != repo ]; then
+                echo 'ERROR: --revision must follow --repo' >&2; exit 1
+            fi
+            [ -n "$2" ] || { echo 'ERROR: --revision requires a commit SHA' >&2; exit 1; }
+            validate_source_revision "$2" || exit 1
+            source_revisions[$last_source_index]="$2"
             shift
             ;;
         -j|--jobs)
@@ -521,12 +560,12 @@ if [ ${#source_values[@]} -eq 0 ]; then
 fi
 
 if [ -n "${SOURCE_INDEX}" ]; then
-    validate_positive_int 'source index' "${SOURCE_INDEX}"
     [ "${SOURCE_INDEX}" -le "${#source_values[@]}" ] || { echo 'ERROR: source index is out of range' >&2; exit 1; }
     while [ "${SOURCE_INDEX#0}" != "${SOURCE_INDEX}" ]; do SOURCE_INDEX="${SOURCE_INDEX#0}"; done
     selected_index=$((SOURCE_INDEX - 1))
     source_types=("${source_types[$selected_index]}")
     source_values=("${source_values[$selected_index]}")
+    source_revisions=("${source_revisions[$selected_index]}")
     slugs=("${slugs[$selected_index]}")
 fi
 

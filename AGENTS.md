@@ -1,279 +1,289 @@
-# Agent contract
+# zmk-build-script: agent guide
 
-利用方法・CLI・環境変数・runner 運用は
-[README.ja.md](README.ja.md) と [README.md](README.md)、保守契約はこの file に集約します。
-外部案件の repo 名・commit hash・日付・個別の実測値・一度きりの結果を文書へ追加せず、
-command / source / image identity と raw log は `.build/` の新しい実行記録に残します。
+English is the authoritative guide. [日本語版](AGENTS.ja.md) contains the same rules; update both
+together.
 
-## Publication privacy and local execution
+## Scope and contract
 
-This rule applies to information prepared for publication or external sharing.
-During an authorized task, agents may inspect and use actual local paths,
-configuration, host/terminal/device identities and private test evidence as
-needed for implementation, diagnosis, identity matching and validation. Such
-local access does not itself authorize collection outside the task or disclosure.
+- Own `build.sh`: build/validate/clean one config or explicitly selected standalone application,
+  copy inputs, manage its workspace and collect artifacts. External enumeration/cloning stays in
+  `scripts/auto-build-external.sh`, `scripts/build-external-source.sh` and
+  `scripts/source-common.sh`. Keep usage/CLI/environment tables in both READMEs; omit one-off
+  project names, commits, dates, measurements and workstation details. Keep individual-build
+  features in `build.sh`; add environment variables for needed opt-outs, and reuse existing
+  responsibilities/scenarios before adding scripts, containers or fixtures.
 
-Before preparing a public commit, push, PR, release, documentation/site output
-or CI artifact, review the actual publication payload, including source,
-comments, AGENTS files, examples, test fixtures, logs, screenshots, generated
-files and metadata. Exclude user-related names and preferences, private absolute
-paths and local-environment details, workstation/terminal identities, individual
-device labels, ports, serials, addresses, pairing/bond identities, credentials,
-and user- or device-specific test/measurement histories. Also check generated
-and uploaded artifacts; checking source prose alone is insufficient.
+- Support Bash 3.2 and standard Unix tools; production Git is optional. On Windows use Git Bash and
+  explicit MSYS/native Git/Docker path conversion. Guard empty arrays under `set -u`. Before
+  container creation, probe tar exclusions with an empty archive and NUL-list support with empty
+  `--null -T` input; help text or help-pipeline SIGPIPE is not proof. Do not reconfigure the host,
+  reclaim global memory or stop unrelated tools. Avoid WSL shims; with Docker path conversion
+  disabled, change directories for native Git rather than passing MSYS paths to it.
 
-Use repository-relative paths, documented variables/placeholders, neutral names
-and clearly synthetic fixtures in public material. Declared public project
-identifiers, existing attribution, standard API/product/platform names and
-reproducible support requirements remain technical project information; do not
-present one user's actual environment as a project requirement. In particular,
-documenting supported platforms is distinct from identifying a user's device.
+- Copy tracked and nonignored untracked files with NUL delimiters, excluding deleted tracked files
+  and retaining ignored tracked files. Fall back to fixed-exclusion copying for absent/failing/empty
+  Git selection or `ZMK_COPY_IGNORED=1`. Exclude `.git`, `.west` and `__pycache__`; select top-level
+  exclusions by root entry without platform-specific tar anchoring, retaining nested names. Keep
+  host-to-container and container-to-workspace copy boundaries distinct.
 
-Keep exact originals and identifiers in appropriate private/local task records
-when required for accurate evidence or device matching. Produce a separate
-sanitized publication copy without weakening assertions or inventing results;
-do not describe it as the unchanged raw record. If useful evidence cannot be
-shared without exposing these details, keep it private and state the public
-validation limit. Recheck the final publication snapshot and its artifacts.
-Existing authorization requirements for version-control, publication, device
-writes, resets and data erasure still apply.
+- Fixed top-level exclusions are `.zmk`, `.build`, `.cache`, `.ccache`, `.vscode`, `build`, `dist`,
+  `node_modules`, `out`, `tmp`, `zmk_search`. Exclude generated `zmk`, `modules`, `tools`,
+  `bootloader`, `optional` roots only when source `.west` and each root's `.git` marker establish
+  them. Names alone are insufficient; never auto-discover `local_modules/`.
 
-## 作業範囲と責務
+- Require a repository root with `build.yaml` and `config/west.yml`; custom config-directory entry
+  points are unsupported. Keep root/module boards and legacy config/boards compatibility, warn for
+  legacy target zephyr content and normalize missing metadata only in the container. Every module
+  needs explicit `-m`, including hidden/space-containing paths. Resolve paths including dir/. before
+  rejecting duplicate full basenames; pass path lists NUL-delimited.
 
-- 最新の user 指示と既存差分を最初に読み、user changes を保持する。
-- commit / stage / push / PR 作成・更新 / merge / tag / release は、各操作の明示指示がある場合だけ行う。
-  test 成功や milestone を許可と解釈せず、無関係な変更を含めない。
-- 主対象は `build.sh`。helper / workflow / docs はその契約に直接関係する範囲だけ扱い、
-  keyboard / module source、実機 firmware、settings を変更しない。
-- 単体 build で常に有効な機能は `build.sh` に置き、環境変数は opt-out が必要な場合だけ追加する。
-  新しい script / container / fixture を増やす前に既存の責務・scenario へ統合できるか確認する。
-- production host の必須依存は Docker と Bash。標準 Unix tool を使い、追加 install を前提にしない。Git は optional。
-- WSL 全体の memory 回収・停止・設定変更や、他 tool の監視を builder に取り込まない。
-  中間 file の削除、依存 / ccache の再利用、host に残す成果物・証拠を区別する。
+- On the host check only required metadata-file existence. Inside the container, strictly validate
+  YAML structure/keys/types before workspace mutation or dependency updates, accepting inline
+  maps/quoted keys. Root CMakeLists.txt/Kconfig require explicit build.cmake/build.kconfig strings;
+  boards/dts/snippets require corresponding build.settings.*_root: . declarations. Preserve nested
+  paths such as proto/zmk and explicit module declarations.
 
-| 場所 | 責務 |
-| --- | --- |
-| `build.sh` | 1 target directory の build / validate / clean、host copy、container workspace、成果物回収 |
-| `scripts/auto-build-external.sh` | source list / JSON matrix、slug 一意化、source process の rolling queue |
-| `scripts/build-external-source.sh` | 1 source の clone / local path 解決、builder 起動、clone cleanup |
-| `scripts/source-common.sh` | wrapper 共通の分類・名前処理、Windows 非互換 clone path の除去 |
-| `repos.txt` | 1 行 1 source。relative path は list file の directory 基準 |
-| `.github/fixtures/` | 標準 firmware、validate 専用 target shapes、module override |
-| `.github/scripts/` | 共通検証入口、runner / LF / output check、既存 helper behavior test |
-| `.github/workflows/` | hosted compatibility、手動 self-hosted smoke、外部 source matrix、heartbeat |
+- Standalone `application` is repository-relative and contains CMakeLists.txt: reject
+  absolute/parent traversal and escaping symlinks. Resolve its manifest Zephyr project/package and
+  pass modules through `ZEPHYR_EXTRA_MODULES`; normal ZMK uses `ZMK_EXTRA_MODULES`. Supplement
+  target-root settings for standalone too, without inferring module build declarations from
+  application entry points. Keep source, target and Ninja concurrency separate.
 
-source 列挙・clone を `build.sh` に戻さない。source 並列、target 並列、Ninja compile 並列を分ける。
-host → container → persistent workspace の 2 段階 copy と host への成果物回収を別の境界として扱う。
+- Use dedicated repository/tool/purpose volumes. Lock a workspace before sync/update/prune;
+  contention stops before mutation. Keep the lock outside prune scope and release on process exit; a
+  retained container alone does not block reuse. Sync only config into the workspace and point
+  ZMK_CONFIG at the fresh container source. Restore previous overlays before current inputs: a
+  west-project name is an overlay, other explicit modules are extra modules.
 
-## Host と source copy
+- Record restoration information before destination changes; explicitly propagate copy/deletion
+  failure instead of relying on errexit in condition-invoked functions. Retain failed backups/stamps
+  and stop. Reject absolute overlay paths and standalone parent components, allowing embedded dots.
+  Atomically record restored/refetch-required state before backup cleanup; never re-delete restored
+  projects after later failure/interruption. Accept legacy two-column records. Normalize
+  in-workspace parents and reject escaping roots. Prune exact normalized roots, including
+  spaces/hidden entries, only from a fully successful west list and recheck before pruning/stamping.
+  Partial/failing lists retain caches and require update; deletion failures are errors.
 
-- Windows / macOS / Linux の差分は script が吸収し、Windows は WSL shim を避け Git Bash を明示する。
-  Docker 用の MSYS path 自動変換停止下では native `git.exe` に MSYS path を渡さず、directory へ `cd` する。
-- Bash 3.2 に対応する。`set -u` 下の空配列は `${array[@]+"${array[@]}"}` または要素数で guard する。
-- container 作成前に空 archive で `tar --exclude` を実行する。NUL list は `--null -T` の空入力を実行して確認し、
-  非対応なら Git file list を使わない。短縮 help の省略や help pipe の SIGPIPE を能力不足と解釈しない。
-- Git working tree は tracked と非 ignored untracked を NUL 区切りで copy し、削除済み tracked を除き、
-  ignored tracked は保持する。`ZMK_COPY_IGNORED=1`、Git 無し / 失敗、非 working tree、空一覧では固定除外つき全 copy。
-- 固定除外は `.git` / `.west` / `__pycache__` と top-level の `.zmk` / `.build` / `.cache` / `.ccache` /
-  `.vscode` / `build` / `dist` / `node_modules` / `out` / `tmp` / `zmk_search`。
-  top-level は root entry で選別し、OS ごとの tar anchor 解釈に依存しない。同名の nested content を保持する。
-- `zmk` / `modules` / `tools` / `bootloader` / `optional` は、source に `.west`、対象 tree に `.git` marker が
-  ある場合だけ generated dependency として除外する。名前だけでは除外せず、`local_modules/` は自動探索しない。
+- Decide reuse from the entire resolved manifest including imports and valid project/overlay state,
+  not its entry-file hash. Missing projects, resolution/list/restoration failure require update.
+  Invalidate readiness first; stamp only complete success and revalidate legacy records. Nonempty
+  failed/interrupted checkouts are not ready. Retry explicitly, safely clearing stale index locks
+  including spaces. Continue after fetch failure only with a complete project list and explicit
+  local overrides for every failed project identified by the final attempt; never mix earlier
+  failures or infer unknown failures. Record continuation separately from a successful upstream
+  update.
 
-## Layout・module・application
+- Keep ccache outside the west workspace. `CCACHE_IGNOREOPTIONS=-specs=*` assumes fixed SDK specs
+  within the selected image; recheck on image/SDK changes and retain image-tag revision suffixes.
+  `--pristine` removes the entire selected volume for build and validate, including
+  dependencies/ccache. Check the complete exact volume list; absence is allowed, but
+  listing/deletion failure stops before container creation. Do not use pristine for
+  overlay-restoration tests.
 
-- 入口は `build.yaml` と `config/west.yml` を持つ repo root。direct config directory / custom config path は扱わない。
-  board 定義は root / module の `boards/` を標準とし、既存の `config/boards` は compatibility path として許容する。
-- target の legacy `zephyr/` content は warning で許容し、不足 metadata / root `module.yml` は container 内だけで正規化する。
-  host source は変更せず、metadata があれば target root を extra module に追加する。
-- module はすべて `-m` で明示する。`dir/.` も host で path 解決してから、空白を含む basename 全体で重複判定する。
-  明示した隠し directory も同じ一覧で検証・適用し、内部の path 一覧は NUL 区切りで渡す。
-- 明示 module の root `CMakeLists.txt` / `Kconfig` は `build.cmake` / `build.kconfig`、`boards/` / `dts/` / `snippets/` は
-  対応する `build.settings.*_root: .` を要求する。host は必要な metadata file の存在だけを確認する。
-  YAML 構造・key は container 内で workspace 変更 / 依存更新前に strict に検証し、inline map / quoted key を許容する。
-  `proto/zmk` などの nested path を保持する。
-- 通常は `zmk/app`。top-level `application` は repo 内の `CMakeLists.txt` を持つ相対 directory を指定する。
-  absolute / parent traversal / repo 外へ出る symlink を拒否する。standalone は manifest の `zephyr` project から package を
-  解決し、extra module を `ZEPHYR_EXTRA_MODULES`、通常の ZMK は `ZMK_EXTRA_MODULES` へ渡す。
-  standalone でも target の root settings を補完する。明示した module build 宣言は保持し、application の
-  CMake / Kconfig 入口から `build.cmake` / `build.kconfig` を推定しない。
+- Preserve build-matrix defaults/include/exclude/skip/aliases, placeholders and snippets; evaluate
+  exclude on raw YAML before CLI-snippet composition and deduplicate reset targets per board. Parse
+  positive integers as decimal, rejecting all-zero forms including 00. Distinguish None from falsey
+  types; validate scalar/list types and reject NUL before shell handoff. Preserve quoting, empty
+  arguments and literal whitespace through shlex/NUL. Sanitize artifact names, Windows reserved
+  stems before the first dot, case-insensitive duplicates and log/summary collisions; reject
+  standalone parent components, not embedded dots.
 
-## Persistent workspace と cache
+- Isolate target build/log trees and collect logs in target order. Keep parallel failure counts as
+  integers, not 8-bit exit packing; collect current-batch failures and stop pending batches.
+  External full/pristine defaults to one target at a time. Each target's subshell EXIT cleanup
+  removes intermediates on success and compile/selection/copy failure while retaining
+  dependencies/ccache. Cleanup failure turns success into failure and preserves any original build
+  error/status.
 
-- workspace へは `config/` だけ同期し、ZMK の `ZMK_CONFIG` は fresh な container source の `config/` に向ける。
-  manifest 外の root を prune するため volume は repo / tool / 用途ごとに分離する。
-  同じ workspace を変更する build は OS lock で排他し、競合時は同期・依存更新・削除前に停止する。
-  lock file は prune 対象の外に置き、build process の終了時に解放する。保持 container の存在だけで再利用を拒否しない。
-- 前回 overlay を workspace 内 backup から復元してから今回 input を適用する。directory 名が west project 名と一致すれば
-  overlay、それ以外は extra module。destination を変更する前に backup の復元記録を残す。
-- 復元の copy / 削除失敗は明示して返す。if 条件内の関数の errexit に依存せず、失敗時は該当 backup / stamp を残して停止する。
-  overlay path は absolute と親を表す独立した `..` component を拒否し、名前の途中の `..` は許容する。
-  復元済み / 再取得が必要な状態を project ごとに atomic に記録してから backup を整理する。
-  後続の失敗・中断後も復元済み project を再削除しない。旧2列の記録を受け入れる。
-- prune は復元後、完全に成功した `west list` の結果だけで行う。root は空白 / hidden entry を含め配列で完全一致比較し、
-  1 回ずつ整理する。一覧失敗・部分出力では cache を保持して update を要求し、成功後に再確認してから prune / stamp する。
-  削除失敗を無視しない。
-- import を含む `west manifest --resolve` 全体の digest 変更 / 解決失敗、必要な ZMK / project の欠落、`west list` 失敗、
-  復元不能な overlay では update する。入口 file の hash だけで再利用判定しない。
-- update 前に ready marker を無効化し、完全成功時だけ resolved manifest を stamp する。旧記録も再検証する。
-  失敗 / 中断後の非空 checkout や未解決 manifest を ready と扱わない。
-- update は設定回数 retry し、各試行直前に空白を壊さず stale index lock を除去する。失敗後の続行には完全な project 一覧と、
-  最終試行で明示された全失敗 project を満たす local override が必要。unknown / unsupported failure を missing list から推測せず、
-  前の試行の失敗名を混ぜない。local override での続行を upstream update 成功と記録しない。
-- ccache は west workspace の外側、cache volume 上に保存する。`CCACHE_IGNOREOPTIONS=-specs=*` は選択 image 内で
-  SDK specs が固定される前提。SDK / image 変更時は前提を再確認し、revision suffix も image tag 選択へ含める。
-- `--pristine` は build / validate とも builder が volume 全体を削除する。完全な volume 一覧で対象を照合し、未作成なら続行、
-  一覧 / 削除失敗なら container 作成前に停止する。依存 / ccache を含むため overlay 復元 test では使わない。
+- Operate build/clone/test containers by the immutable ID returned from create. Create failure never
+  authorizes deleting an existing same-named container. Respect `ZMK_KEEP_CONTAINER=1`, stopping
+  retained containers on interruption. Propagate cleanup failures without hiding prior build errors;
+  clone-container deletion failure stops retries/builder invocation. Defer signals through ID
+  acquisition, handler entry and cleanup, commit the true exit status, then publish one atomic final
+  summary. Do not leak stdbuf LD_PRELOAD to children.
 
-## Parser・build・output
+- Collect one firmware per target: `.uf2`, configured fallback, `.hex`, then `.bin`. Reject fallback
+  extensions containing paths/globs or leading dots/hyphens; host enumeration, summaries and
+  checkers use the same extensions and exclude logs/summaries. Existence probes drain without
+  SIGPIPE. Every started run uses `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/` and retains `build.log`,
+  `build-summary.txt`, failure reason/excerpt on
+  setup/pristine/create/start/source-copy/build/artifact-copy/cleanup failures or interruption.
+  Propagate artifact-copy failures.
 
-- 公開 CLI / 環境変数の表は README に維持する。正の整数は十進表記として扱い、`00` を含む全ゼロを拒否する。
-- top-level / include matrix、defaults、exclude、skip、alias、artifact placeholder を保持する。
-  exclude は CLI snippet 合成前の YAML 値で評価し、reset target は board ごとに重複させない。
-- None と falsey の型を区別し、scalar list / quote を検証する。board / shield / snippet / CMake 引数の NUL は shell 受け渡し前に拒否。
-  literal list は trim せず、shlex 結果は NUL 区切りで渡し、空引数・引用・前後空白を保持する。
-- artifact 名は安全な file 名へ正規化する。最初の dot より前も検査して Windows 予約名を拒否し、大小文字を無視した重複と
-  log / summary などの予約出力名との衝突も拒否する。
-- target ごとに build directory / log を分ける。並列失敗数は整数 data として保持し、8-bit exit status に詰めない。
-  batch の失敗を回収し、未開始の後続 target を進めず、log 順序を保持する。外部 full / pristine の既定 target 並列は 1。
-- 各 target は subshell EXIT で成功 / compile / artifact 選択・copy 失敗時とも中間 directory を削除し、依存 / ccache を保持する。
-  削除失敗を log に残して成功を失敗に変え、元の build error の終了 status は保持する。
-- firmware は target ごとに 1 個、`.uf2` → 指定 fallback → `.hex` → `.bin` の順。host 列挙 / summary / checker は
-  log / summary 自体を除き同じ拡張子を認識する。拡張子には path / glob / 先頭 dot / hyphen を許可しない。
-- run は `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/`。開始済み run は setup / pristine / create / start / source copy /
-  build / artifact copy / cleanup の失敗にも `build.log`、FAILED summary、Reason と error excerpt を残す。
-  artifact copy の失敗は呼び出し元へ返す。main container log にも build stream を流し、`stdbuf` の `LD_PRELOAD` を子へ伝えない。
-  SIGINT / SIGTERM は理由と終了 status を確定して同じ終了処理へ渡す。保持指定の container は中断時に停止して残す。
-- summary の field は Status、失敗時 Reason、Mode、Target、Docker image / cache volume、Elapsed、Built targets、Pristine、
-  Build jobs、Fallback binary、Extra snippets、Module inputs、Files。主要 field の重複と規則外 run の summary を拒否する。
-- Built targets は CR / ANSI / prefix を除いた log 行から取得し、成功 build のみ firmware 数へ fallback する。
-  checker は成功 status / mode / log / 正の target 数 / firmware 数の完全一致を要求する。旧 fallback 未記録は `bin`。
-  保存先名も独立した `..` component だけを拒否し、`case..name` は許可する。
+- Summary/checker agree on status, failure reason, mode, target, image/cache, elapsed time, built
+  count, pristine/jobs/fallback/snippets/modules and files. Reject duplicate major fields and
+  invalid run paths. Count build markers after stripping CR/ANSI/prefixes; fall back to firmware
+  counts only for successful builds. The checker requires success, mode, log, positive target count
+  and exactly matching firmware count. Legacy summaries without fallback use bin.
 
-## Container・外部 source・workflow
+- External wrappers handle URL/UNC/drive/relative paths, unique slugs and isolated per-source
+  clone/cache/container/artifact trees. JSON escapes all shell-representable control bytes and
+  retains original selection indices; CI selectors name existing list files. Fetch with retries in a
+  clone container after daemon preflight and return via docker cp, not bind mounts. On Windows
+  remove only incompatible clone paths with warnings. Failed host deletion stops replacement; delete
+  old files before copying after repair. Success requires clone cleanup, confined directly beneath
+  the resolved clone root; preserve local sources. Collect actual worker exits, including
+  missing-status-file failures, while other sources continue and free slots receive pending work.
+  Resolve relative entries in `repos.txt` against the list file directory; classify external
+  layout/API incompatibility separately from builder defects.
 
-- build / clone / test は create が返した immutable ID で start / exec / copy / cleanup を行う。
-  create 失敗時に同名の既存 container を消さず、要求した名前を所有の証拠にしない。
-- container 削除失敗は log / FAILED summary に反映し、先の build failure の理由・exit status を保持する。
-  `ZMK_KEEP_CONTAINER=1` を尊重する。clone container の削除失敗では retry / builder 起動へ進まない。
-- URL / UNC / drive absolute / relative を区別し、slug 衝突を解消する。source ごとに clone / cache / container / artifact を分ける。
-- URL は daemon preflight 後、clone container 内で retry つき取得し、bind mount ではなく `docker cp` で host へ戻す。
-  Windows だけ trailing 空白 / dot、禁止文字・control・newline、予約 device 名を警告つきで除き、合法名と Unix source は保持する。
-- host clone 先の削除失敗では取得 / copy を止め、修復後も古い file を消してから copy する。終了時も clone コピー削除後だけ
-  成功を報告する。先の clone / build failure があれば削除失敗も併記し、解決済み clone root 直下だけを削除する。local source は保持。
-- rolling queue は worker の実 exit を回収する。status file 前の異常終了も失敗とし、他 source は落とさず空き枠へ次を流す。
-  外部 source の layout / API incompatibility と builder defect を分ける。
-- source / input / runner 名などは `env:` 経由で quote し、`${{ ... }}` を shell text に直接埋め込まない。
-  runner が開始前に表示する値には非公開の source 情報を置かず、matrix / step env は数値 index に限定する。
-  source selector は event payload から実行時に非公開 file へ準備し、source の解決・選択は wrapper が行う。
-  `continue-on-error` で build failure を隠さない。
-  CI console と artifact は固定項目の公開用 report に限定する。raw log / firmware は local に保持し、
-  公開用コピーを unchanged raw record と呼ばない。自動 upload は既知の report path だけを許可する。
-- hosted Compatibility は 3 OS shell / Ubuntu Docker、Self-hosted Build は手動 smoke。外部 matrix は custom label で routing し、
-  `runner.os` に応じて Git Bash / Bash を使う。label / Docker access は runner user で確認し、offline による queued を失敗と混同しない。
-- schedule は UTC cron と換算 comment、concurrency / timeout を保持する。Heartbeat の commit / push をこの契約で自動許可しない。
+- CI passes source/runner inputs through quoted env or structured files, never direct expression
+  interpolation in shell. Runner-visible matrix/step values contain only numeric source indices;
+  derive private selectors from event payload into runtime files. Keep raw logs/firmware private,
+  upload only reviewed fixed-field reports from known report paths and never hide failures with
+  continue-on-error. Preserve hosted three-OS shell/Ubuntu Docker versus manual self-hosted smoke
+  roles, custom labels and runner.os shell selection. Check Docker access as the runner user;
+  offline queues are not build failures. Preserve UTC cron and conversion comments, concurrency and
+  timeouts; Heartbeat grants no publication authority.
 
-## 検証 gate と再発防止
+- For a regression add a failing-original case or named control to the existing affected
+  host/copy/workspace/update/overlay/build/artifact/summary/workflow suite and check other
+  OS/workflow variants. Run scripts through bash, normalize temporary paths with pwd -P, check
+  host-guard reachability and rejection, and verify actual symlinks rather than Git Bash copy
+  fallbacks/skips. Preserve LF/CRLF/bare CR/Control-Z, spaces, large input, Git failure and actual
+  parser argv/order assertions. Consolidate independent Docker conditions, use dedicated caches and
+  acquired container IDs. Immediately check each successful build/validate with its exact run
+  directory. Fixture success alone proves neither real network/west/image/native-host variants nor
+  hosted/self-hosted execution.
 
-不具合は host / copy / workspace / update / overlay / build / artifact / summary / workflow の境界で分類する。
-修正前に失敗する case または識別可能な negative control を既存 helper / fixture に追加し、原因・対応・確認を
-該当する契約と test に反映する。重複した bug 履歴を追加せず、既存の有効な回帰 assertion を削除・緩和しない。
-OS / workflow の片側に同じ問題が残らないか確認する。
+- Reading map for relevant changes: [README.md](README.md), [README.ja.md](README.ja.md). Read the
+  affected contract/coverage sections; documentation-only edits do not require unrelated dependency
+  tours.
 
-| 変更範囲 | 必須確認 |
-| --- | --- |
-| 文書のみ | LF、`git diff --check`、変更した path / link / CLI 参照。文書のみを理由に firmware suite は実行しない |
-| code / helper / workflow | 該当する syntax、LF、`git diff --check`、関連する behavior / build gate |
-| helper / summary | 該当 behavior test と失敗時の status / reason / output |
-| copy / module / sync / cache | runner preflight、copy helper、関連 validate / firmware、直後の output check |
-| artifact / fallback | firmware fixture と output helper。非 UF2 の選択も確認 |
-| workflow | YAML / run step syntax、関連 helper / step。未公開なら remote CI は未実行 |
+## Working rules
 
-local / CI は `bash .github/scripts/test.sh shell|docker|build|all` を入口とし、層の対応は README に置く。
-標準 validate（通常 / reset）、target shapes と CLI snippet、標準 firmware、project overlay / extra module、
-pristine 無しの復元を影響範囲に応じて確認し、各成功 build / validate の直後に run を明示して output checker を実行する。
+- Read the request and existing diff; preserve unrelated and staged work. Finish authorized
+  inspection, edits and reversible checks without repeated approval. Ask only for a missing decision
+  or an out-of-scope action. Before a destructive rewrite, preserve irreplaceable uncommitted
+  content as private evidence, not rolling whole-tree copies.
 
-- 実行ごとに新しい repository 外または directory 全体が Git ignored の記録先を使う。visible な内部保存先は開始前に拒否する。
-  command / status / 時間 / source checksum 前後 / image identity / raw failure を残し、既存証拠を上書きしない。
-- 実行中の script を編集しない。修正後の source を固定して再実行し、前後 checksum が違う結果は最新 source の PASS としない。
-- test は `bash <script>`、temp path は `pwd -P` を使う。host guard は到達 sentinel と拒否条件の両方を確認する。
-  executable bit や Windows fake-bin の未正規化 path に依存しない。
-- Bash 用 symlink fixture は Git Bash の copy fallback を避け、作成後に `-L` で確認する。
-  必要な MSYS link mode は作成 command だけに指定し、権限不足による skip や拒否 assertion の省略で代用しない。
-- LF は `.gitattributes` / `.editorconfig` に従う。raw byte を直接検査して CRLF / bare CR / Control-Z / 大きな入力 /
-  Git failure を見逃さず、検証のために working tree を reset / 書換えしない。
-- 独立した Docker 条件は同一 container に集約する。parser は production を実行して値・順序・実 argv を検査する。
-  update retry / 空白つき stale lock / 部分失敗と復旧は現行 image 内の command boundary を制御して確認する。
-- test container も取得済み ID だけを cleanup する。test cache は専用とし、明示指定の再利用 cache と自動作成 cache の所有を分ける。
-- local / remote CI / 物理動作を分ける。実ネットワーク障害、別 west version、旧 image の実 build、非 amd64 native host、
-  公開後の hosted / self-hosted 実行は、対応する証拠なしに fixture 成功から PASS としない。
+- Git staging, commits, pushes, PR changes, merges, tags, publication, flashing and settings/bond
+  erasure need authorization for that operation. Existing authorization remains valid for the same
+  operation and scope. Dependency guides and passing checks grant none. Before an authorized commit,
+  run applicable pre-commit hooks in Docker without bypasses; keep the configured Git identity.
 
-## 完了判定と報告
+- Use the selected checkout and manifest/lock sources; do not silently switch branches, reset
+  history, replace remotes or create authoring copies. Before changing selection, verify source
+  URLs/full commits, review dependency changes, update affected pins/locks and run owner/integration
+  checks. Distinguish local working snapshots from remotely retrievable commits; report missing refs
+  rather than inventing them.
 
-最新 scope、既存差分の保持、不要な新規 file / 意図しない差分、LF / syntax / 必須 check を再確認する。
-変更 file、PASS / FAIL / 未実行と理由、残る環境の境界、commit / push の有無、worktree の状態を報告する。
-公開は各操作の明示指示がある場合だけ行い、公開した場合は関係する remote CI の結果も確認する。
+- Read relevant root/nested owner and dependency instructions once per selected checkout/revision.
+  Resolve actual west imports, local overrides, enabled features and backend; sibling
+  directories/cache names do not identify inputs. Record READ, NO AGENTS or INACCESSIBLE when
+  preflight requires it. Missing inputs block dependent checks; continue independent authorized
+  work.
 
-## Container test execution
+- Keep permanent agent rules in this synchronized EN/JA pair. Usage/API details stay in their
+  existing documentation homes. Do not add agent-guide fragments or private shared-guide
+  dependencies. Remove duplicated rules and obsolete task/branch assumptions without discarding
+  active contracts.
 
-Run automated tests, builds and dependency setup inside Docker. Host entry points
-may launch containers and export results; do not run test runtimes or install test
-packages/toolchains on the host. Owner source may be mounted read-only. Keep
-test-only ZMK/Zephyr/tool checkouts, runtime environments, temporary files, build
-outputs and caches in container images or named volumes. Tests must not require
-host sibling dependency checkouts or private absolute paths.
+## Execution environment
 
-Resolve and verify the selected revisions inside the container. Prepare missing
-dependencies explicitly in an isolated container workspace; do not silently update
-shared caches or pins. Preserve all owner scenarios, assertions and required
-matrices. Hardware acceptance needs documented device access; report unavailable
-container transports as BLOCKED rather than substituting host execution or mocked
-acceptance. Export only reviewed evidence and retain the publication privacy rule.
+- Run local automated test/build runtimes and dependency setup in Docker; a documented DevContainer
+  qualifies. Unless stated otherwise, work from the owner root in its resolved workspace. Launch
+  Docker-wrapper scripts on the host; run their inner Python/Node/compiler entries inside the
+  prepared container without wrapping Docker again. Host source/Git/reference checks and evidence
+  export are allowed; do not install test packages/toolchains on the host. Keep dependencies,
+  runtime/build trees and caches in images or named volumes.
 
-## Fast container test execution
+- Separate preparation and deliberately selected online compatibility checks from ordinary
+  network-free tests. Inspect the available immutable image ID/digest and verified
+  dependency/toolchain revisions; pass the image through the owner's declared image option; honor
+  declared local overrides and record working files. A launcher that installs or fetches
+  dependencies belongs to preparation/online checking, not an offline run. Do not silently pull,
+  advance pins or mutate shared caches, patch dependencies or disable required features to clear a
+  gate. Missing inputs block dependent checks only; documented preparation within an authorized
+  build/setup remains in scope.
 
-Use prepared container environments, persistent caches and bounded parallelism
-to reduce execution time. Preserve every required scenario, assertion, negative
-control, sanitizer, supported-core variant and repeat.
+- Reuse compatible environments/caches, retaining required clean-cache lanes. Provide required
+  inputs, including relevant untracked files, through read-only mounts or isolated container copies;
+  verify source identity before/after. Isolate mutable build/runtime/install trees per job under one
+  CPU/memory budget, including nested workers. Build once per configuration and reuse that exact
+  binary for identical repeats; cached PASS is not a new run. Performance comparisons separate
+  preparation/staging/build/execution/validation and cold/warm conditions. Existing hosted platform
+  jobs retain their own OS requirements.
 
-- Separate environment preparation from test execution. Pin container images by
-  digest and resolve dependency revisions explicitly. Reuse prepared environments
-  only when their image, toolchain, dependency revisions and lockfiles match.
-  Do not fetch or update dependency inputs during an ordinary test run. Missing
-  inputs block only dependent checks.
+## Checks and entry points
 
-- Keep dependency checkouts, installed test environments, temporary files, build
-  directories and caches in container images or named volumes. Prefer Linux
-  filesystem storage for intensive file access. Any staged owner sources must
-  preserve all required test/compiler inputs, including relevant untracked files,
-  with source identity and pre/post-run drift verification.
+- Documentation/instructions only: check LF with the existing checker, run `git diff --check`, and
+  verify changed paths/commands and EN/JA agreement. Without Git history use
+  `git diff --no-index --check` on before/after copies. Firmware
+  suites are not required solely for prose changes.
 
-- Reuse explicitly selected compiler and package caches with their supported
-  identity and concurrency checks. Keep incompatible environments separate.
-  Never share writable build directories or mutable installed dependency trees
-  between independent jobs. Preserve required clean-cache checks; use isolated
-  fresh caches for those checks.
+- For code/helpers/workflows select `bash .github/scripts/test.sh shell`,
+  `bash .github/scripts/test.sh docker`, `bash .github/scripts/test.sh build` or
+  `bash .github/scripts/test.sh all` for the affected boundary. Local shell test runtimes run inside
+  the prepared container. Docker/build/all additionally need the documented Docker-daemon access and
+  daemon-visible source paths; a missing transport is BLOCKED, not a mocked build PASS. Retain the
+  complete affected copy/cache/overlay/parser/infrastructure matrix and each hosted OS job.
 
-- Dispatch each owner's canonical test entries from inside the container.
-  Common orchestration may select, schedule and collect those entries; assertions
-  and fixtures remain in the owning repository. Avoid nested Docker launches and
-  repeated environment preparation for compatible jobs. Isolate each job's
-  environment, working files and outputs.
+- Immediately after a successful run use
+  `bash .github/scripts/check-build-output.sh validate RUN_DIRECTORY` or
+  `bash .github/scripts/check-build-output.sh build RUN_DIRECTORY`. Use the exact new run path; keep
+  raw failures and distinguish local checks from later remote CI.
 
-- Enforce one configurable CPU and memory budget across concurrent suites,
-  targets, compiler jobs and test workers. Account for nested parallelism.
-  Parallelize only independent jobs; preserve required execution and output order.
+## Test quality
 
-- Within a run, build each required binary once per distinct input/configuration
-  variant and reuse that exact binary for required identical-condition repeats,
-  with each repeat's required initial state. Execute every required test; cached
-  artifacts or previous PASS records do not establish a new test execution.
+- Use representative configuration builds as integration samples for maintaining builder quality.
+  Keep the measure tied to supported contracts and normal/boundary/failure/recovery coverage, not
+  a fixed list of example repositories or their success count. Define expected input, image and
+  artifact names independently before execution; verify exact outputs rather than only counts.
+  Retain controls that reject a wrong image, wrong input or renamed firmware with an unchanged
+  artifact count. Put reusable checks in existing owner suites and keep external examples optional;
+  record their source/dependency identities and untested conditions without claiming universal
+  compatibility or absence of defects from a successful sample.
 
-- Keep fresh build and evidence directories. Record actual commands, exits,
-  completion markers, ordered output, source/dependency/image identities and
-  cache configuration. Measure preparation, staging, build, execution and
-  validation separately.
+- Pin maintained external source lists and test-owned moving dependency revisions to verified full
+  commits. Review input/dependency changes and run affected integration checks when advancing pins.
+  Preserve revisions through source selection and worker arguments; failed pin fetch/verification
+  must stop without falling back to a default branch. Keep floating upstream compatibility checks
+  explicitly selected, and distinguish source pins from dependency pins in evidence and reports.
 
-Quick and full retain their existing contracts. Interface/infrastructure changes
-still require the complete owner matrix. Evaluate speed changes using equivalent
-inputs and checks, report cold and warm runs separately, and retain failures.
+- Keep module fixtures, assertions, independent oracles, mutations, selectors and validators in the
+  owner's tests/; retain documented Web and non-module test layouts. CI/package scripts dispatch
+  owner entries, not sibling/private suites or source-rewriting substitutes. Probes expose state,
+  not scenarios. Map implementation families to normal/boundary/invalid, independent-state,
+  ordered-time/output, reset/cancel, failure/recovery and role/protocol cases and explicit gaps.
+
+- A regression needs a failing original or named control. Expected-failure controls qualify only by
+  their specified assertion/rejection; report them separately from product results. Do not weaken
+  assertions, accept unclassified snapshots or count compilation errors as killed runtime faults.
+  Before retiring tests, archive unique original assertions/failures externally with a replacement
+  map. Quick runs every behavioral scenario with sanitizers where supported; full adds the
+  documented ABI, optimization, coverage, kernel and supported-core matrix.
+
+- Use focused checks for local implementation changes and the complete affected owner matrix for
+  interface/test-infrastructure changes. Run unchanged stock ZMK and DYA only where both are
+  supported. DYA-only features are NOT APPLICABLE to stock; disabling them is not compatibility
+  evidence. For test suites, verify the required nonempty case/fixture completions; a zero exit
+  alone, skipped required cases, timeouts or setup errors do not establish PASS.
+
+## Evidence and handoff
+
+- Use fresh evidence paths: resolve parents and reject existing files, directories or symlinks.
+  Record commands/exits, source/dependency/config/backend/image identities and raw ordered
+  output/times, retaining first failures and relevant config/DTS/binaries. Source or dependency
+  drift invalidates affected results; never edit running scripts. Put retained outputs on a mounted
+  named volume or export them before container removal, including failures; a path printed inside a
+  disposable container is not retained evidence.
+
+- Preserve exact fixed-input traces or specification-based timing bounds; totals do not replace
+  per-report order/time. Before calling a mismatch nondeterministic, repeat identical
+  binary/input/seed/backend/initial-flash conditions and PHY where applicable at least three times.
+  Host load alone is not an explanation. Distinguish invalid/stale/incomplete/unavailable
+  observations from valid zero.
+
+- Report PASS, FAIL, BLOCKED, NOT RUN and NOT APPLICABLE distinctly. Local CI, host/native/compile
+  and simulator results do not establish hosted CI, browser or physical
+  HID/BLE/split/electrical/power/reset acceptance. Validate exercised production paths and correlate
+  hardware before simulator-fidelity claims. End-to-end/stability claims need matching
+  installed-image and host observations; quiet logs are not proof.
+
+- Before sharing, review source/comments/guides/examples/logs/media/artifacts/metadata for
+  credentials, personal/host/device IDs, private paths, bonds and individual histories/preferences.
+  Authorized local work may use real values; keep private originals and label sanitized copies. Use
+  clearly synthetic public fixtures/placeholders; preserve public project/API identifiers, licenses
+  and attribution. Keep useful diffs/evidence. Handoff reports behavior, files, actual checks,
+  gaps/risks and version-control/device actions.

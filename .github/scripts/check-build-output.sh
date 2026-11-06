@@ -3,6 +3,15 @@ set -euo pipefail
 
 mode="${1:-}"
 run_dir="${2:-}"
+PUBLIC_REPORT_KINDS=(tests-shell tests-docker tests-build tests-all build validate)
+
+public_report_kind() {
+  local candidate
+  for candidate in "${PUBLIC_REPORT_KINDS[@]}"; do
+    [ "$1" != "${candidate}" ] || return 0
+  done
+  return 1
+}
 
 public_case_label() {
   case "$1" in syntax|lf|whitespace|lf-contract|output-contract|external-contract|host-contract|host-help|container-help|tools|docker-contract|firmware|docker-dependent) return 0 ;; esac
@@ -26,7 +35,7 @@ publish_report() {
   [ ! -L .build ] && [ ! -L "${public_dir}" ] || { echo 'Publication directory must not be a symlink.' >&2; return 1; }
   mkdir -p "${public_dir}" || return 1
   if [ "${kind}" = clear ]; then
-    for file in tests-shell tests-docker tests-build tests-all build validate; do
+    for file in "${PUBLIC_REPORT_KINDS[@]}"; do
       rm -f "${public_dir}/${file}.txt" || return 1
     done
     rm -f .build/ci-source.status .build/ci-source.record || return 1
@@ -34,7 +43,7 @@ publish_report() {
   fi
   if [ "${kind}" = verify ]; then
     local reports=0 header modes outcomes codes notices line report_status report_outcome has_failure
-    for label in tests-shell tests-docker tests-build tests-all build validate; do
+    for label in "${PUBLIC_REPORT_KINDS[@]}"; do
       file="${public_dir}/${label}.txt"
       [ ! -L "${file}" ] || { echo 'Publication report must not be a symlink.' >&2; return 1; }
       [ ! -e "${file}" ] || [ -f "${file}" ] || return 1
@@ -64,7 +73,7 @@ publish_report() {
     [ "${reports}" -gt 0 ] || { echo 'No publication reports were produced.' >&2; return 1; }
     return 0
   fi
-  case "${kind}" in tests-shell|tests-docker|tests-build|tests-all|build|validate) ;; *) echo 'Invalid publication mode.' >&2; return 1 ;; esac
+  public_report_kind "${kind}" || { echo 'Invalid publication mode.' >&2; return 1; }
   case "${status}" in ''|*[!0-9]*) echo 'Invalid publication exit status.' >&2; return 1 ;; esac
   [ "${status}" -le 255 ] || { echo 'Invalid publication exit status.' >&2; return 1; }
   temporary="$(mktemp "${public_dir}/.report.XXXXXX")" || return 1
@@ -93,6 +102,51 @@ publish_report() {
   trap - EXIT
 }
 
+archive_private_evidence() (
+  set -euo pipefail
+  umask 077
+  local root="$1" parent base archive=""
+  # Resolve the existing parent before creating anything; never archive into checkout.
+  root="${root%/}"
+  parent="$(cd "$(dirname "${root}")" && pwd -P)"
+  base="$(basename "${root}")"
+  case "${base}" in ''|.|..) echo 'Invalid private evidence directory.' >&2; exit 1 ;; esac
+  root="${parent}/${base}"
+  case "${root}/" in "${repo_root}/"*) echo 'Private evidence must be outside checkout.' >&2; exit 1 ;; esac
+  [ ! -L "${root}" ] || { echo 'Private evidence root must not be a symlink.' >&2; exit 1; }
+  mkdir -p "${root}"
+  root="$(cd "${root}" && pwd -P)"
+  case "${root}/" in "${repo_root}/"*) echo 'Private evidence must be outside checkout.' >&2; exit 1 ;; esac
+  archive="$(mktemp -d "${root}/execution-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  trap 'status=$?; if [ "$status" != 0 ]; then printf "FAILED\n" > "$archive/archive-status.txt"; fi; exit "$status"' EXIT
+  printf 'INCOMPLETE\n' > "${archive}/archive-status.txt"
+  {
+    printf 'Run: %s\nAttempt: %s\nJob: %s\n' "${GITHUB_RUN_ID:-local}" "${GITHUB_RUN_ATTEMPT:-1}" "${GITHUB_JOB:-local}"
+    printf 'Source revision: '
+    git rev-parse HEAD 2>/dev/null || printf 'unavailable\n'
+  } > "${archive}/context.txt"
+  printf '%s\n' "${archive}" > .build/ci-evidence.record
+  tar cf - .build | (cd "${archive}" && tar xf -)
+  printf 'COMPLETE\n' > "${archive}/archive-status.txt"
+)
+
+if [ "${mode}" = ci-archive ]; then
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+  cd "${repo_root}"
+  [ ! -L .build ] || { echo 'Private evidence source must not be a symlink.' >&2; exit 1; }
+  mkdir -p .build
+  set +e
+  archive_private_evidence "${2:-${repo_root}/../.zmk-build-evidence}" > .build/ci-archive.log 2>&1
+  archive_status=$?
+  set -e
+  if [ "${archive_status}" = 0 ]; then
+    echo 'Private evidence preserved outside checkout.'
+  else
+    echo 'Private evidence preservation failed; detailed diagnostics remain local.' >&2
+  fi
+  exit "${archive_status}"
+fi
+
 if [ "${mode}" = publish ]; then
   publish_report "${2:-}" "${3:-}" "${4:-}"
   exit "$?"
@@ -112,6 +166,7 @@ run_indexed_source() {
 case "${mode}" in
   ci-tests|ci-tools|ci-lf|ci-syntax|ci-source|ci-source-index|ci-matrix|ci-check)
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+    cd "${repo_root}"
     mkdir -p .build
     ci_execution="$(mktemp -d .build/ci-execution.XXXXXX)"
     status=0
@@ -120,7 +175,7 @@ case "${mode}" in
         (
           source_file="$(cat .build/ci-source-file)" || exit 1
           [ -n "${source_file}" ] || exit 1
-          bash "${repo_root}/scripts/auto-build-external.sh" --list-indices-json "${source_file}" \
+          bash "${repo_root}/scripts/auto-build-external.sh" --list-indices-json --sources-file "${source_file}" \
             > "${ci_execution}/matrix.json" || exit "$?"
           matrix="$(cat "${ci_execution}/matrix.json")" || exit 1
           [ "${matrix}" != '{"include":[]}' ] || exit 1
@@ -146,6 +201,7 @@ case "${mode}" in
         printf '1\n' > .build/ci-source.status
         printf '%s\n' "${ci_execution}/command.log" > .build/ci-source.record
         if [ "${mode}" = ci-source-index ]; then
+          # Capture direct-script notices privately; CI publishes only fixed reports.
           GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= run_indexed_source "${1:-}" \
             > "${ci_execution}/command.log" 2>&1 || status=$?
         else
@@ -155,7 +211,7 @@ case "${mode}" in
         printf '%s\n' "${status}" > .build/ci-source.status ;;
       ci-check)
         case "${2:-}" in build|validate) ;; *) echo 'Invalid output mode.' >&2; exit 2 ;; esac
-        bash "${BASH_SOURCE[0]}" "$2" > "${ci_execution}/command.log" 2>&1 || status=$?
+        bash "${repo_root}/.github/scripts/check-build-output.sh" "$2" > "${ci_execution}/command.log" 2>&1 || status=$?
         source_status="$(cat .build/ci-source.status 2>/dev/null || true)"
         [ "${source_status}" = 0 ] || status=1
         publish_report "$2" "${status}" || status=1 ;;
@@ -203,10 +259,22 @@ require_valid_run_dir() {
 case "${mode}" in
   validate|build) ;;
   *)
-    echo "usage: $0 validate|build [run-dir]" >&2
+    echo "usage: $0 validate|build [run-dir] [--expect expectations-file]" >&2
     exit 2
     ;;
 esac
+
+expected_file=""
+if [ "$#" -gt 2 ]; then
+  if [ "$#" != 4 ] || [ "$3" != --expect ] || [ -z "${run_dir}" ]; then
+    echo 'Output expectations require an explicit run directory and --expect file.' >&2
+    exit 2
+  fi
+  expected_file="$4"
+  [ -f "${expected_file}" ] && [ -r "${expected_file}" ] || {
+    echo 'Cannot read output expectations.' >&2; exit 1;
+  }
+fi
 
 if [ -n "${run_dir}" ]; then
   require_valid_run_dir "${run_dir}" "run directory"
@@ -300,3 +368,58 @@ if [ "${mode}" = "build" ]; then
   echo "[output] firmware artifacts: ${firmware_count}"
   printf '%s\n' "${firmware_list}" | sed 's/^/[output] firmware artifact: /'
 fi
+
+check_expected_output() {
+  local key value field actual count name previous file matched
+  local expected_image=0 expected_target=0 expected_cache=0
+  local artifacts=()
+  # NUL-delimited key/value pairs preserve paths and literal shell characters.
+  # The caller supplies the oracle before the run; do not learn it from outputs.
+  while IFS= read -r -d '' key || [ -n "${key}" ]; do
+    if ! IFS= read -r -d '' value; then
+      echo 'Invalid output expectations: incomplete key/value pair.' >&2; return 1
+    fi
+    case "${key}" in
+      image)
+        [ "${expected_image}" = 0 ] || { echo 'Invalid output expectations: duplicate image.' >&2; return 1; }
+        expected_image=1; field='Docker image' ;;
+      target)
+        [ "${expected_target}" = 0 ] || { echo 'Invalid output expectations: duplicate target.' >&2; return 1; }
+        expected_target=1; field=Target ;;
+      cache)
+        [ "${expected_cache}" = 0 ] || { echo 'Invalid output expectations: duplicate cache.' >&2; return 1; }
+        expected_cache=1; field='Docker cache volume' ;;
+      artifact)
+        case "${value}" in
+          ''|.|..|*/*|*\\*|build.log|build-summary.txt)
+            echo 'Invalid output expectations: artifact must be a firmware basename.' >&2; return 1 ;;
+        esac
+        for previous in ${artifacts[@]+"${artifacts[@]}"}; do
+          [ "${previous}" != "${value}" ] || { echo 'Invalid output expectations: duplicate artifact.' >&2; return 1; }
+        done
+        artifacts+=("${value}")
+        continue ;;
+      *) echo 'Invalid output expectations: unknown key.' >&2; return 1 ;;
+    esac
+    [ -n "${value}" ] || { echo 'Invalid output expectations: empty value.' >&2; return 1; }
+    count="$(grep -c "^${field}:" "${build_summary}" || true)"
+    [ "${count}" = 1 ] || { echo "missing or duplicate expected summary field: ${field}" >&2; return 1; }
+    actual="$(sed -n "s/^${field}: //p" "${build_summary}")"
+    [ "${actual}" = "${value}" ] || { echo "expected ${field} does not match summary" >&2; return 1; }
+  done < "${expected_file}"
+  [ "${expected_image}" = 1 ] || { echo 'Invalid output expectations: image is required.' >&2; return 1; }
+  if [ "${mode}" = validate ]; then
+    [ "${#artifacts[@]}" = 0 ] || { echo 'Invalid output expectations: validate has no firmware.' >&2; return 1; }
+    return 0
+  fi
+  [ "${#artifacts[@]}" -gt 0 ] || { echo 'Invalid output expectations: build artifacts are required.' >&2; return 1; }
+  [ "${#artifacts[@]}" = "${built_targets}" ] || { echo 'expected artifact count does not match built target count' >&2; return 1; }
+  while IFS= read -r file || [ -n "${file}" ]; do
+    name="${file##*/}"; matched=0
+    for value in "${artifacts[@]}"; do [ "${name}" != "${value}" ] || matched=1; done
+    [ "${matched}" = 1 ] || { echo 'unexpected firmware name for output expectations' >&2; return 1; }
+    [ -s "${file}" ] || { echo 'empty expected firmware' >&2; return 1; }
+  done <<< "${firmware_list}"
+}
+
+[ -z "${expected_file}" ] || check_expected_output

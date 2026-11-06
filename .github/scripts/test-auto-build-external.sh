@@ -19,13 +19,13 @@ fail() {
 
 assert_contains() {
   local haystack="$1" needle="$2" label="$3"
-  printf '%s\n' "${haystack}" | grep -F "${needle}" >/dev/null ||
+  printf '%s\n' "${haystack}" | grep -F -- "${needle}" >/dev/null ||
     fail "${label}: ${haystack}"
 }
 
 assert_file_contains() {
   local file="$1" needle="$2" label="$3"
-  grep -F "${needle}" "${file}" >/dev/null ||
+  grep -F -- "${needle}" "${file}" >/dev/null ||
     fail "${label}: $(cat "${file}")"
 }
 
@@ -99,6 +99,67 @@ indices="$(bash "${builder}" --list-indices-json "${repos_file}")"
   fail 'public matrix contains something other than numeric indices'
 selected="$(bash "${builder}" --list "${repos_file}" --source-index 0008)"
 [ "${selected}" = "$(printf '%s\n' "${list}" | tail -n 1)" ] || fail 'indexed selection changed a collision-resolved slug'
+for format in --list-json --list-indices-json; do
+  selected="$(bash "${builder}" "${format}" "${repos_file}" --source-index 0008)"
+  assert_contains "${selected}" '"index":8' 'JSON selection renumbered the original source index'
+done
+
+# Pins are list data; changing the default branch must not change selected inputs.
+revision_one=1111111111111111111111111111111111111111
+revision_two=2222222222222222222222222222222222222222
+pinned_file="${tmp_dir}/pinned sources.txt"
+printf '%s %s\n%s\t%s\npath:local source with spaces\n' \
+  https://example.invalid/config.git "${revision_one}" \
+  repo:https://example.invalid/config.git "${revision_two}" > "${pinned_file}"
+pinned="$(bash "${builder}" --list-json "${pinned_file}")"
+assert_contains "${pinned}" '"source":"https://example.invalid/config.git","revision":"'"${revision_one}"'"' 'space-separated revision was lost'
+assert_contains "${pinned}" '"slug":"config-2"' 'revision changed slug collision handling'
+assert_contains "${pinned}" '"revision":"'"${revision_two}"'"' 'TAB-separated revision was lost'
+assert_contains "${pinned}" 'local source with spaces","revision":""' 'local path was split as a repository pin'
+selected="$(bash "${builder}" --list-json "${pinned_file}" --source-index 2)"
+assert_contains "${selected}" '"index":2' 'pinned selection changed the original index'
+assert_contains "${selected}" '"revision":"'"${revision_two}"'"' 'indexed selection lost its revision'
+case "${selected}" in *"${revision_one}"*) fail 'indexed selection retained the wrong revision' ;; esac
+selected="$(bash "${builder}" --list-json --repo https://example.invalid/config.git --revision "${revision_one}")"
+assert_contains "${selected}" '"revision":"'"${revision_one}"'"' 'explicit revision was lost'
+for bad_revision in main v1.0 short 000000000000000000000000000000000000000G; do
+  printf 'https://example.invalid/config.git %s\n' "${bad_revision}" > "${tmp_dir}/bad-pin.txt"
+  if bash "${builder}" --list "${tmp_dir}/bad-pin.txt" >"${tmp_dir}/bad-pin.out" 2>&1; then fail 'mutable or malformed revision was accepted'; fi
+  assert_file_contains "${tmp_dir}/bad-pin.out" 'full 40-character' 'revision rejection did not reach its validator'
+done
+if bash "${builder}" --list --path "${local_one}" --revision "${revision_one}" >"${tmp_dir}/bad-pin.out" 2>&1; then fail 'revision was accepted for a local path'; fi
+assert_file_contains "${tmp_dir}/bad-pin.out" '--revision must follow --repo' 'local-path revision guard was not reached'
+
+pin_probe="${tmp_dir}/pin-probe.sh"
+printf '#!/usr/bin/env bash\nprintf '\''%%s\\0'\'' "$@" > "$PIN_ARGV"\n' > "${pin_probe}"
+PIN_ARGV="${tmp_dir}/pinned.argv" ZMK_EXTERNAL_SOURCE_BUILDER="${pin_probe}" \
+  bash "${builder}" --sources-file "${pinned_file}" --source-index 2 --mode validate > "${tmp_dir}/pin-probe.out"
+printf '%s\0' --repo https://example.invalid/config.git --revision "${revision_two}" \
+  --source-slug config-2 --mode validate --jobs 1 > "${tmp_dir}/expected-pinned.argv"
+cmp "${tmp_dir}/expected-pinned.argv" "${tmp_dir}/pinned.argv" || fail 'worker did not receive the selected revision'
+
+# Every repository in the maintained default list needs a pin, independent of its size.
+default_list="$(bash "${builder}" --list "${repo_root}/repos.txt")"
+printf '%s\n' "${default_list}" | awk -F '\t' '
+  $3 == "repo" { count++; if (length($5) != 40 || $5 ~ /[^0-9a-f]/) exit 1 }
+  END { if (!count) exit 1 }
+' || fail 'default external repository list contains missing or malformed pins'
+for bad_revision in main short 000000000000000000000000000000000000000G; do
+  if bash "${source_builder}" --repo https://example.invalid/config.git --revision "${bad_revision}" >"${tmp_dir}/bad-worker-pin.out" 2>&1; then
+    fail 'worker accepted a mutable or malformed revision'
+  fi
+  assert_file_contains "${tmp_dir}/bad-worker-pin.out" 'full 40-character' 'worker pin guard was not reached before Docker'
+done
+if bash "${source_builder}" --path "${local_one}" --revision "${revision_one}" >"${tmp_dir}/bad-worker-pin.out" 2>&1; then fail 'worker accepted a local-path revision'; fi
+assert_file_contains "${tmp_dir}/bad-worker-pin.out" '--revision requires a repository source' 'worker local-path pin guard was not reached'
+# Every JSON control byte must be escaped, including legal bytes inside Unix paths.
+for number in $(seq 1 31); do
+  printf -v octal '%03o' "${number}"
+  printf -v character '%b' "\\${octal}"
+  value="synthetic${character}path"
+  json="$(bash "${builder}" --list-json --path "${value}")"
+  case "${json}" in *"${character}"*) fail 'JSON output contains an unescaped control byte' ;; esac
+done
 for invalid in '' 0 00 9 bad -1; do
   if bash "${builder}" --list "${repos_file}" --source-index "${invalid}" >/dev/null 2>&1; then
     fail 'invalid source index was accepted'
@@ -206,7 +267,7 @@ done
 printf 'start %s\n' "${slug}" >> "${FAKE_LOG}"
 case "${slug}" in
   slow) sleep 2 ;;
-  killed) kill -KILL "${PPID}"; exit 0 ;;
+  killed) kill -KILL "$$"; exit 0 ;;
   failed) exit 7 ;;
 esac
 printf 'end %s\n' "${slug}" >> "${FAKE_LOG}"
@@ -256,6 +317,51 @@ assert_file_contains "${tmp_dir}/killed.out" 'killed: failure' 'killed source wa
 assert_file_contains "${tmp_dir}/killed.out" 'failed: failure' 'ordinary child failure was not preserved'
 assert_file_contains "${tmp_dir}/killed.out" 'after-kill: success' 'queue did not continue after worker death'
 assert_file_contains "${tmp_dir}/killed.out" '=== Done: 2 failure(s) ===' 'worker failure total was incorrect'
+
+# Exercise process-group cancellation in the native Linux/macOS/Git Bash matrix.
+cancel_root="${tmp_dir}/cancellation"
+mkdir "${cancel_root}"
+cat > "${cancel_root}/worker.sh" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+slug=
+child=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --source-slug ]; then slug="$2"; shift; fi
+  shift
+done
+stop() {
+  trap '' INT TERM
+  [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true
+  [ -z "$child" ] || wait "$child" 2>/dev/null || true
+  : > "${CANCEL_ROOT}/${slug}.stopped"
+  exit 143
+}
+trap stop TERM
+sleep 30 &
+child=$!
+: > "${CANCEL_ROOT}/${slug}.started"
+wait "$child"
+EOF
+CANCEL_ROOT="${cancel_root}" ZMK_EXTERNAL_SOURCE_BUILDER="${cancel_root}/worker.sh" \
+  bash "${builder}" --path "${local_one}" --source-slug first \
+    --path "${local_two}" --source-slug second --path "${local_three}" --source-slug pending \
+    --source-jobs 2 >"${cancel_root}/console" 2>&1 &
+coordinator=$!
+(sleep 30; kill -KILL "${coordinator}" 2>/dev/null || true) &
+cancel_timer=$!
+for attempt in $(seq 1 100); do
+  [ ! -f "${cancel_root}/first.started" ] || [ ! -f "${cancel_root}/second.started" ] || break
+  sleep .05
+done
+kill -TERM "${coordinator}"
+if wait "${coordinator}"; then cancel_status=0; else cancel_status=$?; fi
+kill "${cancel_timer}" 2>/dev/null || true
+wait "${cancel_timer}" 2>/dev/null || true
+[ "${cancel_status}" = 143 ] || fail "coordinator cancellation returned ${cancel_status}"
+[ -f "${cancel_root}/first.stopped" ] && [ -f "${cancel_root}/second.stopped" ] || \
+  fail 'coordinator returned before active workers stopped'
+[ ! -f "${cancel_root}/pending.started" ] || fail 'cancellation started a pending source'
 
 # Clone setup must never remove a pre-existing name after create fails. Later failures
 # must remove only containers created by this process, including each failed retry.

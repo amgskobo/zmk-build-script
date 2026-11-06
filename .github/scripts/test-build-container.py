@@ -138,30 +138,152 @@ class ContainerContracts(unittest.TestCase):
         for step in steps:
             for mode in ('build', 'validate'):
                 for pristine in ('true', 'false'):
-                    for kind in ('repo', 'path'):
+                    for kind in ('repo', 'pinned-repo', 'path'):
                         with self.subTest(step=step['name'], mode=mode,
                                           pristine=pristine, kind=kind):
-                            source = ('https://example.invalid/config.git' if kind == 'repo'
+                            source_type = 'repo' if kind == 'pinned-repo' else kind
+                            revision = '1' * 40 if kind == 'pinned-repo' else ''
+                            source = ('https://example.invalid/config.git' if source_type == 'repo'
                                       else str(self.root / 'source with spaces'))
                             env = dict(os.environ, EXTERNAL_MODE=mode, EXTERNAL_BUILD_JOBS='2',
                                        EXTERNAL_PRISTINE=pristine, SOURCE_INDEX='0002',
                                        WORKFLOW_ARGV=str(self.root / 'workflow.argv'))
                             sources = self.root / 'sources.txt'
-                            sources.write_text('repo:https://example.invalid/unselected.git\n' + kind + ':' + source + '\n')
+                            sources.write_text('repo:https://example.invalid/unselected.git\n' + source_type + ':' + source +
+                                               (' ' + revision if revision else '') + '\n')
                             (self.root / '.build/ci-source-file').write_text(str(sources))
                             result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
                                                     cwd=self.root, env=env, capture_output=True)
                             self.assertEqual(result.returncode, 0, result.stderr.decode())
                             record = (self.root / '.build/ci-source.record').read_text().strip()
                             actual = (self.root / 'workflow.argv').read_bytes().decode().rstrip('\0').split('\0')
-                            expected = ['--' + kind, source, '--source-slug',
-                                        'config' if kind == 'repo' else 'source-with-spaces',
-                                        '--mode', mode, '--jobs', '2']
+                            expected = ['--' + source_type, source]
+                            if revision:
+                                expected += ['--revision', revision]
+                            expected += ['--source-slug',
+                                         'config' if source_type == 'repo' else 'source-with-spaces',
+                                         '--mode', mode, '--jobs', '2']
                             if pristine == 'true':
                                 expected.append('--pristine')
                             self.assertEqual(actual, expected)
                             self.assertNotIn('unselected.git', (self.root / record).read_text())
                             self.assertNotIn(source, result.stdout.decode())
+
+    def test_external_clone_pins_commit_after_default_branch_advances(self):
+        # Run the production clone command with real Git. Only Docker transport is local.
+        source_tree = pathlib.Path('/tmp/source')
+        self.assertFalse(source_tree.exists(), 'clone transport needs an unowned path to be absent')
+        self.addCleanup(lambda: shutil.rmtree(source_tree) if source_tree.exists() else None)
+        repository = self.root / 'upstream'
+        repository.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(repository), *args], text=True).strip()
+        git('init', '-q')
+        marker = repository / 'marker.txt'
+        revisions = []
+        for value in ('original', 'advanced'):
+            marker.write_text(value)
+            git('add', 'marker.txt')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                'commit', '-qm', value)
+            revisions.append(git('rev-parse', 'HEAD'))
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, shutil, subprocess, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ['CLONE_TRANSPORT'])
+with (root / 'calls.jsonl').open('a') as out: out.write(json.dumps(args) + '\\n')
+if args[0] == 'create':
+    (root / 'command.json').write_text(json.dumps(args[args.index('/bin/bash'):]))
+    print('a' * 64)
+elif args[0] == 'start':
+    sys.exit(subprocess.call(json.loads((root / 'command.json').read_text())))
+elif args[0] == 'cp':
+    shutil.copytree('/tmp/source', args[-1], dirs_exist_ok=True)
+elif args[0] == 'rm':
+    if pathlib.Path('/tmp/source').exists(): shutil.rmtree('/tmp/source')
+else: sys.exit(99)
+''')
+        docker.chmod(0o755)
+        work = self.root / 'clones'
+        work.mkdir()
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   CLONE_TRANSPORT=str(self.root), ZMK_EXTERNAL_CLONE_ATTEMPTS='2')
+        for requested, expected in ((revisions[0], 'original'), ('', 'advanced'), ('0' * 40, None)):
+            with self.subTest(requested=requested):
+                (self.root / 'calls.jsonl').write_text('')
+                result = subprocess.run(['bash', '-c',
+                    'source /tmp/build-external-source.sh; WORK_DIR="$1"; SOURCE_REVISION="$2"; '
+                    'clone_repo_with_docker "$3" fixture "$1/checkout"',
+                    '_', str(work), requested, repository.as_uri()], env=env, text=True, capture_output=True)
+                output = result.stdout + result.stderr
+                print(output, end='')
+                calls = [json.loads(row) for row in (self.root / 'calls.jsonl').read_text().splitlines()]
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertFalse((work / 'checkout').exists())
+                    self.assertEqual([args[0] for args in calls], ['create', 'start', 'rm'] * 2)
+                    self.assertNotIn('Source revision:', output)
+                else:
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertEqual((work / 'checkout/marker.txt').read_text(), expected)
+                    actual = subprocess.check_output(['git', '-C', str(work / 'checkout'),
+                                                       'rev-parse', 'HEAD'], text=True).strip()
+                    self.assertEqual(actual, requested or revisions[1])
+                    self.assertIn('Source revision: ' + actual, output)
+                    self.assertEqual([args[0] for args in calls], ['create', 'start', 'cp', 'rm'])
+                self.assertFalse(source_tree.exists(), 'clone cleanup left its owned tree behind')
+
+    def test_container_build_log_capture_waits_and_requires_completion(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+counter = pathlib.Path(os.environ['LOG_READ_COUNT'])
+count = int(counter.read_text()) + 1
+counter.write_text(str(count))
+assert sys.argv[1:] == ['logs', 'a' * 64]
+print('compile output', count)
+if os.environ['LOG_MODE'] == 'read-failure': sys.exit(23)
+if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 target(s).')
+''')
+        docker.chmod(0o755)
+        sleep = binary / 'sleep'
+        sleep.write_text('#!/bin/sh\n[ "$1" = 1 ]\n')
+        sleep.chmod(0o755)
+        counter = self.root / 'reads'
+        output = self.root / 'stream.log'
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   LOG_READ_COUNT=str(counter), LOG_MODE='delayed')
+        counter.write_text('0')
+        # Named control: the old single read rejects the deliberately delayed marker.
+        control = subprocess.run(['bash', '-c',
+            'docker logs "$1" > "$2"; grep -F "Build complete: 2 target(s)." "$2"',
+            '_', 'a' * 64, str(output)], env=env, capture_output=True)
+        self.assertEqual(control.returncode, 1)
+        self.assertEqual(counter.read_text(), '1')
+        self.assertEqual(output.read_text(), 'compile output 1\n')
+        for mode, reads, message in (
+                ('delayed', '3', 'Build complete: 2 target(s).'),
+                ('never', '10', 'Timed out waiting for the container build log completion marker.'),
+                ('read-failure', '1', 'Failed to read the container build log.')):
+            with self.subTest(mode=mode):
+                counter.write_text('0')
+                env['LOG_MODE'] = mode
+                destination = self.root / (mode + '.log')
+                result = subprocess.run(['bash', '-c',
+                    'source /tmp/test-build-fixtures.sh; capture_container_build_stream "$1" "$2" "$3"',
+                    '_', 'a' * 64, str(destination), 'Build complete: 2 target(s).'],
+                    env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0 if mode == 'delayed' else 1, result.stderr)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertEqual(counter.read_text(), reads)
+                snapshots = list(self.root.glob(mode + '.log.attempt-*'))
+                self.assertEqual(len(snapshots), int(reads))
+                self.assertEqual(destination.read_bytes(), (self.root / (mode + '.log.attempt-' + reads)).read_bytes())
 
     def test_workflows_publish_only_fixed_reports(self):
         root = pathlib.Path('/tmp/workflows')
@@ -176,6 +298,11 @@ class ContainerContracts(unittest.TestCase):
             document = yaml.load(source, Loader=yaml.BaseLoader)
             for job in document['jobs'].values():
                 self.assertNotIn('inputs.', job.get('name', ''))
+                steps = job.get('steps', [])
+                if any('check-build-output.sh ci-' in s.get('run', '') for s in steps):
+                    archives = [s for s in steps if 'check-build-output.sh ci-archive' in s.get('run', '')]
+                    self.assertTrue(archives, path)
+                    self.assertTrue(all('always()' in s['if'] for s in archives))
                 for step in job.get('steps', []):
                     if step.get('name', '').startswith('Show selected runner'):
                         self.assertNotIn('${EXTERNAL_', step['run'])
@@ -189,6 +316,282 @@ class ContainerContracts(unittest.TestCase):
                         self.assertIn('publication-check', step['if'])
         self.assertEqual(uploads, 6)
 
+    def make_image_selection_daemon(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
+args = sys.argv[1:]
+calls = pathlib.Path(os.environ["IMAGE_CALLS"])
+with calls.open("a") as out: out.write(json.dumps(args) + "\\n")
+if args[0] == "create":
+    count = sum(json.loads(row)[0] == "create" for row in calls.read_text().splitlines())
+    print(chr(96 + count) * 64)
+elif args[0] == "exec":
+    if "python3" in args:
+        sys.exit(subprocess.call(args[args.index("python3"):]))
+    if any("./build.sh validate" in arg for arg in args): print("build.yaml is valid.")
+    else: sys.stdin.buffer.read()
+elif args[0] == "rm":
+    if os.environ.get("IMAGE_REMOVE_FAIL"): sys.exit(23)
+    if os.environ.get("IMAGE_REMOVE_GATE"):
+        pathlib.Path(os.environ["IMAGE_REMOVE_GATE"]).touch()
+        while not pathlib.Path(os.environ["IMAGE_REMOVE_RELEASE"]).exists(): time.sleep(.01)
+elif args[0] != "start": sys.exit(99)
+''')
+        docker.chmod(0o755)
+        return binary
+
+    def test_auto_image_selection_uses_west_manifest_structure(self):
+        binary = self.make_image_selection_daemon()
+        documents = [
+            ('name-first', 'manifest:\n  projects:\n    - name: zmk\n      url: https://example.invalid/zmk\n      revision: v0.3-branch+dya\n', '3.5-branch'),
+            ('name-second', 'manifest:\n  projects:\n    - url: https://example.invalid/zmk\n      name: zmk\n      revision: v0.3-branch+dya\n', '3.5-branch'),
+            ('inline', 'manifest: {projects: [{url: https://example.invalid/zmk, revision: "v4.1.0-rc1", name: zmk}]}\n', '4.1-branch'),
+            ('defaults', 'manifest: {defaults: {revision: v0.3.9}, projects: [{url: https://example.invalid/zmk, name: zmk}]}\n', '3.5-branch'),
+            ('quoted', '"manifest": {"projects": [{"name": zmk, "url": https://example.invalid/zmk, "revision": main}]}\n', 'stable'),
+            ('standalone', 'manifest: {projects: []}\n', 'stable'),
+        ]
+        from west.manifest import ImportFlag, Manifest
+        for name, document, tag in documents:
+            with self.subTest(name=name):
+                # Validate the input independently of the builder's shell transport.
+                Manifest.from_data(yaml.safe_load(document), import_flags=ImportFlag.IGNORE)
+                case = self.root / name
+                (case / 'config').mkdir(parents=True)
+                (case / 'config/west.yml').write_text(document)
+                (case / 'build.yaml').write_text('board: A\n')
+                calls = case / 'calls'
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE_TAG='auto',
+                           ZMK_BUILD_IMAGE_REPOSITORY='synthetic/build', ZMK_KEEP_CONTAINER='0',
+                           IMAGE_CALLS=str(calls))
+                env.pop('ZMK_BUILD_IMAGE', None)
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(case)], env=env,
+                                           text=True, capture_output=True, timeout=15)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                images = [row[-4] for row in commands if row[0] == 'create']
+                self.assertEqual(images[-1], 'synthetic/build:' + tag)
+                created = [chr(97 + i) * 64 for i in range(len(images))]
+                removed = [row[-1] for row in commands if row[0] == 'rm']
+                self.assertEqual(removed, created)
+
+    def test_auto_image_selection_failure_stops_before_copy_or_replacement(self):
+        binary = self.make_image_selection_daemon()
+        for name, document, extra, reason in (
+            ('invalid', 'manifest: {projects: false}\n', {}, 'manifest image selection failed'),
+            ('cleanup', 'manifest: {projects: [{name: zmk, url: https://example.invalid/zmk, revision: v0.3}]}\n',
+             {'IMAGE_REMOVE_FAIL': '1'}, 'image selection container cleanup failed'),
+        ):
+            with self.subTest(name=name):
+                case = self.root / name
+                (case / 'config').mkdir(parents=True)
+                (case / 'config/west.yml').write_text(document)
+                (case / 'build.yaml').write_text('board: A\n')
+                calls = case / 'calls'
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE_TAG='auto', IMAGE_CALLS=str(calls),
+                           ZMK_KEEP_CONTAINER='1', **extra)
+                env.pop('ZMK_BUILD_IMAGE', None)
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(case)], env=env,
+                                           text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(completed.returncode, 0)
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                self.assertEqual(sum(row[0] == 'create' for row in commands), 1)
+                self.assertFalse(any('tar' in row or any('./build.sh validate' in arg for arg in row)
+                                     for row in commands))
+                summaries = [p for p in (BUILD.parent / '.build').glob('*/build-summary.txt')
+                             if 'Target: ' + str(case) + '\n' in p.read_text()]
+                self.assertEqual(len(summaries), 1)
+                self.assertIn('Status: FAILED', summaries[0].read_text())
+                self.assertIn('Reason: ' + reason, summaries[0].read_text())
+
+    def test_auto_image_override_skips_manifest_inspection(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for name, override, tag, expected in (
+            ('full', 'synthetic/build@sha256:' + 'd' * 64, 'auto', 'synthetic/build@sha256:' + 'd' * 64),
+            ('tag', '', '3.5-branch', 'synthetic/build:3.5-branch'),
+        ):
+            with self.subTest(name=name):
+                calls = self.root / (name + '.calls')
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE=override, ZMK_BUILD_IMAGE_TAG=tag,
+                           ZMK_BUILD_IMAGE_REPOSITORY='synthetic/build', ZMK_KEEP_CONTAINER='0',
+                           IMAGE_CALLS=str(calls))
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                           text=True, capture_output=True, timeout=10)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                self.assertEqual([row[-4] for row in commands if row[0] == 'create'], [expected])
+                self.assertFalse(any('python3' in row for row in commands))
+
+    def test_auto_image_switch_cancellation_finishes_bootstrap_cleanup(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'config/west.yml').write_text(
+            'manifest: {projects: [{name: zmk, url: https://example.invalid/zmk, revision: v0.3}]}\n')
+        (self.root / 'build.yaml').write_text('board: A\n')
+        calls, gate, release = (self.root / name for name in ('calls', 'gate', 'release'))
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE_TAG='auto', ZMK_KEEP_CONTAINER='1',
+                   IMAGE_CALLS=str(calls), IMAGE_REMOVE_GATE=str(gate), IMAGE_REMOVE_RELEASE=str(release))
+        env.pop('ZMK_BUILD_IMAGE', None)
+        process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                   start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not gate.exists() and time.monotonic() < deadline:
+                self.assertIsNone(process.poll())
+                time.sleep(.01)
+            self.assertTrue(gate.exists())
+            os.killpg(process.pid, signal.SIGTERM)
+            release.touch()
+            output, _ = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 143, output)
+            commands = [json.loads(row) for row in calls.read_text().splitlines()]
+            self.assertEqual(sum(row[0] == 'create' for row in commands), 1)
+            self.assertEqual([row for row in commands if row[0] == 'rm'], [['rm', '-f', 'a' * 64]])
+            summary = next((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid)).read_text()
+            self.assertIn('Status: FAILED', summary)
+            self.assertIn('Reason: interrupted by SIGTERM', summary)
+        finally:
+            release.touch()
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            if process.poll() is None: process.wait(timeout=5)
+
+    def external_cancellation_fixture(self, name):
+        case = self.root / name
+        (case / 'scripts').mkdir(parents=True)
+        for script in ('auto-build-external.sh', 'build-external-source.sh', 'source-common.sh'):
+            shutil.copyfile('/tmp/' + script, case / 'scripts' / script)
+        builder = case / 'build.sh'
+        builder.write_text('''#!/usr/bin/env bash
+set -eu
+target="$1"
+child=""
+finish() {
+    trap '' INT TERM
+    [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true
+    [ -z "$child" ] || wait "$child" 2>/dev/null || true
+    : > "$target/cleanup-complete"
+    exit 143
+}
+trap finish TERM
+printf '%s\\n' "$$" > "$target/builder.pid"
+sleep 30 &
+child=$!
+: > "$target/started"
+wait "$child"
+''')
+        builder.chmod(0o755)
+        for number in range(3):
+            (case / str(number)).mkdir()
+        return case
+
+    def test_external_queue_cancellation_stops_active_workers_before_return(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signum):
+                case = self.external_cancellation_fixture('queue-' + str(signum))
+                args = ['bash', str(case / 'scripts/auto-build-external.sh'), '--source-jobs', '2']
+                for number in range(3): args.extend(['--path', str(case / str(number))])
+                with (case / 'console').open('w') as output:
+                    process = subprocess.Popen(args, start_new_session=True, stdout=output, stderr=output)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not all((case / str(i) / 'started').exists() for i in range(2)) and time.monotonic() < deadline:
+                            self.assertIsNone(process.poll())
+                            time.sleep(.01)
+                        self.assertTrue(all((case / str(i) / 'started').exists() for i in range(2)))
+                        process.send_signal(signum)
+                        self.assertEqual(process.wait(timeout=5), 128 + signum, (case / 'console').read_text())
+                        for number in range(2):
+                            self.assertTrue((case / str(number) / 'cleanup-complete').exists(), (case / 'console').read_text())
+                        self.assertFalse((case / '2/started').exists())
+                    finally:
+                        for pid in case.glob('*/builder.pid'):
+                            try: os.kill(int(pid.read_text()), signal.SIGTERM)
+                            except ProcessLookupError: pass
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        if process.poll() is None: process.wait(timeout=5)
+
+    def test_external_source_cancellation_waits_for_builder_cleanup(self):
+        case = self.external_cancellation_fixture('single-source')
+        with (case / 'console').open('w') as output:
+            process = subprocess.Popen(['bash', str(case / 'scripts/build-external-source.sh'),
+                                        '--path', str(case / '0')], start_new_session=True,
+                                       stdout=output, stderr=output)
+            try:
+                deadline = time.monotonic() + 5
+                while not (case / '0/started').exists() and time.monotonic() < deadline:
+                    self.assertIsNone(process.poll())
+                    time.sleep(.01)
+                self.assertTrue((case / '0/started').exists())
+                process.terminate()
+                self.assertEqual(process.wait(timeout=5), 143, (case / 'console').read_text())
+                self.assertTrue((case / '0/cleanup-complete').exists())
+                self.assertTrue((case / '0').is_dir())
+            finally:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                if process.poll() is None: process.wait(timeout=5)
+
+    def test_external_clone_cancellation_acquires_and_removes_created_identity(self):
+        case = self.external_cancellation_fixture('clone-cancel')
+        binary = case / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, signal, sys, time
+root = pathlib.Path(os.environ["CLONE_CANCEL_CASE"])
+with (root / "calls").open("a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1] == "create":
+    # Keep creation pending, but expose the actual cancellation delivery.
+    signal.signal(signal.SIGTERM, lambda *_: (root / "signal-received").touch())
+    (root / "group").write_text(str(os.getpgrp()))
+    (root / "reached").touch()
+    while not (root / "release").exists(): time.sleep(.01)
+    print("c" * 64)
+elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
+''')
+        docker.chmod(0o755)
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   CLONE_CANCEL_CASE=str(case))
+        with (case / 'console').open('w') as output:
+            process = subprocess.Popen(['bash', str(case / 'scripts/auto-build-external.sh'),
+                                        '--repo', 'https://example.invalid/config.git'],
+                                       env=env, start_new_session=True, stdout=output, stderr=output)
+            try:
+                deadline = time.monotonic() + 5
+                while not (case / 'reached').exists() and time.monotonic() < deadline:
+                    self.assertIsNone(process.poll())
+                    time.sleep(.01)
+                self.assertTrue((case / 'reached').exists())
+                process.terminate()
+                deadline = time.monotonic() + 5
+                while not (case / 'signal-received').exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue((case / 'signal-received').exists(), (case / 'console').read_text())
+                (case / 'release').touch()
+                self.assertEqual(process.wait(timeout=5), 143, (case / 'console').read_text())
+                calls = [json.loads(row) for row in (case / 'calls').read_text().splitlines()]
+                self.assertEqual(sum(row[0] == 'create' for row in calls), 1, calls)
+                self.assertEqual([row for row in calls if row[0] == 'rm'], [['rm', '-f', 'c' * 64]])
+                self.assertFalse(any(row[0] in ('start', 'cp') for row in calls))
+                self.assertFalse(any((case / '.build/external').iterdir()))
+            finally:
+                (case / 'release').touch()
+                group = case / 'group'
+                if group.exists():
+                    try: os.killpg(int(group.read_text()), signal.SIGKILL)
+                    except ProcessLookupError: pass
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                if process.poll() is None: process.wait(timeout=5)
+
     def test_external_workflow_keeps_source_values_out_of_runner_details(self):
         workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
         for job in workflow['jobs'].values():
@@ -199,6 +602,15 @@ class ContainerContracts(unittest.TestCase):
                     self.assertNotIn('inputs.source_file', value)
         resolver = workflow['jobs']['sources']['steps']
         self.assertTrue(any('ci-matrix' in step.get('run', '') for step in resolver))
+
+    def test_external_json_round_trips_all_shell_representable_control_bytes(self):
+        for number in range(1, 32):
+            with self.subTest(number=number):
+                value = '/synthetic/control' + chr(number) + 'path'
+                result = subprocess.run(['bash', '/tmp/auto-build-external.sh', '--list-json', '--path', value],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)['include'][0]['source'], value)
 
     def test_normal_defaults_aliases_and_order(self):
         self.expect_targets({'defaults': {'cmake-args': '-DDEFAULT=1'}, 'include': [
@@ -313,6 +725,36 @@ class ContainerContracts(unittest.TestCase):
         for name in ('alpha beta', 'beta'):
             (self.modules / name).mkdir()
         self.expect_targets({'board': 'A'}, [target('A-zmk')])
+
+    def test_module_build_paths_require_strings_before_workspace_changes(self):
+        for key in ('cmake', 'kconfig'):
+            for value in (True, 17, ['.'], {'path': '.'}):
+                with self.subTest(key=key, value=value):
+                    case = self.make_workspace(prior_overlay=False)
+                    module = case.inputs / 'typed-module'
+                    (module / 'zephyr').mkdir(parents=True)
+                    (module / 'CMakeLists.txt').touch()
+                    (module / 'Kconfig').touch()
+                    declaration = {'cmake': '.', 'kconfig': 'Kconfig'}
+                    declaration[key] = value
+                    (module / 'zephyr/module.yml').write_text(yaml.safe_dump({'build': declaration}))
+                    result = subprocess.run(['bash', str(BUILD), 'validate'], env=case.env,
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('build.' + key + ' must be a string', result.stderr)
+                    result, output = self.run_workspace(case)
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertEqual(case.commands.read_text(), '', output)
+                    self.assertFalse((case.source / 'zephyr').exists())
+
+    def test_target_build_paths_are_not_replaced_when_their_type_is_invalid(self):
+        (self.root / 'CMakeLists.txt').touch()
+        for value in (False, 0, ['.'], {'path': '.'}):
+            with self.subTest(value=value):
+                (self.root / 'module.yml').write_text(yaml.safe_dump({'build': {'cmake': value}}))
+                metadata = self.root / 'zephyr/module.yml'
+                if metadata.exists(): metadata.unlink()
+                self.expect_error({'board': 'A'}, 'build.cmake must be a string')
 
     def test_distinct_extra_module_names_reach_west(self):
         case = self.make_workspace(prior_overlay=False)
@@ -590,6 +1032,7 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             self.assertTrue((case / 'reached').exists())
                             os.killpg(process.pid, signum)
                             time.sleep(.05)
+                            os.killpg(process.pid, signum)
                             (case / 'release').touch()
                             output, _ = process.communicate(timeout=5)
                             self.assertEqual(process.returncode, 128 + signum, output)
@@ -606,6 +1049,159 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             try: os.killpg(process.pid, signal.SIGKILL)
                             except ProcessLookupError: pass
                             if process.poll() is None: process.wait(timeout=3)
+
+    def test_finalization_group_signals_complete_cleanup_and_publish_final_status(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys, time
+if sys.argv[1] == 'create': print('a' * 64)
+elif sys.argv[1] == 'start': sys.exit(int(os.environ['FINAL_INITIAL_STATUS']))
+elif sys.argv[1] == 'exec':
+    if 'mkdir -p /root/zmk-config' in ' '.join(sys.argv): pass
+    elif './build.sh validate' in ' '.join(sys.argv): print('build.yaml is valid.')
+    else: sys.stdin.buffer.read()
+elif sys.argv[1] == 'rm':
+    pathlib.Path(os.environ['FINAL_REACHED']).touch()
+    while not pathlib.Path(os.environ['FINAL_RELEASE']).exists(): time.sleep(.01)
+    pathlib.Path(os.environ['FINAL_COMPLETE']).touch()
+else: sys.exit(99)
+''')
+        docker.chmod(0o755)
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for initial in (0, 23):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(initial=initial, signal=signum):
+                    folder = self.root / ('finish-%s-%s' % (initial, signum))
+                    folder.mkdir()
+                    env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                               PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                               FINAL_INITIAL_STATUS=str(initial), FINAL_REACHED=str(folder / 'reached'),
+                               FINAL_RELEASE=str(folder / 'release'), FINAL_COMPLETE=str(folder / 'complete'))
+                    process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                               start_new_session=True, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not (folder / 'reached').exists() and time.monotonic() < deadline:
+                            self.assertIsNone(process.poll())
+                            time.sleep(.01)
+                        self.assertTrue((folder / 'reached').exists())
+                        os.killpg(process.pid, signum)
+                        time.sleep(.05)
+                        (folder / 'release').touch()
+                        output, _ = process.communicate(timeout=5)
+                        self.assertTrue((folder / 'complete').exists(), output)
+                        self.assertEqual(process.returncode, initial or 128 + signum, output)
+                        summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
+                        self.assertEqual(len(summaries), 1)
+                        summary = summaries[0].read_text()
+                        self.assertIn('Status: FAILED', summary)
+                        reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
+                        self.assertIn('Reason: ' + reason, summary)
+                    finally:
+                        (folder / 'release').touch()
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        if process.poll() is None: process.wait(timeout=3)
+
+    def test_finalization_entry_signals_preserve_cleanup_and_the_original_failure(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'docker').write_text('''#!/usr/bin/env bash
+case "$1" in
+  create) printf '%064d\\n' 0 ;;
+  start) exit "${ENTRY_INITIAL_STATUS}" ;;
+  exec)
+    case "$*" in
+      *'mkdir -p /root/zmk-config'*) ;;
+      *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
+      *) cat >/dev/null ;;
+    esac ;;
+  rm) : > "${ENTRY_CLEANED}" ;;
+  *) exit 99 ;;
+esac
+''')
+        (binary / 'docker').chmod(0o755)
+        hook = self.root / 'entry-hook.sh'
+        hook.write_text('''set -T
+trap 'if [ "${FUNCNAME[0]:-}" = finish_run ]; then trap - DEBUG; : > "$ENTRY_REACHED"; kill -s "$ENTRY_SIGNAL" "$$"; fi' DEBUG
+''')
+        for initial in (0, 23):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(initial=initial, signal=signum):
+                    folder = self.root / ('entry-%s-%s' % (initial, signum))
+                    folder.mkdir()
+                    env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                               PATH=str(binary) + os.pathsep + os.environ['PATH'], BASH_ENV=str(hook),
+                               ENTRY_INITIAL_STATUS=str(initial), ENTRY_SIGNAL=str(int(signum)),
+                               ENTRY_REACHED=str(folder / 'reached'), ENTRY_CLEANED=str(folder / 'cleaned'))
+                    process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    output, _ = process.communicate(timeout=10)
+                    self.assertTrue((folder / 'reached').exists(), output)
+                    self.assertTrue((folder / 'cleaned').exists(), output)
+                    self.assertEqual(process.returncode, initial or 128 + signum, output)
+                    summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
+                    self.assertEqual(len(summaries), 1, output)
+                    summary = summaries[0].read_text()
+                    self.assertIn('Status: FAILED', summary)
+                    reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
+                    self.assertIn('Reason: ' + reason, summary)
+
+    def test_summary_publication_is_atomic_and_commits_the_outcome(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'docker').write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+if sys.argv[1] == 'create': print('a' * 64)
+elif sys.argv[1] == 'start': pass
+elif sys.argv[1] == 'exec':
+    if 'mkdir -p /root/zmk-config' in ' '.join(sys.argv): pass
+    elif './build.sh validate' in ' '.join(sys.argv): print('build.yaml is valid.')
+    else: sys.stdin.buffer.read()
+elif sys.argv[1] == 'rm': pathlib.Path(os.environ['PUBLISH_CLEANED']).touch()
+else: sys.exit(99)
+''')
+        (binary / 'mv').write_text('''#!/usr/bin/env python3
+import os, pathlib, signal, subprocess, sys
+if sys.argv[-1].endswith('/build-summary.txt'):
+    pathlib.Path(os.environ['PUBLISH_REACHED']).touch()
+    assert pathlib.Path(os.environ['PUBLISH_CLEANED']).exists(), 'summary preceded cleanup'
+    if os.environ['PUBLISH_CASE'] == 'io-failure': sys.exit(23)
+    status = subprocess.call([os.environ['PUBLISH_REAL_MV']] + sys.argv[1:])
+    os.kill(int(pathlib.Path(os.environ['PUBLISH_PID']).read_text()), signal.SIGTERM)
+    sys.exit(status)
+os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
+''')
+        for file in binary.iterdir(): file.chmod(0o755)
+        for name in ('late-signal', 'io-failure'):
+            with self.subTest(name=name):
+                folder = self.root / name
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'], PUBLISH_CASE=name,
+                           PUBLISH_CLEANED=str(folder / 'cleaned'), PUBLISH_REACHED=str(folder / 'reached'),
+                           PUBLISH_PID=str(folder / 'pid'), PUBLISH_REAL_MV=shutil.which('mv'))
+                process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                (folder / 'pid').write_text(str(process.pid))
+                output, _ = process.communicate(timeout=10)
+                self.assertTrue((folder / 'reached').exists(), output)
+                self.assertTrue((folder / 'cleaned').exists(), output)
+                runs = list((BUILD.parent / '.build').glob('*-pid-%s' % process.pid))
+                self.assertEqual(len(runs), 1)
+                summary = runs[0] / 'build-summary.txt'
+                if name == 'late-signal':
+                    self.assertEqual(process.returncode, 0, output)
+                    self.assertIn('Status: SUCCESS', summary.read_text())
+                else:
+                    self.assertNotEqual(process.returncode, 0, output)
+                    self.assertFalse(summary.exists(), output)
+                self.assertFalse(list(runs[0].glob('summary-tmp-*')))
 
     def test_restore_copy_failure_preserves_recovery_state(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project', True)
@@ -950,6 +1546,37 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                 self.assertFalse((case.workspace / name).exists(), output)
                 self.assertEqual(output.count('Removing stale workspace entry: ' + name + '\n'), 1)
         self.assertFalse(case.counter.exists())
+
+    def test_pruning_normalizes_in_workspace_parent_components(self):
+        for path in ('project', './project', 'modules/../project', 'case..name/project'):
+            with self.subTest(path=path):
+                case = self.make_workspace(project_path=path, prior_overlay=False)
+                result, output = self.run_workspace(case)
+                self.assertEqual(result.returncode, 71, output)
+                self.assertTrue(case.project.resolve().is_dir(), output)
+                self.assertFalse(case.counter.exists(), output)
+
+    def test_standalone_resolves_zephyr_once_for_all_targets(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                case = self.make_workspace(prior_overlay=False, jobs=jobs, document={
+                    'application': '.', 'include': [
+                        {'board': 'A', 'artifact-name': 'app-' + str(i)} for i in range(3)]})
+                (case.source / 'CMakeLists.txt').touch()
+                zephyr = case.workspace / 'zephyr'
+                package = zephyr / 'share/zephyr-package/cmake'
+                package.mkdir(parents=True)
+                (package / 'ZephyrConfig.cmake').touch()
+                west = pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'west'
+                text = west.read_text().replace("projects = [('zmk', 'zmk'),", "projects = [('zephyr', 'zephyr'), ('zmk', 'zmk'),")
+                text = text.replace("    fault = os.environ.get('PROBE_LIST_FAILURE')", "    if wanted == 'zephyr':\n        print(str(pathlib.Path(os.environ['WORK_DIR']) / 'zephyr'))\n        sys.exit(0)\n    fault = os.environ.get('PROBE_LIST_FAILURE')")
+                west.write_text(text)
+                case.env['PROBE_BUILD_EXIT'] = '0'
+                result, output = self.run_workspace(case)
+                self.assertEqual(result.returncode, 0, output)
+                calls = [json.loads(line) for line in case.commands.with_suffix('.argv.jsonl').read_text().splitlines()]
+                self.assertEqual(sum(args[:2] == ['list', 'zephyr'] for args in calls), 1)
+                self.assertEqual(sum(args[0] == 'build' for args in calls), 3)
 
     def test_recorded_overlay_restores_before_obsolete_root_is_pruned(self):
         case = self.make_workspace()
