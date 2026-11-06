@@ -23,12 +23,36 @@ cleanup() {
 }
 trap cleanup EXIT
 build_case() {
-  local name="$1" run
+  local name="$1" run expectations expected_image expected_tag expected_target artifact
   shift
+  expectations="${ZMK_TEST_RESULTS}/${name}.expect"
+  expected_target="$(cd "$1" && pwd -P)"
+  expected_image="${ZMK_BUILD_IMAGE:-}"
+  if [ -z "${expected_image}" ]; then
+    # These fixtures pin a mainline commit; their auto toolchain is stable.
+    expected_tag="${ZMK_BUILD_IMAGE_TAG:-auto}"
+    [ "${expected_tag}" != auto ] || expected_tag=stable
+    expected_image="${ZMK_BUILD_IMAGE_REPOSITORY:-zmkfirmware/zmk-build-arm}:${expected_tag}"
+  fi
+  {
+    printf '%s\0' image "${expected_image}" target "${expected_target}" cache "${ZMK_DOCKER_CACHE_VOLUME}"
+    case "${name}" in
+      standard)
+        for artifact in ci_extra_nice_nano_corne_left_nice_view_adapter ci_split_nice_nano_corne_right_nice_view_adapter \
+          ci_bootloader_settings_reset ci_bootloader_settings_reset_xiao_ble ci_bootloader_corne_left \
+          ci_xiao_ble_tester ci_bootloader_corne_right ci_reset_nice_nano; do
+          printf '%s\0' artifact "${artifact}.uf2"
+        done ;;
+      overlay|restore)
+        printf '%s\0' artifact ci_module_override_zmk_studio_messages.bin artifact ci_module_override_reset_hex.hex ;;
+      standalone) printf '%s\0' artifact ci_standalone.bin ;;
+      *) echo 'Missing fixture output expectations.' >&2; return 1 ;;
+    esac
+  } > "${expectations}"
   container_logs+=("${ZMK_TEST_RESULTS}/${name}.log")
   bash build.sh "$@" | tee "${ZMK_TEST_RESULTS}/${name}.log"
   run="$(sed $'s/\033\[[0-9;]*m//g' "${ZMK_TEST_RESULTS}/${name}.log" | tail -n 1 | tr -d '\r')"
-  bash .github/scripts/check-build-output.sh build "${run}"
+  bash .github/scripts/check-build-output.sh build "${run}" --expect "${expectations}"
   case "${name}" in
     standard)
       grep -qx 'Built targets: 8' "${run}/build-summary.txt"

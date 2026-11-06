@@ -24,7 +24,11 @@ write_summary() {
 }
 
 run_ok() {
-  local mode="$1" run_arg="${2:-}"
+  local mode="$1" run_arg="${2:-}" expected_file="${3:-}"
+  if [ -n "${expected_file}" ]; then
+    (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" --expect "${expected_file}" >/dev/null)
+    return
+  fi
   if [ -n "${run_arg}" ]; then
     (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" >/dev/null)
   else
@@ -33,12 +37,13 @@ run_ok() {
 }
 
 run_fail() {
-  local mode="$1" expected="$2" run_arg="${3:-}"
+  local mode="$1" expected="$2" run_arg="${3:-}" expected_file="${4:-}"
   if [ -n "${run_arg}" ]; then
     check_cmd=(bash "${checker}" "${mode}" "${run_arg}")
   else
     check_cmd=(bash "${checker}" "${mode}")
   fi
+  [ -z "${expected_file}" ] || check_cmd+=(--expect "${expected_file}")
   if (cd "${case_root}" && "${check_cmd[@]}" >"${tmp_dir}/stdout" 2>"${tmp_dir}/stderr"); then
     echo "check-build-output.sh ${mode} unexpectedly succeeded" >&2
     exit 1
@@ -249,6 +254,74 @@ EOF
   printf '%s: conflicting\n' "${field}" >> "${run_path}/build-summary.txt"
   run_fail build "duplicate summary field: ${field}"
 done
+
+# Caller-owned expectations catch wrong outputs even when their count is unchanged.
+# Keep these values independent of the summary and of the production target parser.
+reset_case
+expected_file="${tmp_dir}/expected output"
+printf '%s\0' image synthetic/build:stable target /synthetic/config cache synthetic-cache \
+  artifact left.uf2 artifact right.bin > "${expected_file}"
+strict_summary() {
+  write_summary <<EOF
+Status: SUCCESS
+Mode: build
+Built targets: 2
+Docker image: ${1:-synthetic/build:stable}
+Target: ${2:-/synthetic/config}
+Docker cache volume: ${3:-synthetic-cache}
+EOF
+}
+strict_summary
+printf 'synthetic firmware\n' > "${run_path}/left.uf2"
+printf 'synthetic firmware\n' > "${run_path}/right.bin"
+run_ok build "${run_path}" "${expected_file}"
+strict_summary synthetic/build:wrong
+run_fail build 'expected Docker image' "${run_path}" "${expected_file}"
+strict_summary
+mv "${run_path}/left.uf2" "${run_path}/wrong-target.uf2"
+run_fail build 'unexpected firmware name' "${run_path}" "${expected_file}"
+mv "${run_path}/wrong-target.uf2" "${run_path}/left.uf2"
+strict_summary synthetic/build:stable /synthetic/wrong
+run_fail build 'expected Target' "${run_path}" "${expected_file}"
+strict_summary synthetic/build:stable /synthetic/config wrong-cache
+run_fail build 'expected Docker cache volume' "${run_path}" "${expected_file}"
+strict_summary
+printf 'Docker image: synthetic/build:stable\n' >> "${run_path}/build-summary.txt"
+run_fail build 'duplicate expected summary field' "${run_path}" "${expected_file}"
+strict_summary
+: > "${run_path}/left.uf2"
+run_fail build 'empty expected firmware' "${run_path}" "${expected_file}"
+printf 'synthetic firmware\n' > "${run_path}/left.uf2"
+
+for invalid in duplicate-image duplicate-artifact unknown-key truncated-value truncated-key no-image no-artifact path-artifact reserved-artifact; do
+  case "${invalid}" in
+    duplicate-image) printf '%s\0' image synthetic/build:stable image synthetic/build:stable artifact left.uf2 ;;
+    duplicate-artifact) printf '%s\0' image synthetic/build:stable artifact left.uf2 artifact left.uf2 ;;
+    unknown-key) printf '%s\0' image synthetic/build:stable unknown value ;;
+    truncated-value) printf 'image\0synthetic/build:stable' ;;
+    truncated-key) printf 'image' ;;
+    no-image) printf '%s\0' artifact left.uf2 ;;
+    no-artifact) printf '%s\0' image synthetic/build:stable ;;
+    path-artifact) printf '%s\0' image synthetic/build:stable artifact ../left.uf2 ;;
+    reserved-artifact) printf '%s\0' image synthetic/build:stable artifact build.log ;;
+  esac > "${tmp_dir}/invalid expectation"
+  run_fail build 'Invalid output expectations' "${run_path}" "${tmp_dir}/invalid expectation"
+done
+printf '%s\0' image synthetic/build:stable artifact left.uf2 > "${tmp_dir}/too-few.expect"
+run_fail build 'expected artifact count' "${run_path}" "${tmp_dir}/too-few.expect"
+run_fail build 'Cannot read output expectations' "${run_path}" "${tmp_dir}/missing.expect"
+
+# Metadata-only checks can use the same contract without expecting firmware.
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+Docker image: synthetic/build:stable
+Target: /synthetic/config
+Docker cache volume: synthetic-cache
+EOF
+printf '%s\0' image synthetic/build:stable target /synthetic/config > "${tmp_dir}/validate.expect"
+run_ok validate "${run_path}" "${tmp_dir}/validate.expect"
+run_fail validate 'Invalid output expectations' "${run_path}" "${expected_file}"
 
 # Dots inside a directory name are legal; only a complete parent-traversal component is rejected.
 reset_case

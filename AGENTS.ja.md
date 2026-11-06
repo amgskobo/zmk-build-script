@@ -1,306 +1,271 @@
-# エージェント契約
-
-この file は [AGENTS.md](AGENTS.md) の日本語訳です。標準・正本は英語版です。
-両版を同期し、差異があれば英語版に従って日本語訳を修正します。
-
-利用方法・CLI・環境変数・runner 運用は
-[README.ja.md](README.ja.md) と [README.md](README.md)、保守契約はこの file に集約します。
-外部案件の repo 名・commit hash・日付・個別の実測値・一度きりの結果を文書へ追加せず、
-command / source / image identity と raw log は `.build/` の新しい実行記録に残します。
-
-## 公開時のプライバシーとローカル実行
-
-この規則は、公開または外部共有に向けて用意する情報に適用します。
-許可された作業中は、実装・診断・識別情報の照合・検証に必要な実際の local path、設定、
-host / terminal / device の識別情報、非公開の test 証拠を調査・利用できます。
-その local access 自体は、作業範囲外の収集や開示を許可しません。
-
-公開する commit / push / PR / release / 文書・site 出力 / CI artifact を準備する前に、
-source、comment、AGENTS file、example、test fixture、log、screenshot、生成 file、metadata を含む
-実際の公開対象を確認します。user に関係する名前・好み、非公開の absolute path・local 環境詳細、
-workstation / terminal の識別情報、個別 device の label・port・serial・address・pairing / bond 識別情報、
-認証情報、user / device 固有の test・測定履歴を除外します。生成・upload される artifact も確認し、
-source の文章だけの確認で済ませません。
-
-公開物には repository-relative path、文書化した変数・placeholder、中立な名前、明確に合成した fixture を使います。
-公開を明示した project 識別子、既存の attribution、標準 API / product / platform 名、再現可能な support 要件は
-技術的な project 情報です。一人の user の実環境を project 要件として扱いません。
-特に、対応 platform の文書化と user の device の特定は区別します。
-
-正確な証拠や device 照合に必要な場合、正確な原本と識別情報は適切な非公開・local 作業記録に保持します。
-assertion を弱めたり結果を捏造したりせず、公開用に情報を除いた別コピーを作成し、
-変更していない raw record とは説明しません。これらの詳細を開示せずに有用な証拠を共有できなければ、
-非公開のまま保持し、公開できる検証の限界を明記します。最終の公開 snapshot と artifact を再確認します。
-version control、公開、device 書き込み、reset、data 消去に関する既存の許可要件も引き続き適用します。
-
-## 作業範囲と責務
-
-### 作業の境界
-
-- 最新の user 指示と既存差分を最初に読み、user changes を保持する。
-- commit / stage / push / PR 作成・更新 / merge / tag / release は、各操作の明示指示がある場合だけ行う。
-  test 成功や milestone を許可と解釈せず、無関係な変更を含めない。
-- 主対象は `build.sh`。helper / workflow / docs はその契約に直接関係する範囲だけ扱い、
-  keyboard / module source、実機 firmware、settings を変更しない。
-- 単体 build で常に有効な機能は `build.sh` に置き、環境変数は opt-out が必要な場合だけ追加する。
-  新しい script / container / fixture を増やす前に既存の責務・scenario へ統合できるか確認する。
-- production host の必須依存は Docker と Bash。標準 Unix tool を使い、追加 install を前提にしない。Git は optional。
-- WSL 全体の memory 回収・停止・設定変更や、他 tool の監視を builder に取り込まない。
-  中間 file の削除、依存 / ccache の再利用、host に残す成果物・証拠を区別する。
-
-### fileごとの責務
-
-| 場所 | 責務 |
-| --- | --- |
-| `build.sh` | 1 target directory の build / validate / clean、host copy、container workspace、成果物回収 |
-| `scripts/auto-build-external.sh` | source list / JSON matrix、slug 一意化、source process の rolling queue |
-| `scripts/build-external-source.sh` | 1 source の clone / local path 解決、builder 起動、clone cleanup |
-| `scripts/source-common.sh` | wrapper 共通の分類・名前処理、Windows 非互換 clone path の除去 |
-| `repos.txt` | 1 行 1 source。relative path は list file の directory 基準 |
-| `.github/fixtures/` | 標準 firmware、validate 専用 target shapes、module override |
-| `.github/scripts/` | 共通検証入口、runner / LF / output check、既存 helper behavior test |
-| `.github/workflows/` | hosted compatibility、手動 self-hosted smoke、外部 source matrix、heartbeat |
-
-source 列挙・clone を `build.sh` に戻さない。source 並列、target 並列、Ninja compile 並列を分ける。
-host → container → persistent workspace の 2 段階 copy と host への成果物回収を別の境界として扱う。
-
-## Host と source copy
-
-### host互換性とcapability
-
-- Windows / macOS / Linux の差分は script が吸収し、Windows は WSL shim を避け Git Bash を明示する。
-  Docker 用の MSYS path 自動変換停止下では native `git.exe` に MSYS path を渡さず、directory へ `cd` する。
-- Bash 3.2 に対応する。`set -u` 下の空配列は `${array[@]+"${array[@]}"}` または要素数で guard する。
-- container 作成前に空 archive で `tar --exclude` を実行する。NUL list は `--null -T` の空入力を実行して確認し、
-  非対応なら Git file list を使わない。短縮 help の省略や help pipe の SIGPIPE を能力不足と解釈しない。
-
-### copyするfileの選択
-
-- Git working tree は tracked と非 ignored untracked を NUL 区切りで copy し、削除済み tracked を除き、
-  ignored tracked は保持する。`ZMK_COPY_IGNORED=1`、Git 無し / 失敗、非 working tree、空一覧では固定除外つき全 copy。
-- 固定除外は `.git` / `.west` / `__pycache__` と top-level の `.zmk` / `.build` / `.cache` / `.ccache` /
-  `.vscode` / `build` / `dist` / `node_modules` / `out` / `tmp` / `zmk_search`。
-  top-level は root entry で選別し、OS ごとの tar anchor 解釈に依存しない。同名の nested content を保持する。
-- `zmk` / `modules` / `tools` / `bootloader` / `optional` は、source に `.west`、対象 tree に `.git` marker が
-  ある場合だけ generated dependency として除外する。名前だけでは除外せず、`local_modules/` は自動探索しない。
-
-## Layout・module・application
-
-### repository layout
-
-- 入口は `build.yaml` と `config/west.yml` を持つ repo root。direct config directory / custom config path は扱わない。
-  board 定義は root / module の `boards/` を標準とし、既存の `config/boards` は compatibility path として許容する。
-- target の legacy `zephyr/` content は warning で許容し、不足 metadata / root `module.yml` は container 内だけで正規化する。
-  host source は変更せず、metadata があれば target root を extra module に追加する。
-
-### 明示module
-
-- module はすべて `-m` で明示する。`dir/.` も host で path 解決してから、空白を含む basename 全体で重複判定する。
-  明示した隠し directory も同じ一覧で検証・適用し、内部の path 一覧は NUL 区切りで渡す。
-- 明示 module の root `CMakeLists.txt` / `Kconfig` は `build.cmake` / `build.kconfig`、`boards/` / `dts/` / `snippets/` は
-  対応する `build.settings.*_root: .` を要求する。host は必要な metadata file の存在だけを確認する。
-  YAML 構造・key は container 内で workspace 変更 / 依存更新前に strict に検証し、inline map / quoted key を許容する。
-  `build.cmake` / `build.kconfig` の path は文字列とし、target の正規化前にも型を確認する。
-  `proto/zmk` などの nested path を保持する。
-
-### application
-
-- 通常は `zmk/app`。top-level `application` は repo 内の `CMakeLists.txt` を持つ相対 directory を指定する。
-  absolute / parent traversal / repo 外へ出る symlink を拒否する。standalone は manifest の `zephyr` project から package を
-  解決し、extra module を `ZEPHYR_EXTRA_MODULES`、通常の ZMK は `ZMK_EXTRA_MODULES` へ渡す。
-  standalone でも target の root settings を補完する。明示した module build 宣言は保持し、application の
-  CMake / Kconfig 入口から `build.cmake` / `build.kconfig` を推定しない。
-
-## Persistent workspace と cache
-
-### workspaceの所有
-
-- workspace へは `config/` だけ同期し、ZMK の `ZMK_CONFIG` は fresh な container source の `config/` に向ける。
-  manifest 外の root を prune するため volume は repo / tool / 用途ごとに分離する。
-  同じ workspace を変更する build は OS lock で排他し、競合時は同期・依存更新・削除前に停止する。
-  lock file は prune 対象の外に置き、build process の終了時に解放する。保持 container の存在だけで再利用を拒否しない。
-
-### overlayの復元とprune
-
-- 前回 overlay を workspace 内 backup から復元してから今回 input を適用する。directory 名が west project 名と一致すれば
-  overlay、それ以外は extra module。destination を変更する前に backup の復元記録を残す。
-- 復元の copy / 削除失敗は明示して返す。if 条件内の関数の errexit に依存せず、失敗時は該当 backup / stamp を残して停止する。
-  overlay path は absolute と親を表す独立した `..` component を拒否し、名前の途中の `..` は許容する。
-  復元済み / 再取得が必要な状態を project ごとに atomic に記録してから backup を整理する。
-  後続の失敗・中断後も復元済み project を再削除しない。旧2列の記録を受け入れる。
-- prune は復元後、完全に成功した `west list` の結果だけで行う。root は空白 / hidden entry を含め配列で完全一致比較し、
-  1 回ずつ整理する。一覧失敗・部分出力では cache を保持して update を要求し、成功後に再確認してから prune / stamp する。
-  root 選択前に workspace 内の親 component を正規化し、workspace 外へ出る path は拒否する。
-  削除失敗を無視しない。
-
-### 依存の再利用と更新
-
-- import を含む `west manifest --resolve` 全体の digest 変更 / 解決失敗、必要な ZMK / project の欠落、`west list` 失敗、
-  復元不能な overlay では update する。入口 file の hash だけで再利用判定しない。
-- update 前に ready marker を無効化し、完全成功時だけ resolved manifest を stamp する。旧記録も再検証する。
-  失敗 / 中断後の非空 checkout や未解決 manifest を ready と扱わない。
-- update は設定回数 retry し、各試行直前に空白を壊さず stale index lock を除去する。失敗後の続行には完全な project 一覧と、
-  最終試行で明示された全失敗 project を満たす local override が必要。unknown / unsupported failure を missing list から推測せず、
-  前の試行の失敗名を混ぜない。local override での続行を upstream update 成功と記録しない。
-
-### cacheの寿命
-
-- ccache は west workspace の外側、cache volume 上に保存する。`CCACHE_IGNOREOPTIONS=-specs=*` は選択 image 内で
-  SDK specs が固定される前提。SDK / image 変更時は前提を再確認し、revision suffix も image tag 選択へ含める。
-- `--pristine` は build / validate とも builder が volume 全体を削除する。完全な volume 一覧で対象を照合し、未作成なら続行、
-  一覧 / 削除失敗なら container 作成前に停止する。依存 / ccache を含むため overlay 復元 test では使わない。
-
-## Parser・build・output
-
-### CLIとYAML
-
-- 公開 CLI / 環境変数の表は README に維持する。正の整数は十進表記として扱い、`00` を含む全ゼロを拒否する。
-- top-level / include matrix、defaults、exclude、skip、alias、artifact placeholder を保持する。
-  exclude は CLI snippet 合成前の YAML 値で評価し、reset target は board ごとに重複させない。
-- None と falsey の型を区別し、scalar list / quote を検証する。board / shield / snippet / CMake 引数の NUL は shell 受け渡し前に拒否。
-  literal list は trim せず、shlex 結果は NUL 区切りで渡し、空引数・引用・前後空白を保持する。
-- artifact 名は安全な file 名へ正規化する。最初の dot より前も検査して Windows 予約名を拒否し、大小文字を無視した重複と
-  log / summary などの予約出力名との衝突も拒否する。
-
-### targetの実行
-
-- target ごとに build directory / log を分ける。並列失敗数は整数 data として保持し、8-bit exit status に詰めない。
-  batch の失敗を回収し、未開始の後続 target を進めず、log 順序を保持する。外部 full / pristine の既定 target 並列は 1。
-- 各 target は subshell EXIT で成功 / compile / artifact 選択・copy 失敗時とも中間 directory を削除し、依存 / ccache を保持する。
-  削除失敗を log に残して成功を失敗に変え、元の build error の終了 status は保持する。
-
-### 成果物とsummary
-
-- firmware は target ごとに 1 個、`.uf2` → 指定 fallback → `.hex` → `.bin` の順。host 列挙 / summary / checker は
-  log / summary 自体を除き同じ拡張子を認識する。拡張子には path / glob / 先頭 dot / hyphen を許可しない。
-- run は `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/`。開始済み run は setup / pristine / create / start / source copy /
-  build / artifact copy / cleanup の失敗にも `build.log`、FAILED summary、Reason と error excerpt を残す。
-  artifact copy の失敗は呼び出し元へ返す。main container log にも build stream を流し、`stdbuf` の `LD_PRELOAD` を子へ伝えない。
-  SIGINT / SIGTERM は理由と終了 status を確定して同じ終了処理へ渡す。保持指定の container は中断時に停止して残す。
-  ID 回収、終了 handler の入口、cleanup 中は signal を遅延する。先の build failure を保持し、cleanup 後に最終 summary を1回 atomic に公開する。
-  summary 公開前に終了 status を確定する。firmware 存在確認では列挙を最後まで読み、SIGPIPE を誘発しない。
-- summary の field は Status、失敗時 Reason、Mode、Target、Docker image / cache volume、Elapsed、Built targets、Pristine、
-  Build jobs、Fallback binary、Extra snippets、Module inputs、Files。主要 field の重複と規則外 run の summary を拒否する。
-- Built targets は CR / ANSI / prefix を除いた log 行から取得し、成功 build のみ firmware 数へ fallback する。
-  checker は成功 status / mode / log / 正の target 数 / firmware 数の完全一致を要求する。旧 fallback 未記録は `bin`。
-  保存先名も独立した `..` component だけを拒否し、`case..name` は許可する。
-
-## Container・外部 source・workflow
-
-### containerの所有
-
-- build / clone / test は create が返した immutable ID で start / exec / copy / cleanup を行う。
-  create 失敗時に同名の既存 container を消さず、要求した名前を所有の証拠にしない。
-- container 削除失敗は log / FAILED summary に反映し、先の build failure の理由・exit status を保持する。
-  `ZMK_KEEP_CONTAINER=1` を尊重する。clone container の削除失敗では retry / builder 起動へ進まない。
-
-### 外部source
-
-- URL / UNC / drive absolute / relative を区別し、slug 衝突を解消する。source ごとに clone / cache / container / artifact を分ける。
-  JSON は shell で扱える全制御文字を escape し、source 選択後も元の index を保持する。
-  CI source selector は常に list file を指定し、不足する list は matrix 解決時に拒否する。
-- URL は daemon preflight 後、clone container 内で retry つき取得し、bind mount ではなく `docker cp` で host へ戻す。
-  Windows だけ trailing 空白 / dot、禁止文字・control・newline、予約 device 名を警告つきで除き、合法名と Unix source は保持する。
-- host clone 先の削除失敗では取得 / copy を止め、修復後も古い file を消してから copy する。終了時も clone コピー削除後だけ
-  成功を報告する。先の clone / build failure があれば削除失敗も併記し、解決済み clone root 直下だけを削除する。local source は保持。
-- rolling queue は worker の実 exit を回収する。status file 前の異常終了も失敗とし、他 source は落とさず空き枠へ次を流す。
-  外部 source の layout / API incompatibility と builder defect を分ける。
-
-### workflow
-
-- source / input / runner 名などは `env:` 経由で quote し、`${{ ... }}` を shell text に直接埋め込まない。
-  runner が開始前に表示する値には非公開の source 情報を置かず、matrix / step env は数値 index に限定する。
-  source selector は event payload から実行時に非公開 file へ準備し、source の解決・選択は wrapper が行う。
-  `continue-on-error` で build failure を隠さない。
-  CI console と artifact は固定項目の公開用 report に限定する。raw log / firmware は local に保持し、
-  公開用コピーを unchanged raw record と呼ばない。自動 upload は既知の report path だけを許可する。
-- hosted Compatibility は 3 OS shell / Ubuntu Docker、Self-hosted Build は手動 smoke。外部 matrix は custom label で routing し、
-  `runner.os` に応じて Git Bash / Bash を使う。label / Docker access は runner user で確認し、offline による queued を失敗と混同しない。
-- schedule は UTC cron と換算 comment、concurrency / timeout を保持する。Heartbeat の commit / push をこの契約で自動許可しない。
-
-## Container 内での test 実行
-
-自動 test、build、依存環境の準備は Docker 内で実行します。host の入口は container の起動と結果の出力を
-行えますが、host で test runtime を実行したり test package / toolchain を install したりしません。
-対象 repository の source は read-only mount にできます。test 専用の ZMK / Zephyr / tool checkout、
-runtime 環境、一時 file、build 出力、cache は container image または named volume に保持します。
-test は host の隣接 dependency checkout や非公開の absolute path を必要としないものにします。
-
-選択した revision は container 内で解決・検証します。不足する依存は分離した container workspace に明示的に
-準備し、共有 cache や pin を暗黙に更新しません。対象 repository の全 scenario、assertion、必須 matrix を保持します。
-hardware の受け入れ確認には文書化された device access が必要です。container transport が利用できない場合は
-BLOCKED と報告し、host 実行や mock による受け入れ確認で代用しません。確認済みの証拠だけを出力し、
-公開時のプライバシー規則を維持します。
-
-### Container test 実行の高速化
-
-準備済みの container 環境、永続 cache、上限を設けた並列実行で所要時間を短縮します。
-必須の全 scenario、assertion、negative control、sanitizer、対応 core variant、反復を保持します。
-
-- 環境準備と test 実行を分離します。container image は digest で固定し、依存 revision を明示的に解決します。
-  image、toolchain、依存 revision、lockfile が一致する場合だけ準備済み環境を再利用します。
-  通常の test 実行中に依存 input を fetch / update しません。不足 input は依存する確認だけを block します。
-- dependency checkout、install 済み test 環境、一時 file、build directory、cache は container image または
-  named volume に保持します。大量の file access には Linux filesystem を優先します。対象 source を staging する場合は、
-  関係する untracked file を含む必要な test / compiler input をすべて保持し、source identity と実行前後の変化を確認します。
-- 明示的に選択した compiler / package cache は、対応する identity / concurrency check とともに再利用します。
-  非互換環境は分離します。独立 job 間で書き込み可能な build directory や変更可能な install 済み dependency tree を
-  共有しません。必須の clean-cache check を保持し、その確認には分離した新規 cache を使います。
-- 各対象 repository の正式な test 入口を container 内から実行します。共通 orchestration は入口の選択・schedule・結果収集を
-  行えますが、assertion と fixture は対象 repository に置きます。Docker の入れ子起動と、互換 job 間の環境準備の繰り返しを
-  避けます。各 job の環境、作業 file、出力を分離します。
-- 並行する suite、target、compiler job、test worker 全体で、設定可能な共通の CPU / memory budget を適用します。
-  入れ子の並列実行も計上します。独立 job だけを並列化し、必要な実行順序と出力順序を保持します。
-- 1 回の run では、必須 binary を異なる input / configuration variant ごとに 1 回 build し、同一条件で必要な反復には
-  その同じ binary を再利用します。各反復に必要な初期状態を用意します。必須 test はすべて実行し、cache された artifact や
-  過去の PASS 記録を新たな test 実行の根拠にしません。
-- build と証拠には新規 directory を使います。実際の command、exit、完了 marker、順序を保った出力、
-  source / dependency / image identity、cache 設定を記録します。準備・staging・build・実行・検証を別々に計測します。
-
-quick / full の既存契約は維持します。interface / infrastructure の変更には引き続き対象 repository の完全な matrix が
-必要です。同等の input と check で高速化を評価し、cold / warm run を分けて報告し、失敗も保持します。
-
-## 検証 gate と再発防止
-
-不具合は host / copy / workspace / update / overlay / build / artifact / summary / workflow の境界で分類する。
-修正前に失敗する case または識別可能な negative control を既存 helper / fixture に追加し、原因・対応・確認を
-該当する契約と test に反映する。重複した bug 履歴を追加せず、既存の有効な回帰 assertion を削除・緩和しない。
-OS / workflow の片側に同じ問題が残らないか確認する。
-
-### 必須確認
-
-| 変更範囲 | 必須確認 |
-| --- | --- |
-| 文書のみ | LF、`git diff --check`、変更した path / link / CLI 参照。文書のみを理由に firmware suite は実行しない |
-| code / helper / workflow | 該当する syntax、LF、`git diff --check`、関連する behavior / build gate |
-| helper / summary | 該当 behavior test と失敗時の status / reason / output |
-| copy / module / sync / cache | runner preflight、copy helper、関連 validate / firmware、直後の output check |
-| artifact / fallback | firmware fixture と output helper。非 UF2 の選択も確認 |
-| workflow | YAML / run step syntax、関連 helper / step。未公開なら remote CI は未実行 |
-
-local / CI は `bash .github/scripts/test.sh shell|docker|build|all` を入口とし、層の対応は README に置く。
-標準 validate（通常 / reset）、target shapes と CLI snippet、標準 firmware、project overlay / extra module、
-pristine 無しの復元を影響範囲に応じて確認し、各成功 build / validate の直後に run を明示して output checker を実行する。
-
-### 証拠と回帰fixture
-
-- 実行ごとに新しい repository 外または directory 全体が Git ignored の記録先を使う。visible な内部保存先は開始前に拒否する。
-  command / status / 時間 / source checksum 前後 / image identity / raw failure を残し、既存証拠を上書きしない。
-- 実行中の script を編集しない。修正後の source を固定して再実行し、前後 checksum が違う結果は最新 source の PASS としない。
-- test は `bash <script>`、temp path は `pwd -P` を使う。host guard は到達 sentinel と拒否条件の両方を確認する。
-  executable bit や Windows fake-bin の未正規化 path に依存しない。
-- Bash 用 symlink fixture は Git Bash の copy fallback を避け、作成後に `-L` で確認する。
-  必要な MSYS link mode は作成 command だけに指定し、権限不足による skip や拒否 assertion の省略で代用しない。
-- LF は `.gitattributes` / `.editorconfig` に従う。raw byte を直接検査して CRLF / bare CR / Control-Z / 大きな入力 /
-  Git failure を見逃さず、検証のために working tree を reset / 書換えしない。
-- 独立した Docker 条件は同一 container に集約する。parser は production を実行して値・順序・実 argv を検査する。
-  update retry / 空白つき stale lock / 部分失敗と復旧は現行 image 内の command boundary を制御して確認する。
-- test container も取得済み ID だけを cleanup する。test cache は専用とし、明示指定の再利用 cache と自動作成 cache の所有を分ける。
-- local / remote CI / 物理動作を分ける。実ネットワーク障害、別 west version、旧 image の実 build、非 amd64 native host、
-  公開後の hosted / self-hosted 実行は、対応する証拠なしに fixture 成功から PASS としない。
-
-## 完了判定と報告
-
-最新 scope、既存差分の保持、不要な新規 file / 意図しない差分、LF / syntax / 必須 check を再確認する。
-変更 file、PASS / FAIL / 未実行と理由、残る環境の境界、commit / push の有無、worktree の状態を報告する。
-公開は各操作の明示指示がある場合だけ行い、公開した場合は関係する remote CI の結果も確認する。
+# zmk-build-script：エージェントガイド
+
+この文書は [英語版](AGENTS.md) と同じルールをまとめた日本語訳です。
+
+英語版を正本とし、変更時は両方を同期します。
+
+## 責務と維持する契約
+
+- `build.sh` は一つの設定または明示的に選んだ単独アプリケーションのbuild・validate・clean、入力コピー、作業領域管理、成果物回収を担当する。
+  外部ソースの列挙・クローンは `scripts/auto-build-external.sh`、`scripts/build-external-source.sh`、`scripts/source-common.sh` に置く。
+  利用方法・CLI・環境変数の表は両READMEで管理し、単発のプロジェクト名・コミット・日付・測定・作業環境の情報を恒久文書へ足さない。
+  個別ビルドに常に必要な機能は `build.sh` に置き、環境変数は必要な無効化指定に使う。
+  スクリプト・コンテナ・fixtureの追加前に、既存の責務・シナリオで扱えるか確認する。
+
+- Bash 3.2と標準Unixツールに対応し、通常のビルドではGitを必須にしない。
+  WindowsではGit Bashを使い、MSYS・ネイティブGit・Docker間のパス変換を明示する。
+  `set -u` での空配列を保護する。
+  コンテナ作成前に、tarの除外は空アーカイブで、NUL区切りリストは空の `--null -T` 入力で実行確認する。
+  help文面やhelpを読むパイプのSIGPIPEだけで対応可否を判断しない。
+  ホスト全体の再設定・メモリ回収・無関係なツールの停止を行わない。
+  WSLのshimを避け、Dockerのパス変換を無効にした状態では、ネイティブGitへMSYSパスを渡さず対象ディレクトリへ移動して実行する。
+
+- Git管理ファイルと、ignore対象でない未追跡ファイルをNUL区切りでコピーする。
+  削除済みの管理ファイルは除き、管理済みならignore対象でも残す。
+  Gitによる選択が取得不能・失敗・空の場合や `ZMK_COPY_IGNORED=1` の場合は固定除外方式を使う。
+  `.git`、`.west`、`__pycache__` を除き、ルート直下の除外はOS固有のtar照合規則に頼らずルートの項目単位で選ぶ。
+  同名の下位ディレクトリは残す。
+  ホスト→コンテナとコンテナ→作業領域のコピーを区別する。
+
+- ルート直下の固定除外は `.zmk`、`.build`、`.cache`、`.ccache`、`.vscode`、`build`、`dist`、`node_modules`、`out`、`tmp`、`zmk_search` とする。
+  生成依存の `zmk`、`modules`、`tools`、`bootloader`、`optional` は、ソースの `.west` と各ルートの `.git` で確認できる場合だけ除く。
+  名前だけで判断せず、`local_modules/` を自動発見しない。
+
+- `build.yaml` と `config/west.yml` があるリポジトリルートを入口にし、任意の設定ディレクトリを直接指定する形には対応しない。
+  ルート・モジュール内のboardsと既存のconfig/boards互換経路を保ち、旧形式の対象zephyrには警告する。
+  不足メタデータの補完はコンテナ内だけで行う。
+  隠しディレクトリ・空白付きパスを含む全モジュールを `-m` で明示する。
+  dir/.を含むパスを解決してから、空白を含む完全なbasenameの重複を拒否する。
+  パス一覧はNUL区切りで渡す。
+
+- ホストでは必要なメタデータファイルの存在だけを確認する。
+  構造・キー・型の厳密なYAML検証は、作業領域の変更や依存更新前にコンテナ内で行い、inline map・引用付きキーも受け付ける。
+  ルートのCMakeLists.txt・Kconfigには文字列のbuild.cmake・build.kconfigを、boards・dts・snippetsには対応するbuild.settings.*_root: .宣言を求める。
+  proto/zmkなどの入れ子パスと明示的なモジュール宣言を保つ。
+
+- 単独アプリケーションの `application` はCMakeLists.txtを持つリポジトリ相対ディレクトリとし、絶対パス・親への遡り・外へ出るsymlinkを拒否する。
+  マニフェストのZephyrプロジェクト・packageを解決し、モジュールは `ZEPHYR_EXTRA_MODULES` で渡す。
+  通常のZMKでは `ZMK_EXTRA_MODULES` を使う。
+  単独アプリでも対象ルートの設定を補い、アプリ入口からモジュールのビルド宣言を推測しない。
+  ソース・対象・Ninjaの並列数を分ける。
+
+- リポジトリ・ツール・用途別の専用ボリュームを使う。
+  同期・更新・不要領域の削除前に作業領域をロックし、競合時は変更前に停止する。
+  ロックファイルは削除範囲の外に置き、プロセス終了時に解放する。
+  保持コンテナの存在だけで再利用を止めない。
+  作業領域へ同期するのはconfigだけとし、ZMK_CONFIGは新しいコンテナソースへ向ける。
+  今回の入力前に前回の上書きを復元する。
+  westプロジェクトと同名なら上書き、それ以外の明示モジュールは追加モジュールとする。
+
+- 復元情報は復元先を変える前に記録する。
+  条件式から呼ぶ関数のerrexitに頼らず、コピー・削除失敗を明示的に返し、該当backup・stampを残して停止する。
+  絶対パスと独立した親ディレクトリ成分を拒否し、名前内の連続したdotは許可する。
+  backup削除前に復元済み・再取得要の状態を不可分に記録し、後続の失敗・中断で復元済みプロジェクトを再削除しない。
+  旧2列形式も受け付ける。
+  作業領域内の親成分を正規化し、領域外へ出るルートを拒否する。
+  空白・隠し項目を含む正規化済みルートの完全一致で削除し、完全に成功したwest listを使って削除・stamp直前にも再確認する。
+  一部だけの一覧や失敗ではキャッシュを保ち更新を要求し、削除失敗を無視しない。
+
+- 再利用は入口ファイルのハッシュではなく、importを含む解決済みマニフェスト全体とプロジェクト・上書きの正常な状態で判断する。
+  必須プロジェクト不足、解決・一覧取得・復元の失敗では更新を求める。
+  先にreadyを無効化し、全成功時だけstampして旧記録も再検証する。
+  失敗・中断後に中身が残っていてもreadyとしない。
+  明示回数で再試行し、空白付きの古いindexロックも安全に除く。
+  取得失敗後の継続には完全なプロジェクト一覧と、最終試行が特定した全失敗プロジェクトへの明示ローカル上書きを必要とする。
+  前の試行の失敗を混ぜず、不明な失敗を推測しない。
+  継続は上流更新成功と分けて記録する。
+
+- ccacheはwest作業領域の外に置く。
+  `CCACHE_IGNOREOPTIONS=-specs=*` は選択イメージ内でSDK specsが固定される前提なので、イメージ・SDK変更時に再確認し、タグのリビジョン接尾辞も保つ。
+  `--pristine` はbuild・validateとも依存・ccacheを含む選択ボリューム全体を削除する。
+  完全な一覧で正確に照合し、不在なら続けるが、一覧取得・削除の失敗はコンテナ作成前に止める。
+  上書き復元テストにpristineを使わない。
+
+- ビルド対象一覧のdefaults・include・exclude・skip・alias、placeholder、snippetを保つ。
+  excludeはCLI snippet合成前のYAML値へ適用し、ボードごとのリセットを重複させない。
+  正の整数は十進数として読み、00を含む全桁ゼロを拒否する。
+  Noneと偽と評価される型を区別し、scalar・listの型を検証してシェルへ渡す前にNULを拒否する。
+  shlex・NULで引用・空引数・意図された空白を保つ。
+  成果物名は最初のdot以前のWindows予約名、大文字小文字を無視した重複、ログ・summary名との衝突を検証し、名前内のdotではなく独立した親ディレクトリ成分を拒否する。
+
+- 対象別にビルド・ログ領域を分け、対象順にログを集約する。
+  並列失敗数は8bitの終了値へ詰め込まず整数で保持する。
+  実行中のbatchの失敗を集め、未着手のbatchを止める。
+  外部full・pristineは既定で対象一件ずつとする。
+  対象ごとのsubshell EXIT処理は成功時とコンパイル・選択・コピー失敗時に中間物を除き、依存・ccacheを残す。
+  後始末に失敗したら成功扱いにせず、元のビルドエラーと終了値があれば維持する。
+
+- build・clone・testコンテナはcreateで取得した不変IDで操作する。
+  create失敗を同名の既存コンテナを削除する根拠にしない。
+  `ZMK_KEEP_CONTAINER=1` を尊重し、中断時は保持するコンテナを停止する。
+  元のビルドエラーを隠さず後始末の失敗も伝え、cloneコンテナ削除失敗後は再試行・builder起動を止める。
+  ID取得・終了ハンドラー入口・後始末中はsignalを保留し、真の終了値を確定してから最終summaryを一度だけ不可分に公開する。
+  stdbufのLD_PRELOADを子プロセスへ漏らさない。
+
+- 対象ごとに `.uf2`、指定fallback、`.hex`、`.bin` の順で一つ回収する。
+  fallback拡張子内のパス・glob、先頭dot・ハイフンを拒否する。
+  ホスト列挙・summary・検証処理で拡張子をそろえ、ログ・summary自体は数えない。
+  存在確認はSIGPIPEを起こさず列挙を最後まで読む。
+  開始した実行は `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/` を使い、準備・pristine・create・start・ソースコピー・ビルド・成果物コピー・後始末の失敗や中断でも `build.log`、`build-summary.txt`、失敗理由・抜粋を残す。
+  成果物コピーの失敗も呼び出し元へ返す。
+
+- summaryと検証処理で、状態・失敗理由・mode・対象・イメージ／キャッシュ・経過時間・ビルド数・pristine／jobs／fallback／snippets／modules・ファイル一覧を一致させる。
+  主要フィールドの重複と不正な実行パスを拒否する。
+  CR・ANSI・接頭辞を除いてビルド完了行を数え、成功時だけファームウェア数で代用する。
+  検証処理は成功状態、mode、ログ、正の対象数、それと完全に一致するファームウェア数を要求する。
+  fallback欄がない旧summaryはbinとする。
+
+- 外部wrapperはURL・UNC・drive・相対パス、一意のslug、ソース別のclone・cache・container・artifact領域を担当する。
+  JSONではシェルで表せる全制御byteをエスケープし、選択後も元indexを保つ。
+  CIの選択指定は存在する一覧ファイルを指す。
+  daemon確認後にcloneコンテナ内で再試行付き取得を行い、bind mountではなくdocker cpで戻す。
+  Windowsでは非互換なcloneパスだけを警告して除く。
+  ホスト削除失敗時は置換を止め、修復後も古いファイルを除いてからコピーする。
+  成功扱いにはcloneの削除も必要とし、削除先は解決済みcloneルート直下に限定してローカルソースを保護する。
+  状態ファイル欠落も含めて実際のworker終了値を集め、他ソースを継続して空き枠へ次を割り当てる。
+  `repos.txt` の相対指定は一覧ファイルのディレクトリ基準で解決する。
+  外部ソースの構成・API非互換とbuilderの不具合を区別する。
+
+- CIのソース・runner入力は引用したenvか構造化ファイルで渡し、式をシェルへ直接展開しない。
+  runnerが先に表示するmatrix・step値にはソースの数値indexだけを入れ、非公開の選択指定はevent payloadから実行時ファイルへ作る。
+  生ログ・ファームウェアは非公開で保ち、既知のreportパスから確認済みの固定フィールドだけをuploadする。
+  continue-on-errorで失敗を隠さない。
+  公開runnerの3OSシェル・Ubuntu Dockerと、手動のself-hosted smokeの役割、独自label、runner.osによるシェル選択を保つ。
+  runner利用者としてDocker接続を確認し、offline待機とビルド失敗を区別する。
+  UTC cron・時差換算コメント・並列制御・タイムアウトを保ち、Heartbeatを公開承認としない。
+
+- 回帰では、影響する既存のhost・copy・workspace・update・overlay・build・artifact・summary・workflowテストへ修正前に失敗する条件か名前付き対照を追加し、他OS・workflowも確認する。
+  スクリプトはbash経由、仮パスはpwd -Pで正規化し、host guardの到達確認と拒否条件の両方を検証する。
+  Git Bashのコピー代替やskipでsymlinkを代用せず、実際のリンクを確認する。
+  LF・CRLF・単独CR・Control-Z・空白・大入力・Git失敗・実parserのargvと順序の検証を保つ。
+  独立したDocker条件は集約し、専用cacheと取得済みコンテナIDを使う。
+  build・validate成功の直後に正確な実行ディレクトリで検証する。
+  fixture成功だけで実ネットワーク・west・イメージ・ネイティブホストの違いや公開／self-hosted実行の合格を示さない。
+
+- 関連する変更では、次の文書から該当する契約・テスト範囲を確認する: [README.md](README.md)、[README.ja.md](README.ja.md)。
+  文書だけの修正で、無関係な依存調査を追加しない。
+
+## 作業の進め方
+
+- 依頼と既存差分を確認し、無関係な変更やステージ済みの作業を保護する。
+  承認済みの調査・編集・取り消し可能な検証は、確認を繰り返さず完了まで進める。
+  判断材料の不足や範囲外の操作だけを確認する。
+  内容を大きく置き換える前には、失われるおそれのある未コミット部分を非公開の証跡へ残す。
+  ソース全体の世代コピーは増やさない。
+
+- Gitのステージング、コミット、push、PRの変更、merge、tag、公開、実機書き込み、設定・ボンドの消去には、その操作への承認が必要。
+  同じ操作・範囲への承認は継続して有効とする。
+  依存先のガイドや検証成功を追加の承認としない。
+  承認されたコミットの前には、該当するpre-commitフックをDocker内で実行し、迂回しない。
+  Gitの名前・メール設定を維持する。
+
+- 選択済みのチェックアウトとマニフェスト・ロックファイルの指定を使う。
+  ブランチ切り替え、履歴のリセット、リモートの置換、編集用コピーの作成を暗黙に行わない。
+  選択を変える前に取得元URLと完全なコミットIDを確認し、依存差分のレビュー、該当する固定リビジョン・ロックファイルの更新、担当リポジトリと統合側の検証を行う。
+  ローカルの作業スナップショットとリモートから取得可能なコミットを区別し、不足するrefを捏造しない。
+
+- 作業範囲に関係する担当リポジトリ・依存先のルートと下位ディレクトリの指示を、選択したチェックアウト・リビジョンごとに一度確認する。
+  実際のwest import、ローカル上書き、有効機能、実行環境を解決する。
+  隣接ディレクトリやキャッシュ名だけで入力を特定しない。
+  事前確認で必要な場合はREAD・NO AGENTS・INACCESSIBLEを記録する。
+  入力不足で保留するのは依存する検証だけとし、独立した承認済み作業は続ける。
+
+- 恒久的な作業ルールは、この英語版・日本語版の2ファイルに集約して同期する。
+  利用方法やAPIの詳細は既存の所定文書に置く。
+  ガイドの断片や非公開の共通ガイドへの依存を増やさない。
+  現行の契約を残したうえで、重複ルールと古い作業・ブランチの前提を整理する。
+
+## 実行環境
+
+- ローカルの自動テスト・ビルドの実行環境と依存準備はDocker内に置く。
+  文書化されたDevContainerも利用できる。
+  別記がなければ、解決済み作業領域の担当リポジトリルートで作業する。
+  Dockerを起動するスクリプトはホストで、その内部のPython・Node・コンパイラーの入口は準備済みコンテナ内で実行し、Dockerで二重に包まない。
+  ホストでのソース・Git・参照先の確認と証跡の取り出しは行えるが、テスト用パッケージ・ツールチェーンを追加しない。
+  依存・実行／ビルド領域・キャッシュはイメージか名前付きボリュームに置く。
+
+- 依存準備・意図して選んだオンライン互換性確認と、通常のネットワーク不要のテストを分ける。
+  利用可能な不変のイメージID・digest、依存・ツールチェーンのリビジョンを確認し、指定ローカル上書きと作業ファイルを記録する。
+  イメージは担当側で宣言された指定方法を通じて選択する。
+  依存をinstall・取得するランチャーは準備・オンライン確認として扱い、オフライン実行としない。
+  検証を通すための暗黙のpull・固定リビジョン前進・共有キャッシュ変更・依存パッチ・必要機能の無効化を行わない。
+  不足する入力に依存する検証だけを保留する。
+  承認済みビルド・環境準備に含まれる所定の準備は、その範囲で進める。
+
+- 互換性のある環境・キャッシュを再利用し、必要なクリーンキャッシュでの検証も残す。
+  未追跡ファイルを含む必須入力は、読み取り専用マウントか独立したコンテナ内コピーで用意し、実行前後でソースの同一性を確認する。
+  書き込み可能なビルド・実行・インストール領域はジョブごとに分け、入れ子のワーカーを含む一つのCPU・メモリ予算を守る。
+  構成ごとに一度ビルドし、同条件の反復では同じバイナリを使う。
+  過去のPASSを今回の実行に代えない。
+  性能比較では準備・入力配置・ビルド・実行・検証と、コールド・ウォーム条件を分ける。
+  既存の公開CIのプラットフォーム別ジョブは、それぞれのOS要件を維持する。
+
+## 検証と実行入口
+
+- 文書・指示だけの変更では既存checkerでLFを検査し、`git diff --check`、変更したパス・コマンド、英日対応を確認する。
+  Git履歴がなければ変更前後のコピーに `git diff --no-index --check` を使う。
+  文章だけの修正にファームウェア全体の検証は要求しない。
+
+- コード・helper・workflow変更では、影響範囲に応じて `bash .github/scripts/test.sh shell`、`bash .github/scripts/test.sh docker`、`bash .github/scripts/test.sh build`、`bash .github/scripts/test.sh all` を選ぶ。
+  ローカルのshellテスト自体は準備済みコンテナ内で実行する。
+  docker・build・allには、所定のDocker daemon接続とdaemon側から参照可能なソースパスも必要。
+  接続不足はBLOCKEDとし、模擬ビルドのPASSで代用しない。
+  copy・cache・overlay・parser・基盤の該当全構成と、公開CIの各OSジョブを保つ。
+
+- 成功直後に `bash .github/scripts/check-build-output.sh validate RUN_DIRECTORY` または `bash .github/scripts/check-build-output.sh build RUN_DIRECTORY` を実行する。
+  今回の正確な実行パスを指定し、生の失敗を残す。
+  ローカル検証と後のリモートCIを区別する。
+
+## テストの品質
+
+- 代表構成のビルドは、builderの完成度を維持するための統合検証の例として扱う。
+  指標は特定の例示リポジトリの一覧や成功件数に固定せず、対応する契約と通常・境界・失敗・復旧の検証範囲に結び付ける。
+  期待する入力元・イメージ・成果物名は実行前に独立して定義し、件数だけでなく出力の完全一致を確認する。
+  成果物数が変わらなくても、誤ったイメージ・入力元・変更されたファームウェア名を拒否する対照条件を保持する。
+  再利用する検証は既存の担当テスト群に置き、外部の例示構成は任意の追加検証とする。
+  そのソース・依存の同一性と未検証条件を記録し、例の成功だけで全構成の互換性や不具合がないことを断定しない。
+
+- モジュールのfixture、検証条件、独立した期待値、不具合を挿入する負例、実行対象の選択、結果検証は、担当リポジトリのtests/に置く。
+  Webとモジュール以外のテストは、文書化された既存の配置を維持する。
+  CI・packageスクリプトは正規入口を呼び出し、隣接リポジトリ・私的なテスト群・ソースを書き換える代替処理へ責務を移さない。
+  製品コードのprobeは状態だけを公開する。
+  実装群を通常・境界・不正入力、独立状態、出力順序・時刻、初期化・取消、失敗・復旧、役割・プロトコルのテストへ対応付け、未検証箇所も示す。
+
+- 回帰修正には修正前の失敗か名前付きの対照条件を示す。
+  失敗を期待する対照条件は、指定された検証条件・拒否理由で失敗した場合だけ成立とし、製品の結果と分けて報告する。
+  検証条件を弱めたり、差の意味を確認せずスナップショットを更新したり、コンパイルエラーを実行時不具合の検出と数えたりしない。
+  テスト廃止前には、元の固有検証条件・失敗証跡を置換対応表とともに外部へ保存する。
+  quickでも全動作シナリオを、対応環境ではsanitizer付きで実行する。
+  fullでは文書化されたABI・最適化・カバレッジ・カーネル・対応コアの組み合わせを追加する。
+
+- 局所的な実装変更は対応する検証を選び、インターフェース・テスト基盤の変更では影響する担当リポジトリの全検証を実行する。
+  上流ZMK（stock）とDYAの両方を確認するのは、両対応を明示している場合に限る。
+  DYA専用機能は上流ZMKに対してNOT APPLICABLEとし、無効化したビルドを互換性の証拠にしない。
+  テスト群では必要なケース・fixtureが空の選択になっていないことと、実際の完了を確認する。
+  終了値ゼロだけ、必須ケースのskip、timeout、準備エラーをPASSの根拠にしない。
+
+## 証跡と引き継ぎ
+
+- 証跡は新しいパスへ出力し、親パスを解決して既存ファイル・ディレクトリ・symlinkがあれば停止する。
+  コマンド・終了値、ソース・依存・構成・実行環境・イメージの同一性、生の出力順序・時刻を記録し、最初の失敗と必要な設定・DTS・バイナリを残す。
+  ソースや依存が途中で変わった結果は無効とし、実行中のスクリプトを編集しない。
+  保持する出力はマウントした名前付きボリュームへ置くか、失敗時も含めてコンテナ削除前に取り出す。
+  削除されるコンテナ内のパスが表示されただけでは、証跡を保管したことにならない。
+
+- 固定入力では正確な時系列記録、時刻変動を扱う場合は仕様に基づく許容範囲を残す。
+  合計値で個々のレポート順序・時刻を代替しない。
+  差を非決定的と判断する前に、同じバイナリ・入力・シード・実行環境・初期フラッシュ状態と、該当する場合は同じPHYで少なくとも3回反復する。
+  ホスト負荷だけを原因としない。
+  不正・古い・不完全・取得不能な観測を、有効なゼロと区別する。
+
+- PASS・FAIL・BLOCKED・NOT RUN・NOT APPLICABLEを区別する。
+  ローカルCI、ホストテスト・ネイティブ実行・コンパイル、シミュレーターの結果だけで、公開CI、ブラウザー、実機のHID・BLE・分割接続・電気的動作・消費電力・初期化動作の合格を示さない。
+  シミュレーターの忠実性を主張する前に、使用した製品経路を検証し、実機との対応を確認する。
+  エンドツーエンドの性能・安定性には、対応する実機イメージとホスト観測をそろえる。
+  静かなログだけでは証明にならない。
+
+- 共有前にソース・コメント・ガイド・例・ログ・画像等・成果物・メタデータを確認し、認証情報、個人・ホスト・機器ID、非公開パス、ボンド情報、個別履歴・嗜好を除く。
+  承認済みのローカル作業では実値を使えるが、原本を非公開で保管し、公開用の加工版であることを明示する。
+  公開fixture・例示値には合成データを明示して使い、公開プロジェクト・APIの識別子、ライセンス、帰属を保つ。
+  必要な差分・証跡を残す。
+  引き継ぎでは動作、ファイル、実際の検証、未確認事項・リスク、バージョン管理・実機操作を報告する。

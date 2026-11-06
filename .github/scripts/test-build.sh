@@ -90,12 +90,15 @@ make_module() {
 
 # run_validate SCENARIO TARGET [MODULE...]: one validate run, one container, any number of -m modules.
 run_validate() {
-  local scenario="$1" target="$2" log_path module
+  local scenario="$1" target="$2" log_path module expectations
   shift 2
   local modules=()
   for module in "$@"; do modules+=(-m "${module}"); done
   local container="zmk-copy-excludes-${scenario}-$$"
   log_path="${tmp_dir}/${scenario}.log"
+  expectations="${tmp_dir}/${scenario}.expect"
+  printf '%s\0' image "${ZMK_BUILD_IMAGE}" target "$(cd "${target}" && pwd -P)" \
+    cache "${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}" > "${expectations}"
   container_logs+=("${log_path}")
 
   echo "[build-contract] ${scenario}"
@@ -105,7 +108,7 @@ run_validate() {
     { tail -n 120 "${log_path}" >&2; return 1; }
   local run
   run="$(sed $'s/\033\[[0-9;]*m//g' "${log_path}" | tail -n 1 | tr -d '\r')"
-  bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${run}"
+  bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${run}" --expect "${expectations}"
   last_container="$(tr -d '\r' < "${log_path}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
   [ -n "${last_container}" ] || { echo 'validate did not return a container ID' >&2; return 1; }
 }

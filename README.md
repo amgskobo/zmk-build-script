@@ -432,6 +432,25 @@ elsewhere.
 Run names must follow the displayed convention. The summary records the selected
 fallback; older summaries default to `bin`.
 
+For a quality gate, define expected outputs independently before building and pass
+`--expect FILE` with an explicit run directory. The file contains NUL-delimited
+key/value pairs: one required `image`, optional `target` and `cache`, and one
+`artifact` per expected firmware basename in build mode. Validate mode accepts
+only the metadata keys. For example:
+
+```bash
+printf '%s\0' image zmkfirmware/zmk-build-arm:stable \
+  artifact example_corne_left.uf2 > expected-output.nul
+bash .github/scripts/check-build-output.sh build \
+  .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID --expect expected-output.nul
+```
+
+Expected metadata must match exactly and appear once in the summary. Build checks
+also require the exact firmware name set and nonempty files; a wrong image or a
+renamed firmware fails even when the artifact count is unchanged. Keep expectation
+files private when they contain local paths. This uses Bash and standard tools,
+without an additional host parser dependency.
+
 ## Workflows and self-hosted runners
 
 | Workflow | Purpose |
@@ -534,6 +553,14 @@ bash .github/scripts/test.sh all
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.
+
+Representative configurations and optional external builds are integration samples
+for maintaining builder quality. Select samples by the contracts they exercise and
+keep source/dependency identities and untested conditions in their evidence. The
+canonical suites combine those samples with independent output expectations and
+failure controls, including wrong image/input/name cases. A fixed repository count
+is not a quality threshold. Firmware fixtures check their expected image, input,
+cache and full artifact name set immediately after each successful build.
 
 ### Evidence and test caches
 

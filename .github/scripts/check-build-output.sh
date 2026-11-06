@@ -259,10 +259,22 @@ require_valid_run_dir() {
 case "${mode}" in
   validate|build) ;;
   *)
-    echo "usage: $0 validate|build [run-dir]" >&2
+    echo "usage: $0 validate|build [run-dir] [--expect expectations-file]" >&2
     exit 2
     ;;
 esac
+
+expected_file=""
+if [ "$#" -gt 2 ]; then
+  if [ "$#" != 4 ] || [ "$3" != --expect ] || [ -z "${run_dir}" ]; then
+    echo 'Output expectations require an explicit run directory and --expect file.' >&2
+    exit 2
+  fi
+  expected_file="$4"
+  [ -f "${expected_file}" ] && [ -r "${expected_file}" ] || {
+    echo 'Cannot read output expectations.' >&2; exit 1;
+  }
+fi
 
 if [ -n "${run_dir}" ]; then
   require_valid_run_dir "${run_dir}" "run directory"
@@ -356,3 +368,58 @@ if [ "${mode}" = "build" ]; then
   echo "[output] firmware artifacts: ${firmware_count}"
   printf '%s\n' "${firmware_list}" | sed 's/^/[output] firmware artifact: /'
 fi
+
+check_expected_output() {
+  local key value field actual count name previous file matched
+  local expected_image=0 expected_target=0 expected_cache=0
+  local artifacts=()
+  # NUL-delimited key/value pairs preserve paths and literal shell characters.
+  # The caller supplies the oracle before the run; do not learn it from outputs.
+  while IFS= read -r -d '' key || [ -n "${key}" ]; do
+    if ! IFS= read -r -d '' value; then
+      echo 'Invalid output expectations: incomplete key/value pair.' >&2; return 1
+    fi
+    case "${key}" in
+      image)
+        [ "${expected_image}" = 0 ] || { echo 'Invalid output expectations: duplicate image.' >&2; return 1; }
+        expected_image=1; field='Docker image' ;;
+      target)
+        [ "${expected_target}" = 0 ] || { echo 'Invalid output expectations: duplicate target.' >&2; return 1; }
+        expected_target=1; field=Target ;;
+      cache)
+        [ "${expected_cache}" = 0 ] || { echo 'Invalid output expectations: duplicate cache.' >&2; return 1; }
+        expected_cache=1; field='Docker cache volume' ;;
+      artifact)
+        case "${value}" in
+          ''|.|..|*/*|*\\*|build.log|build-summary.txt)
+            echo 'Invalid output expectations: artifact must be a firmware basename.' >&2; return 1 ;;
+        esac
+        for previous in ${artifacts[@]+"${artifacts[@]}"}; do
+          [ "${previous}" != "${value}" ] || { echo 'Invalid output expectations: duplicate artifact.' >&2; return 1; }
+        done
+        artifacts+=("${value}")
+        continue ;;
+      *) echo 'Invalid output expectations: unknown key.' >&2; return 1 ;;
+    esac
+    [ -n "${value}" ] || { echo 'Invalid output expectations: empty value.' >&2; return 1; }
+    count="$(grep -c "^${field}:" "${build_summary}" || true)"
+    [ "${count}" = 1 ] || { echo "missing or duplicate expected summary field: ${field}" >&2; return 1; }
+    actual="$(sed -n "s/^${field}: //p" "${build_summary}")"
+    [ "${actual}" = "${value}" ] || { echo "expected ${field} does not match summary" >&2; return 1; }
+  done < "${expected_file}"
+  [ "${expected_image}" = 1 ] || { echo 'Invalid output expectations: image is required.' >&2; return 1; }
+  if [ "${mode}" = validate ]; then
+    [ "${#artifacts[@]}" = 0 ] || { echo 'Invalid output expectations: validate has no firmware.' >&2; return 1; }
+    return 0
+  fi
+  [ "${#artifacts[@]}" -gt 0 ] || { echo 'Invalid output expectations: build artifacts are required.' >&2; return 1; }
+  [ "${#artifacts[@]}" = "${built_targets}" ] || { echo 'expected artifact count does not match built target count' >&2; return 1; }
+  while IFS= read -r file || [ -n "${file}" ]; do
+    name="${file##*/}"; matched=0
+    for value in "${artifacts[@]}"; do [ "${name}" != "${value}" ] || matched=1; done
+    [ "${matched}" = 1 ] || { echo 'unexpected firmware name for output expectations' >&2; return 1; }
+    [ -s "${file}" ] || { echo 'empty expected firmware' >&2; return 1; }
+  done <<< "${firmware_list}"
+}
+
+[ -z "${expected_file}" ] || check_expected_output

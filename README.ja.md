@@ -392,6 +392,21 @@ validate の結果は `build` を `validate` に置き換えます。両 mode �
 run 名は上記の規則に従います。
 fallback は summary に記録し、記録のない旧 summary は `bin` と解釈します。
 
+品質の検証では、実行前に独立した出力の期待値を定義し、明示run directoryとともに `--expect FILE` を渡します。
+fileはNUL区切りのkey/value対で、必須の `image` 一つ、任意の `target` と `cache`、
+build modeでは期待するfirmwareのbasenameごとの `artifact` を記録します。validate modeはmetadataのkeyだけを受け付けます。
+
+```bash
+printf '%s\0' image zmkfirmware/zmk-build-arm:stable \
+  artifact example_corne_left.uf2 > expected-output.nul
+bash .github/scripts/check-build-output.sh build \
+  .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID --expect expected-output.nul
+```
+
+期待するmetadataはsummaryに一度だけ現れ、値の完全一致が必要です。buildではfirmware名の集合の完全一致と
+各fileが空でないことも要求し、件数が同じでもイメージの誤りやfirmware名の変更を失敗にします。
+local pathを含む期待値fileは非公開で保持します。Bashと標準toolを使い、hostに追加parserを要求しません。
+
 ## ワークフローとrunner
 
 | workflow | 用途 |
@@ -481,6 +496,12 @@ bash .github/scripts/test.sh all
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。
+
+代表構成と任意の外部ビルドは、builderの完成度を維持するための統合検証の例です。
+確認する契約に沿って例を選び、ソース・依存の同一性と未検証条件を証跡に記録します。
+共通テスト群では、それらの例と独立した出力の期待値、誤ったイメージ・入力元・成果物名などの負例を組み合わせます。
+特定のリポジトリ件数を品質の合格基準にはしません。firmware fixtureでは成功直後に期待するイメージ・入力元・cache・
+成果物名の集合を照合します。
 
 ### 検証記録とtest cache
 
