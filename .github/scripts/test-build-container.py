@@ -138,30 +138,152 @@ class ContainerContracts(unittest.TestCase):
         for step in steps:
             for mode in ('build', 'validate'):
                 for pristine in ('true', 'false'):
-                    for kind in ('repo', 'path'):
+                    for kind in ('repo', 'pinned-repo', 'path'):
                         with self.subTest(step=step['name'], mode=mode,
                                           pristine=pristine, kind=kind):
-                            source = ('https://example.invalid/config.git' if kind == 'repo'
+                            source_type = 'repo' if kind == 'pinned-repo' else kind
+                            revision = '1' * 40 if kind == 'pinned-repo' else ''
+                            source = ('https://example.invalid/config.git' if source_type == 'repo'
                                       else str(self.root / 'source with spaces'))
                             env = dict(os.environ, EXTERNAL_MODE=mode, EXTERNAL_BUILD_JOBS='2',
                                        EXTERNAL_PRISTINE=pristine, SOURCE_INDEX='0002',
                                        WORKFLOW_ARGV=str(self.root / 'workflow.argv'))
                             sources = self.root / 'sources.txt'
-                            sources.write_text('repo:https://example.invalid/unselected.git\n' + kind + ':' + source + '\n')
+                            sources.write_text('repo:https://example.invalid/unselected.git\n' + source_type + ':' + source +
+                                               (' ' + revision if revision else '') + '\n')
                             (self.root / '.build/ci-source-file').write_text(str(sources))
                             result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
                                                     cwd=self.root, env=env, capture_output=True)
                             self.assertEqual(result.returncode, 0, result.stderr.decode())
                             record = (self.root / '.build/ci-source.record').read_text().strip()
                             actual = (self.root / 'workflow.argv').read_bytes().decode().rstrip('\0').split('\0')
-                            expected = ['--' + kind, source, '--source-slug',
-                                        'config' if kind == 'repo' else 'source-with-spaces',
-                                        '--mode', mode, '--jobs', '2']
+                            expected = ['--' + source_type, source]
+                            if revision:
+                                expected += ['--revision', revision]
+                            expected += ['--source-slug',
+                                         'config' if source_type == 'repo' else 'source-with-spaces',
+                                         '--mode', mode, '--jobs', '2']
                             if pristine == 'true':
                                 expected.append('--pristine')
                             self.assertEqual(actual, expected)
                             self.assertNotIn('unselected.git', (self.root / record).read_text())
                             self.assertNotIn(source, result.stdout.decode())
+
+    def test_external_clone_pins_commit_after_default_branch_advances(self):
+        # Run the production clone command with real Git. Only Docker transport is local.
+        source_tree = pathlib.Path('/tmp/source')
+        self.assertFalse(source_tree.exists(), 'clone transport needs an unowned path to be absent')
+        self.addCleanup(lambda: shutil.rmtree(source_tree) if source_tree.exists() else None)
+        repository = self.root / 'upstream'
+        repository.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(repository), *args], text=True).strip()
+        git('init', '-q')
+        marker = repository / 'marker.txt'
+        revisions = []
+        for value in ('original', 'advanced'):
+            marker.write_text(value)
+            git('add', 'marker.txt')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                'commit', '-qm', value)
+            revisions.append(git('rev-parse', 'HEAD'))
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, shutil, subprocess, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ['CLONE_TRANSPORT'])
+with (root / 'calls.jsonl').open('a') as out: out.write(json.dumps(args) + '\\n')
+if args[0] == 'create':
+    (root / 'command.json').write_text(json.dumps(args[args.index('/bin/bash'):]))
+    print('a' * 64)
+elif args[0] == 'start':
+    sys.exit(subprocess.call(json.loads((root / 'command.json').read_text())))
+elif args[0] == 'cp':
+    shutil.copytree('/tmp/source', args[-1], dirs_exist_ok=True)
+elif args[0] == 'rm':
+    if pathlib.Path('/tmp/source').exists(): shutil.rmtree('/tmp/source')
+else: sys.exit(99)
+''')
+        docker.chmod(0o755)
+        work = self.root / 'clones'
+        work.mkdir()
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   CLONE_TRANSPORT=str(self.root), ZMK_EXTERNAL_CLONE_ATTEMPTS='2')
+        for requested, expected in ((revisions[0], 'original'), ('', 'advanced'), ('0' * 40, None)):
+            with self.subTest(requested=requested):
+                (self.root / 'calls.jsonl').write_text('')
+                result = subprocess.run(['bash', '-c',
+                    'source /tmp/build-external-source.sh; WORK_DIR="$1"; SOURCE_REVISION="$2"; '
+                    'clone_repo_with_docker "$3" fixture "$1/checkout"',
+                    '_', str(work), requested, repository.as_uri()], env=env, text=True, capture_output=True)
+                output = result.stdout + result.stderr
+                print(output, end='')
+                calls = [json.loads(row) for row in (self.root / 'calls.jsonl').read_text().splitlines()]
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertFalse((work / 'checkout').exists())
+                    self.assertEqual([args[0] for args in calls], ['create', 'start', 'rm'] * 2)
+                    self.assertNotIn('Source revision:', output)
+                else:
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertEqual((work / 'checkout/marker.txt').read_text(), expected)
+                    actual = subprocess.check_output(['git', '-C', str(work / 'checkout'),
+                                                       'rev-parse', 'HEAD'], text=True).strip()
+                    self.assertEqual(actual, requested or revisions[1])
+                    self.assertIn('Source revision: ' + actual, output)
+                    self.assertEqual([args[0] for args in calls], ['create', 'start', 'cp', 'rm'])
+                self.assertFalse(source_tree.exists(), 'clone cleanup left its owned tree behind')
+
+    def test_container_build_log_capture_waits_and_requires_completion(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+counter = pathlib.Path(os.environ['LOG_READ_COUNT'])
+count = int(counter.read_text()) + 1
+counter.write_text(str(count))
+assert sys.argv[1:] == ['logs', 'a' * 64]
+print('compile output', count)
+if os.environ['LOG_MODE'] == 'read-failure': sys.exit(23)
+if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 target(s).')
+''')
+        docker.chmod(0o755)
+        sleep = binary / 'sleep'
+        sleep.write_text('#!/bin/sh\n[ "$1" = 1 ]\n')
+        sleep.chmod(0o755)
+        counter = self.root / 'reads'
+        output = self.root / 'stream.log'
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   LOG_READ_COUNT=str(counter), LOG_MODE='delayed')
+        counter.write_text('0')
+        # Named control: the old single read rejects the deliberately delayed marker.
+        control = subprocess.run(['bash', '-c',
+            'docker logs "$1" > "$2"; grep -F "Build complete: 2 target(s)." "$2"',
+            '_', 'a' * 64, str(output)], env=env, capture_output=True)
+        self.assertEqual(control.returncode, 1)
+        self.assertEqual(counter.read_text(), '1')
+        self.assertEqual(output.read_text(), 'compile output 1\n')
+        for mode, reads, message in (
+                ('delayed', '3', 'Build complete: 2 target(s).'),
+                ('never', '10', 'Timed out waiting for the container build log completion marker.'),
+                ('read-failure', '1', 'Failed to read the container build log.')):
+            with self.subTest(mode=mode):
+                counter.write_text('0')
+                env['LOG_MODE'] = mode
+                destination = self.root / (mode + '.log')
+                result = subprocess.run(['bash', '-c',
+                    'source /tmp/test-build-fixtures.sh; capture_container_build_stream "$1" "$2" "$3"',
+                    '_', 'a' * 64, str(destination), 'Build complete: 2 target(s).'],
+                    env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0 if mode == 'delayed' else 1, result.stderr)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertEqual(counter.read_text(), reads)
+                snapshots = list(self.root.glob(mode + '.log.attempt-*'))
+                self.assertEqual(len(snapshots), int(reads))
+                self.assertEqual(destination.read_bytes(), (self.root / (mode + '.log.attempt-' + reads)).read_bytes())
 
     def test_workflows_publish_only_fixed_reports(self):
         root = pathlib.Path('/tmp/workflows')

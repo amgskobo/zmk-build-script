@@ -897,7 +897,7 @@ copy_ignored=
 ccache_dir=
 
 # Stage the complete contract input set once in the existing validation container.
-(cd "${repo_root}" && tar cf - .github/scripts/test-build-container.py \
+(cd "${repo_root}" && tar cf - .github/scripts/test-build-container.py .github/scripts/test-build-fixtures.sh \
   .github/fixtures/target-shapes-zmk-config/build.yaml scripts/source-common.sh \
   scripts/auto-build-external.sh scripts/build-external-source.sh .github/scripts/check-build-output.sh .github/workflows/*.yml) |
   docker exec -i -e ZMK_BUILD_IMAGE="${ZMK_BUILD_IMAGE}" "${last_container}" bash -c '
@@ -905,6 +905,7 @@ ccache_dir=
     mkdir -p /tmp/contract-inputs /tmp/workflows
     tar xf - -C /tmp/contract-inputs
     cp /tmp/contract-inputs/.github/scripts/test-build-container.py /tmp/
+    cp /tmp/contract-inputs/.github/scripts/test-build-fixtures.sh /tmp/
     cp /tmp/contract-inputs/.github/fixtures/target-shapes-zmk-config/build.yaml /tmp/target-shapes.yaml
     cp /tmp/contract-inputs/scripts/*.sh /tmp/
     cp /tmp/contract-inputs/.github/scripts/check-build-output.sh /tmp/

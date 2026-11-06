@@ -18,6 +18,13 @@ validate_positive_int() {
     exit 1
 }
 
+validate_source_revision() {
+    [ -z "$1" ] && return 0
+    if [ "${#1}" = 40 ] && [[ "$1" != *[!0-9a-f]* ]]; then return 0; fi
+    echo 'ERROR: source revision must be a full 40-character lowercase commit SHA' >&2
+    return 1
+}
+
 is_repo_url() {
     case "$1" in
         http://*|https://*|ssh://*|git://*|file://*|git@*:*)

@@ -286,10 +286,19 @@ marker; names such as `modules` or `tools` alone do not exclude source content.
 
 ### Source lists and commands
 
-[repos.txt](repos.txt) contains one URL or local path per line. Optional prefixes
-are `repo:` / `url:` and `path:`. List-relative paths resolve from the list file's
-directory. `build.sh` handles one repository; the wrappers own source selection,
+[repos.txt](repos.txt) contains one source per line: `URL COMMIT_SHA` or a local
+path. Separate the URL and revision with spaces or a TAB. Revisions must be full
+40-character lowercase commit SHAs; branch names, tags and abbreviated SHAs are
+rejected. Optional prefixes are `repo:` / `url:` and `path:`. A local path remains
+one value, including spaces, and resolves from the list file's directory.
+`build.sh` handles one repository; the wrappers own source selection,
 unique slugs and [source parallelism](#parallel-builds).
+
+The maintained list pins verified example commits so an upstream default-branch
+change cannot silently change CI's source input. Review changes and rerun affected
+integration checks before updating a pin. A URL without a revision still selects
+its current default branch for explicit upstream compatibility checks. Source pins
+fix the configuration repository only; dependencies still follow its west manifest.
 
 ```bash
 bash scripts/auto-build-external.sh --list repos.txt
@@ -303,6 +312,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | Wrapper option | Meaning |
 | --- | --- |
 | `--repo URL`, `--path DIR` | Select an explicit source type. |
+| `--revision SHA` | Fetch and verify an exact full commit SHA. In `auto-build-external.sh`, place it after the corresponding `--repo URL`; local paths cannot have a revision. |
 | `--source-slug NAME`, `--repo-slug NAME` | Set a source's slug; in the multi-source wrapper, place it after `--repo` / `--path`. |
 | `--mode build\|validate` | Select build or validation. |
 | `--pristine`, `--settings-reset`, `-j` / `--jobs`, `-S` / `--snippet`, `-m` / `--module` | Forward builder options, including pristine validation. |
@@ -310,7 +320,11 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | `--sources-file FILE`, `--repos-file FILE` | Select a source list in `auto-build-external.sh`. |
 | `--list`, `--list-json` / `--matrix-json` | Print resolved sources or the JSON matrix without building. |
 | `--list-indices-json` | Print only numeric source indices for a public CI matrix. |
-| `--source-index N` | Select one source from the fully resolved list, preserving its unique slug and original JSON index; indices start at 1. |
+| `--source-index N` | Select one source from the fully resolved list, preserving its revision, unique slug and original JSON index; indices start at 1. |
+
+`--list` prints TAB-separated slug, cache volume, type, source and revision columns.
+`--list-json` includes a `revision` field, empty for local paths or unpinned URLs.
+`--list-indices-json` continues to expose only numeric indices.
 
 ### Wrapper environment variables
 
@@ -329,7 +343,9 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 
 URL cloning runs in Docker and returns files with `docker cp`, requiring no host
 Git installation or bind mount. Windows-incompatible filenames are removed with
-warnings only for Windows hosts. Clone cleanup is limited to a child of the
+warnings only for Windows hosts. A pinned source is fetched directly and its
+checked-out SHA is verified before copying; fetch or verification failure never
+falls back to the default branch. Clone cleanup is limited to a child of the
 resolved clone root; removal failures stop the source job. Each source has its
 own clone directory, cache, container and artifacts. Workers that fail or exit
 before recording status count as failures; other sources continue and fill free
@@ -553,6 +569,10 @@ bash .github/scripts/test.sh all
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.
+Their manifests pin both ZMK and Zephyr to tested commits; the firmware suite
+also verifies the resolved checkouts against those pins. Update them deliberately
+with dependency review and the affected test layers. Keep tests against moving
+upstream branches as separately selected compatibility checks.
 
 Representative configurations and optional external builds are integration samples
 for maintaining builder quality. Select samples by the contracts they exercise and

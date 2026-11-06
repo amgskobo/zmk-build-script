@@ -19,6 +19,7 @@ ZMK_EXTERNAL_SETTINGS_RESET="${ZMK_EXTERNAL_SETTINGS_RESET:-0}"
 
 SOURCE_TYPE=""
 SOURCE_VALUE=""
+SOURCE_REVISION=""
 SOURCE_SLUG=""
 SOURCE_SIGNAL_STATUS=0
 SOURCE_BUILD_PID=""
@@ -37,6 +38,7 @@ Runs exactly one source build. Use auto-build-external.sh or GitHub Actions
 matrix to start multiple copies in parallel.
 
 Options:
+  --revision SHA         Fetch and verify this exact full commit SHA for --repo.
   --mode build|validate   Select firmware build or configuration validation (default: build).
   --pristine              Reset the selected source cache before building.
   --settings-reset        Add missing settings_reset targets.
@@ -216,10 +218,21 @@ clone_repo_with_docker() {
         if clone_container_id="$(trap '' INT TERM; docker_no_pathconv create --name "${clone_container_name}" \
             "${ZMK_EXTERNAL_CLONE_IMAGE}" \
             /bin/bash -lc "$(declare -f prune_windows_clone_paths)"'
-                git clone --depth=1 "$1" /tmp/source || exit "$?"
+                if [ -n "$4" ]; then
+                    git init /tmp/source || exit "$?"
+                    git -C /tmp/source remote add origin "$1" || exit "$?"
+                    git -C /tmp/source fetch --depth=1 origin "$4" || exit "$?"
+                    git -C /tmp/source checkout --detach FETCH_HEAD || exit "$?"
+                    actual_revision="$(git -C /tmp/source rev-parse HEAD)" || exit "$?"
+                    [ "${actual_revision}" = "$4" ] || { echo "ERROR: fetched source revision does not match requested commit" >&2; exit 1; }
+                else
+                    git clone --depth=1 "$1" /tmp/source || exit "$?"
+                    actual_revision="$(git -C /tmp/source rev-parse HEAD)" || exit "$?"
+                fi
+                printf "Source revision: %s\n" "${actual_revision}"
                 [ "$2" != 1 ] || prune_windows_clone_paths /tmp/source "$3"
             ' \
-            _ "${source}" "${prune_clone_paths}" "${slug}")"; then
+            _ "${source}" "${prune_clone_paths}" "${slug}" "${SOURCE_REVISION}")"; then
             clone_container_id="${clone_container_id%$'\r'}"
             if [ "${#clone_container_id}" -ne 64 ] || [[ "${clone_container_id}" == *[!0-9a-f]* ]]; then
                 echo "ERROR: Docker create did not return a clone container ID" >&2
@@ -397,6 +410,7 @@ build_single_source() {
 
 main() {
     SOURCE_SIGNAL_STATUS=0
+    SOURCE_REVISION=""
     trap 'request_source_stop 130' INT
     trap 'request_source_stop 143' TERM
     while [ "$#" -gt 0 ]; do
@@ -411,6 +425,12 @@ main() {
                 [ "$#" -ge 2 ] || { echo "ERROR: --path requires a value" >&2; exit 1; }
                 SOURCE_TYPE="path"
                 SOURCE_VALUE="$2"
+                shift
+                ;;
+            --revision)
+                [ "$#" -ge 2 ] && [ -n "$2" ] || { echo 'ERROR: --revision requires a commit SHA' >&2; exit 1; }
+                SOURCE_REVISION="$2"
+                validate_source_revision "${SOURCE_REVISION}" || exit 1
                 shift
                 ;;
             --repo-slug|--source-slug)
@@ -488,6 +508,10 @@ main() {
             exit 1
             ;;
     esac
+
+    if [ -n "${SOURCE_REVISION}" ] && [ "${SOURCE_TYPE}" != repo ]; then
+        echo 'ERROR: --revision requires a repository source' >&2; exit 1
+    fi
 
     build_single_source
 }

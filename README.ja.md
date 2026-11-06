@@ -265,9 +265,16 @@ Git working tree では tracked と ignore されない untracked file を copy 
 
 ### source listとcommand
 
-[repos.txt](repos.txt) は 1 行 1 URL または local path です。`repo:` / `url:` / `path:` prefix も使えます。
-list 内の相対 path は list file の directory 基準です。`build.sh` は 1 repository、wrapper は
+[repos.txt](repos.txt) は 1 行 1 source で、`URL COMMIT_SHA` または local path を記述します。
+URL と revision は空白または TAB で区切ります。revision は小文字の16進数40文字の完全なコミットSHAに限り、
+branch 名・tag・省略SHAは拒否します。`repo:` / `url:` / `path:` prefix も使えます。
+local path は空白を含めて1つの値として扱い、相対 path は list file の directory 基準です。`build.sh` は 1 repository、wrapper は
 source 選択・slug の一意化・[source並列](#並列ビルド)を担当します。
+
+既定の一覧は検証した例のコミットに固定し、upstream の既定 branch が進んでも CI の入力元が変わらないようにします。
+pin の更新時は差分をレビューし、影響する統合検証を再実行します。revision を省略した URL は、
+upstream 互換性を明示的に確認する用途として、従来どおり現在の既定 branch を選びます。
+source の pin が固定するのは設定 repository です。依存は引き続き各 west manifest の指定に従います。
 
 ```bash
 bash scripts/auto-build-external.sh --list repos.txt
@@ -281,6 +288,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | wrapper option | 意味 |
 | --- | --- |
 | `--repo URL`, `--path DIR` | source の種類を明示します。 |
+| `--revision SHA` | 完全なコミットSHAを取得し、一致を確認します。`auto-build-external.sh` では対応する `--repo URL` の後ろに置きます。local path には指定できません。 |
 | `--source-slug NAME`, `--repo-slug NAME` | source の slug を指定します。複数 source wrapper では `--repo` / `--path` の後ろに置きます。 |
 | `--mode build\|validate` | build / validate を選びます。 |
 | `--pristine`, `--settings-reset`, `-j` / `--jobs`, `-S` / `--snippet`, `-m` / `--module` | builder option を渡します。validate の pristine も含みます。 |
@@ -288,7 +296,11 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | `--sources-file FILE`, `--repos-file FILE` | `auto-build-external.sh` の source list を指定します。 |
 | `--list`, `--list-json` / `--matrix-json` | build せず解決済み source または JSON matrix を表示します。 |
 | `--list-indices-json` | 公開 CI matrix 用に数値の source index だけを表示します。 |
-| `--source-index N` | 一覧全体の解決後、1から始まる番号で1件を選択します。一意化した slug と元の JSON index を保持します。 |
+| `--source-index N` | 一覧全体の解決後、1から始まる番号で1件を選択します。revision、一意化した slug と元の JSON index を保持します。 |
+
+`--list` は slug、cache volume、種類、source、revision の順で TAB 区切りの5列を出力します。
+`--list-json` の `revision` field は local path と revision 未指定の URL では空です。
+`--list-indices-json` は引き続き数値の index だけを公開します。
 
 ### wrapperの環境変数
 
@@ -307,6 +319,8 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 
 URL clone は Docker 内で行い、bind mount を使わず `docker cp` で host へ戻すため、host Git は必須にしません。
 Windows で作れない file 名は Windows host の場合だけ警告つきで除きます。
+pin がある場合は指定コミットを直接取得し、copy 前に checkout のSHAを照合します。
+取得・照合に失敗しても既定 branch には戻しません。
 clone 削除は解決済み clone root の直下に限定し、削除失敗では source job を停止します。
 clone directory / cache / container / artifact は source ごとに分離します。
 worker が結果記録前に異常終了した場合も失敗として回収し、他 source は空き枠へ順次進めます。
@@ -496,6 +510,9 @@ bash .github/scripts/test.sh all
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。
+fixture の manifest は ZMK と Zephyr の両方を検証済みコミットに固定し、firmware suite は
+取得した checkout と pin の一致も確認します。更新時は依存の差分をレビューし、影響する test layer を実行します。
+upstream の動く branch に対する互換性確認は、別途明示して実行します。
 
 代表構成と任意の外部ビルドは、builderの完成度を維持するための統合検証の例です。
 確認する契約に沿って例を選び、ソース・依存の同一性と未検証条件を証跡に記録します。

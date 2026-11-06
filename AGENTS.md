@@ -235,6 +235,12 @@ together.
   record their source/dependency identities and untested conditions without claiming universal
   compatibility or absence of defects from a successful sample.
 
+- Pin maintained external source lists and test-owned moving dependency revisions to verified full
+  commits. Review input/dependency changes and run affected integration checks when advancing pins.
+  Preserve revisions through source selection and worker arguments; failed pin fetch/verification
+  must stop without falling back to a default branch. Keep floating upstream compatibility checks
+  explicitly selected, and distinguish source pins from dependency pins in evidence and reports.
+
 - Keep module fixtures, assertions, independent oracles, mutations, selectors and validators in the
   owner's tests/; retain documented Web and non-module test layouts. CI/package scripts dispatch
   owner entries, not sibling/private suites or source-rewriting substitutes. Probes expose state,

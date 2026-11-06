@@ -19,6 +19,7 @@ ZMK_EXTERNAL_SETTINGS_RESET="${ZMK_EXTERNAL_SETTINGS_RESET:-0}"
 
 source_types=()
 source_values=()
+source_revisions=()
 slugs=()
 used_slugs=()
 build_snippets=()
@@ -40,13 +41,15 @@ Usage:
   bash scripts/auto-build-external.sh --list-json [sources.txt | source ...]
   bash scripts/auto-build-external.sh --list-indices-json [sources.txt | source ...]
 
-sources.txt accepts one source per line. Each source may be a Git URL or a
-local zmk-config path. Optional prefixes are supported: repo:<url>, path:<dir>.
+sources.txt accepts one source per line. Git URLs may be followed by a space or
+TAB and a full commit SHA. Local paths, including spaces, remain one value.
+Optional prefixes are supported: repo:<url>, path:<dir>.
 Actual builds are one build-external-source.sh process per source.
 --jobs controls target-level parallelism inside each source.
 --source-jobs controls how many sources the local wrapper starts at once.
 
 Options:
+  --revision SHA         Pin the preceding --repo to a full commit SHA.
   --mode build|validate   Select firmware build or configuration validation (default: build).
   --pristine              Reset the selected source cache before building.
   --settings-reset        Add missing settings_reset targets.
@@ -159,12 +162,13 @@ classify_source() {
 }
 
 add_source() {
-    local type="$1" value="$2" slug_override="${3:-}" base slug
+    local type="$1" value="$2" slug_override="${3:-}" revision="${4:-}" base slug
     [ -n "${value}" ] || return 0
     case "${type}" in
         repo|path) ;;
         *) echo "ERROR: source type must be repo or path: ${type}" >&2; exit 1 ;;
     esac
+    validate_source_revision "${revision}" || exit 1
     if [ -n "${slug_override}" ]; then
         base="$(sanitize_slug "${slug_override}")"
     elif [ "${type}" = "repo" ]; then
@@ -176,6 +180,7 @@ add_source() {
     slug="${UNIQUE_SLUG}"
     source_types+=("${type}")
     source_values+=("${value}")
+    source_revisions+=("${revision}")
     slugs+=("${slug}")
 }
 
@@ -189,7 +194,7 @@ add_auto_source() {
 }
 
 load_sources_file() {
-    local file="$1" line trimmed file_dir type value
+    local file="$1" line trimmed file_dir type value revision
     if [ ! -f "${file}" ]; then
         echo "ERROR: source list not found: ${file}" >&2
         echo "Create a file with one Git URL or local path per line." >&2
@@ -204,10 +209,16 @@ load_sources_file() {
         classify_source "${trimmed}"
         type="${CLASSIFIED_TYPE}"
         value="${CLASSIFIED_VALUE}"
+        revision=""
+        if [ "${type}" = repo ]; then
+            value="$(trim_line "${value}")"
+            revision="$(trim_line "${value#"${value%%[[:space:]]*}"}")"
+            value="${value%%[[:space:]]*}"
+        fi
         if [ "${type}" = "path" ]; then
             value="$(resolve_list_path "${file_dir}" "${value}")"
         fi
-        add_source "${type}" "${value}"
+        add_source "${type}" "${value}" "" "${revision}"
     done < "${file}"
 }
 
@@ -239,7 +250,7 @@ print_list() {
     [ ${#source_values[@]} -gt 0 ] || return 0
     for i in "${!source_values[@]}"; do
         cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${slugs[$i]}"
-        printf '%s\t%s\t%s\t%s\n' "${slugs[$i]}" "${cache_volume}" "${source_types[$i]}" "${source_values[$i]}"
+        printf '%s\t%s\t%s\t%s\t%s\n' "${slugs[$i]}" "${cache_volume}" "${source_types[$i]}" "${source_values[$i]}" "${source_revisions[$i]}"
     done
 }
 
@@ -259,13 +270,14 @@ print_list_json() {
             continue
         fi
         cache_volume="${ZMK_EXTERNAL_CACHE_PREFIX}-${slugs[$i]}"
-        printf '%s{"index":%s,"slug":"%s","cache_volume":"%s","type":"%s","source":"%s"}' \
+        printf '%s{"index":%s,"slug":"%s","cache_volume":"%s","type":"%s","source":"%s","revision":"%s"}' \
             "${comma}" \
             "${index}" \
             "$(json_escape "${slugs[$i]}")" \
             "$(json_escape "${cache_volume}")" \
             "$(json_escape "${source_types[$i]}")" \
-            "$(json_escape "${source_values[$i]}")"
+            "$(json_escape "${source_values[$i]}")" \
+            "${source_revisions[$i]}"
         comma=","
     done
     printf ']}\n'
@@ -287,6 +299,7 @@ builder_args_for_source() {
     local i="$1" snippet module
     if [ "${source_types[$i]}" = "repo" ]; then
         printf '%s\0%s\0' --repo "${source_values[$i]}"
+        [ -z "${source_revisions[$i]}" ] || printf '%s\0%s\0' --revision "${source_revisions[$i]}"
     else
         printf '%s\0%s\0' --path "${source_values[$i]}"
     fi
@@ -451,6 +464,16 @@ while [ "$#" -gt 0 ]; do
             last_source_index="$((${#source_values[@]} - 1))"
             shift
             ;;
+        --revision)
+            [ "$#" -ge 2 ] || { echo 'ERROR: --revision requires a value' >&2; exit 1; }
+            if [ -z "${last_source_index}" ] || [ "${source_types[$last_source_index]}" != repo ]; then
+                echo 'ERROR: --revision must follow --repo' >&2; exit 1
+            fi
+            [ -n "$2" ] || { echo 'ERROR: --revision requires a commit SHA' >&2; exit 1; }
+            validate_source_revision "$2" || exit 1
+            source_revisions[$last_source_index]="$2"
+            shift
+            ;;
         -j|--jobs)
             [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
             BUILD_JOBS="$2"
@@ -542,6 +565,7 @@ if [ -n "${SOURCE_INDEX}" ]; then
     selected_index=$((SOURCE_INDEX - 1))
     source_types=("${source_types[$selected_index]}")
     source_values=("${source_values[$selected_index]}")
+    source_revisions=("${source_revisions[$selected_index]}")
     slugs=("${slugs[$selected_index]}")
 fi
 
