@@ -132,11 +132,31 @@ assert_file_contains "${tmp_dir}/bad-pin.out" '--revision must follow --repo' 'l
 
 pin_probe="${tmp_dir}/pin-probe.sh"
 printf '#!/usr/bin/env bash\nprintf '\''%%s\\0'\'' "$@" > "$PIN_ARGV"\n' > "${pin_probe}"
-PIN_ARGV="${tmp_dir}/pinned.argv" ZMK_EXTERNAL_SOURCE_BUILDER="${pin_probe}" \
-  bash "${builder}" --sources-file "${pinned_file}" --source-index 2 --mode validate > "${tmp_dir}/pin-probe.out"
-printf '%s\0' --repo https://example.invalid/config.git --revision "${revision_two}" \
-  --source-slug config-2 --mode validate --jobs 1 > "${tmp_dir}/expected-pinned.argv"
-cmp "${tmp_dir}/expected-pinned.argv" "${tmp_dir}/pinned.argv" || fail 'worker did not receive the selected revision'
+# Define each budget independently of the invoking runner. Keep exact argv checks
+# for the selected pin while covering defaults, environment and CLI precedence.
+for budget in default environment leading-zero cli-override; do
+  case "${budget}" in
+    default) expected_jobs=1 ;;
+    environment) expected_jobs=2 ;;
+    leading-zero) expected_jobs=0002 ;;
+    cli-override) expected_jobs=3 ;;
+  esac
+  (
+    unset ZMK_BUILD_JOBS
+    jobs_args=()
+    case "${budget}" in
+      environment|cli-override) export ZMK_BUILD_JOBS=2 ;;
+      leading-zero) export ZMK_BUILD_JOBS=0002 ;;
+    esac
+    [ "${budget}" != cli-override ] || jobs_args+=(--jobs 3)
+    PIN_ARGV="${tmp_dir}/pinned.argv" ZMK_EXTERNAL_SOURCE_BUILDER="${pin_probe}" \
+      bash "${builder}" --sources-file "${pinned_file}" --source-index 2 --mode validate \
+      ${jobs_args[@]+"${jobs_args[@]}"} > "${tmp_dir}/pin-probe.out"
+  )
+  printf '%s\0' --repo https://example.invalid/config.git --revision "${revision_two}" \
+    --source-slug config-2 --mode validate --jobs "${expected_jobs}" > "${tmp_dir}/expected-pinned.argv"
+  cmp "${tmp_dir}/expected-pinned.argv" "${tmp_dir}/pinned.argv" || fail "worker pin/budget argv mismatch: ${budget}"
+done
 
 # Every repository in the maintained default list needs a pin, independent of its size.
 default_list="$(bash "${builder}" --list "${repo_root}/repos.txt")"
