@@ -123,6 +123,7 @@ such as `00` are rejected. See [Parallel builds](#parallel-builds) for concurren
 | `ZMK_CCACHE_DIR` | ccache directory inside the container (`/workspaces/.ccache`). Keep it on the cache volume for persistence. |
 | `ZMK_COPY_IGNORED` | `1` also copies files ignored by Git. |
 | `ZMK_BUILD_JOBS` | Default for `--jobs` (1). |
+| `CMAKE_BUILD_PARALLEL_LEVEL` | Positive decimal compiler-job limit per target, forwarded to CMake in the container. Empty/unset uses the selected image/tool default. |
 | `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` attempts (3). |
 | `ZMK_FALLBACK_BINARY` | Firmware extension tried after `.uf2` (`bin`). |
 | `ZMK_EXTRA_MODULES` | Container-visible module paths appended to the selected application's extra modules. |
@@ -137,7 +138,12 @@ Source processes, build targets and Ninja compilation have separate concurrency:
 | --- | --- | --- |
 | Sources in one local wrapper invocation | `--source-jobs N` / `ZMK_EXTERNAL_SOURCE_JOBS` | 1 source |
 | Targets in each source | `--jobs N` / `ZMK_BUILD_JOBS` | 1 target |
-| Compilation within a target | Ninja and the selected build environment | Build-environment default |
+| Compilation within a target | `CMAKE_BUILD_PARALLEL_LEVEL` via CMake/Ninja | Build-environment default |
+
+For two targets with at most two compiler jobs each, run
+`CMAKE_BUILD_PARALLEL_LEVEL=2 bash build.sh path/to/zmk-config --jobs 2`.
+The summary records `Build jobs` and `Compiler jobs`; `auto` for compiler jobs
+means the host supplied no limit. Source workers multiply these limits.
 
 ### Targets in one source
 
@@ -487,7 +493,8 @@ checkable, including earlier dotted suffixes without sequence metadata. The summ
 
 For a quality gate, define expected outputs independently before building and pass
 `--expect FILE` with an explicit run directory. The file contains NUL-delimited
-key/value pairs: one required `image`, optional `target` and `cache`, and one
+key/value pairs: one required `image`, optional `target`, `cache`, `jobs` and
+`compiler-jobs`, and one
 `artifact` per expected firmware basename in build mode. Validate mode accepts
 only the metadata keys. For example:
 
@@ -513,8 +520,9 @@ without an additional host parser dependency.
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Resolve the list on Ubuntu, then route each source to an eligible self-hosted runner. |
 | [Heartbeat](.github/workflows/heartbeat.yml) | Update the tracked heartbeat record; this workflow commits and pushes. |
 
-Self-hosted Build accepts optional `build_image` and `docker_platform` inputs,
-passed through the existing `ZMK_BUILD_IMAGE` and `ZMK_DOCKER_PLATFORM` variables.
+Self-hosted Build accepts optional `build_image`, `docker_platform`, `target_jobs`
+and `compiler_jobs` inputs, passed through `ZMK_BUILD_IMAGE`,
+`ZMK_DOCKER_PLATFORM`, `ZMK_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` respectively.
 Blank inputs retain the runner's environment and the builder/Docker defaults.
 The macOS job uses `/bin/bash`; the Windows job uses Git Bash explicitly.
 
@@ -610,7 +618,7 @@ bash .github/scripts/test.sh all
 | --- | --- |
 | `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module paths with spaces, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
 | `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
-| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets; exact outputs and dependency identities. |
+| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run the `shell`, `docker` and `build` layers in that order. |
 
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)

@@ -1483,12 +1483,12 @@ ccache_dir=
 # Round-trip the actual pruned Linux tree through the same host-path helper as external clone.
 (
   source "${repo_root}/scripts/build-external-source.sh"
-  mkdir -p "${tmp_dir}/clone-copy"
-  docker_no_pathconv cp "${last_container}:/tmp/windows-copy/." "$(docker_host_path "${tmp_dir}/clone-copy")"
+  mkdir -p "${tmp_dir}/.clone destination 名前/returned files"
+  docker_no_pathconv cp "${last_container}:/tmp/windows-copy/." "$(docker_host_path "${tmp_dir}/.clone destination 名前/returned files")"
 )
-[ "$(find "${tmp_dir}/clone-copy" -type f | wc -l | tr -d '[:space:]')" = 7 ]
+[ "$(find "${tmp_dir}/.clone destination 名前/returned files" -type f | wc -l | tr -d '[:space:]')" = 7 ]
 for file in keep.txt 'nested/valid name.txt' nested/COM0.txt nested/my..file.txt unicode-名前.txt $'DEL-\177.txt' COM⁴.txt; do
-  cmp "${tmp_dir}/clone-copy/${file}" <(printf 'clone payload\n')
+  cmp "${tmp_dir}/.clone destination 名前/returned files/${file}" <(printf 'clone payload\n')
 done
 # Use the existing validate container as the holder; never reset a production cache.
 : "${ZMK_DOCKER_CACHE_VOLUME:?Run Docker contracts through test.sh}"

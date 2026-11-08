@@ -115,6 +115,7 @@ firmware は compile しません。build / validate とも、新しい run dire
 | `ZMK_CCACHE_DIR` | container 内の ccache directory（`/workspaces/.ccache`）。永続化する場合は cache volume 上に置きます。 |
 | `ZMK_COPY_IGNORED` | `1` で Git が ignore する file も copy します。 |
 | `ZMK_BUILD_JOBS` | `--jobs` の既定値（1）。 |
+| `CMAKE_BUILD_PARALLEL_LEVEL` | 各 target の compile 並列数を正の十進整数で指定し、container 内の CMake へ渡します。空欄・未指定は選択した image / tool の既定値です。 |
 | `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` の試行回数（3）。 |
 | `ZMK_FALLBACK_BINARY` | `.uf2` の次に探す firmware 拡張子（`bin`）。 |
 | `ZMK_EXTRA_MODULES` | 選択した application の extra module に足す、container から参照できる path。 |
@@ -129,7 +130,12 @@ source process、各sourceのtarget、Ninjaによるcompileは、それぞれ別
 | --- | --- | --- |
 | 一つのlocal wrapperから起動するsource | `--source-jobs N` / `ZMK_EXTERNAL_SOURCE_JOBS` | 1 source |
 | 各source内のtarget | `--jobs N` / `ZMK_BUILD_JOBS` | 1 target |
-| 一つのtarget内のcompile | Ninjaと選択したbuild環境 | build環境の既定値 |
+| 一つのtarget内のcompile | CMake / Ninja 経由の `CMAKE_BUILD_PARALLEL_LEVEL` | build環境の既定値 |
+
+2 target を同時に、それぞれ最大 2 compiler jobs で build する場合は
+`CMAKE_BUILD_PARALLEL_LEVEL=2 bash build.sh path/to/zmk-config --jobs 2` を実行します。
+summary の `Build jobs` と `Compiler jobs` に記録し、compiler jobs の `auto` は host が
+上限を指定していないことを表します。source worker が複数ある場合は、その分も掛け合わせます。
 
 ### 一つのsource内のtarget
 
@@ -431,7 +437,7 @@ run 名は上記の規則に従い、衝突時だけ 2 から始まる `-N` を�
 fallback は summary に記録し、記録のない旧 summary は `bin` と解釈します。
 
 品質の検証では、実行前に独立した出力の期待値を定義し、明示run directoryとともに `--expect FILE` を渡します。
-fileはNUL区切りのkey/value対で、必須の `image` 一つ、任意の `target` と `cache`、
+fileはNUL区切りのkey/value対で、必須の `image` 一つ、任意の `target`・`cache`・`jobs`・`compiler-jobs`、
 build modeでは期待するfirmwareのbasenameごとの `artifact` を記録します。validate modeはmetadataのkeyだけを受け付けます。
 
 ```bash
@@ -454,8 +460,8 @@ local pathを含む期待値fileは非公開で保持します。Bashと標準to
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Ubuntu で list を解決し、source ごとに利用可能な self-hosted runner へ割り当てます。 |
 | [Heartbeat](.github/workflows/heartbeat.yml) | 追跡中の heartbeat 記録を更新します。commit / push を含む workflow です。 |
 
-Self-hosted Build の任意入力 `build_image` / `docker_platform` は、既存の
-`ZMK_BUILD_IMAGE` / `ZMK_DOCKER_PLATFORM` 変数へ渡します。空欄の場合は runner の環境と
+Self-hosted Build の任意入力 `build_image` / `docker_platform` / `target_jobs` / `compiler_jobs` は、それぞれ
+`ZMK_BUILD_IMAGE` / `ZMK_DOCKER_PLATFORM` / `ZMK_BUILD_JOBS` / `CMAKE_BUILD_PARALLEL_LEVEL` 変数へ渡します。空欄の場合は runner の環境と
 builder / Docker の既定値を保持します。macOS job は `/bin/bash`、Windows job は Git Bash を明示します。
 
 ### runnerの登録
@@ -536,7 +542,7 @@ bash .github/scripts/test.sh all
 | --- | --- |
 | `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白入り target / module path、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
-| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application、成果物数と依存 identity。 |
+| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
 
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は

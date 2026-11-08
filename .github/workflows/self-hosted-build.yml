@@ -30,6 +30,16 @@ on:
         required: false
         type: string
         default: ''
+      target_jobs:
+        description: Optional parallel target count; blank preserves runner environment and builder defaults
+        required: false
+        type: string
+        default: ''
+      compiler_jobs:
+        description: Optional compiler jobs per target; blank preserves runner environment and build-image defaults
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -39,6 +49,8 @@ env:
   ZMK_TEST_PRISTINE: ${{ inputs.pristine && '1' || '0' }}
   BUILD_IMAGE_INPUT: ${{ inputs.build_image }}
   DOCKER_PLATFORM_INPUT: ${{ inputs.docker_platform }}
+  TARGET_JOBS_INPUT: ${{ inputs.target_jobs }}
+  COMPILER_JOBS_INPUT: ${{ inputs.compiler_jobs }}
 
 jobs:
   macos:
@@ -60,6 +72,8 @@ jobs:
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
           if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
+          if [ -n "${TARGET_JOBS_INPUT}" ]; then export ZMK_BUILD_JOBS="${TARGET_JOBS_INPUT}"; fi
+          if [ -n "${COMPILER_JOBS_INPUT}" ]; then export CMAKE_BUILD_PARALLEL_LEVEL="${COMPILER_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else
@@ -105,6 +119,8 @@ jobs:
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
           if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
+          if [ -n "${TARGET_JOBS_INPUT}" ]; then export ZMK_BUILD_JOBS="${TARGET_JOBS_INPUT}"; fi
+          if [ -n "${COMPILER_JOBS_INPUT}" ]; then export CMAKE_BUILD_PARALLEL_LEVEL="${COMPILER_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else
@@ -150,6 +166,8 @@ jobs:
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
           if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
+          if [ -n "${TARGET_JOBS_INPUT}" ]; then export ZMK_BUILD_JOBS="${TARGET_JOBS_INPUT}"; fi
+          if [ -n "${COMPILER_JOBS_INPUT}" ]; then export CMAKE_BUILD_PARALLEL_LEVEL="${COMPILER_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else

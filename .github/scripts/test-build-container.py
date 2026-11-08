@@ -324,21 +324,24 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                         self.assertIn('publication-check', step['if'])
         self.assertEqual(uploads, 6)
 
-    def test_self_hosted_workflow_preserves_and_quotes_image_inputs(self):
+    def test_self_hosted_workflow_preserves_and_quotes_build_inputs(self):
         workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
                              Loader=yaml.BaseLoader)
         inputs = workflow['on']['workflow_dispatch']['inputs']
-        for name in ('build_image', 'docker_platform'):
+        for name in ('build_image', 'docker_platform', 'target_jobs', 'compiler_jobs'):
             self.assertIn(name, inputs)
             self.assertEqual(inputs[name]['type'], 'string')
             self.assertEqual(inputs[name]['default'], '')
         self.assertEqual(workflow['env']['BUILD_IMAGE_INPUT'], '${{ inputs.build_image }}')
         self.assertEqual(workflow['env']['DOCKER_PLATFORM_INPUT'], '${{ inputs.docker_platform }}')
+        self.assertEqual(workflow['env']['TARGET_JOBS_INPUT'], '${{ inputs.target_jobs }}')
+        self.assertEqual(workflow['env']['COMPILER_JOBS_INPUT'], '${{ inputs.compiler_jobs }}')
         folder = self.root / '.github/scripts'
         folder.mkdir(parents=True)
         (folder / 'check-build-output.sh').write_text(
             '#!/usr/bin/env bash\nset -eu\n'
-            'printf "%s\\0" "$ZMK_BUILD_IMAGE" "$ZMK_DOCKER_PLATFORM" "$@" >> "$WORKFLOW_CAPTURE"\n')
+            'printf "%s\\0" "$ZMK_BUILD_IMAGE" "$ZMK_DOCKER_PLATFORM" "$ZMK_BUILD_JOBS" '
+            '"$CMAKE_BUILD_PARALLEL_LEVEL" "$@" >> "$WORKFLOW_CAPTURE"\n')
         calls = self.root / 'calls'
         marker = self.root / 'must-not-execute'
         executions = 0
@@ -356,16 +359,19 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                     with self.subTest(job=job_id, mode=mode, supplied=supplied):
                         calls.write_bytes(b'')
                         platform = 'linux/amd64' if supplied else ''
+                        jobs = '2' if supplied and supplied.endswith('1' * 64) else supplied
                         env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT=supplied,
                                    DOCKER_PLATFORM_INPUT=platform, ZMK_BUILD_IMAGE='synthetic.invalid/retained:v1',
-                                   ZMK_DOCKER_PLATFORM='linux/arm64', WORKFLOW_CAPTURE=str(calls))
+                                   ZMK_DOCKER_PLATFORM='linux/arm64', TARGET_JOBS_INPUT=jobs,
+                                   COMPILER_JOBS_INPUT=jobs, ZMK_BUILD_JOBS='3',
+                                   CMAKE_BUILD_PARALLEL_LEVEL='4', WORKFLOW_CAPTURE=str(calls))
                         result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
                                                 cwd=self.root, env=env, capture_output=True)
                         self.assertEqual(result.returncode, 0, result.stderr.decode())
                         expected = []
                         for selection in (('all',) if mode == 'build' else ('shell', 'docker')):
                             expected += [supplied or 'synthetic.invalid/retained:v1',
-                                         platform or 'linux/arm64', 'ci-tests', selection]
+                                         platform or 'linux/arm64', jobs or '3', jobs or '4', 'ci-tests', selection]
                         actual = calls.read_bytes().decode().split('\0')
                         self.assertEqual(actual, expected + [''])
                         self.assertFalse(marker.exists(), 'input was executed as shell code')
@@ -400,7 +406,8 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                     with self.subTest(job=job_id, mode=mode, status=status):
                         calls.write_bytes(b'')
                         env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT='',
-                                   DOCKER_PLATFORM_INPUT='', PREFLIGHT_STATUS=str(status),
+                                   DOCKER_PLATFORM_INPUT='', TARGET_JOBS_INPUT='', COMPILER_JOBS_INPUT='',
+                                   PREFLIGHT_STATUS=str(status),
                                    WORKFLOW_CAPTURE=str(calls))
                         result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
                                                  preflight['run'] + '\n' + suite['run']],
@@ -525,6 +532,32 @@ elif args[0] != "start": sys.exit(99)
                 commands = [json.loads(row) for row in calls.read_text().splitlines()]
                 self.assertEqual([row[-4] for row in commands if row[0] == 'create'], [expected])
                 self.assertFalse(any('python3' in row for row in commands))
+
+    def test_compiler_jobs_host_validation_and_container_forwarding(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for index, value in enumerate((None, '', '2', '0002', '10', '0', '00', '-1', '1.5', ' 2', '2\n', 'bad')):
+            with self.subTest(value=value):
+                calls = self.root / ('compiler-%d.calls' % index)
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE='synthetic/build:fixed',
+                           ZMK_KEEP_CONTAINER='0', IMAGE_CALLS=str(calls))
+                env.pop('CMAKE_BUILD_PARALLEL_LEVEL', None)
+                if value is not None: env['CMAKE_BUILD_PARALLEL_LEVEL'] = value
+                result = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                        text=True, capture_output=True, timeout=15)
+                valid = value in (None, '', '2', '0002', '10')
+                self.assertEqual(result.returncode, 0 if valid else 1, result.stdout + result.stderr)
+                if not valid:
+                    self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL must be a positive integer', result.stderr)
+                    self.assertFalse(calls.exists(), 'invalid compiler count reached Docker')
+                    continue
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                create = next(row for row in commands if row[0] == 'create')
+                compiler_env = [arg for arg in create if arg.startswith('CMAKE_BUILD_PARALLEL_LEVEL=')]
+                expected = [] if not value else ['CMAKE_BUILD_PARALLEL_LEVEL=' + value.lstrip('0')]
+                self.assertEqual(compiler_env, expected, 'host override must reach Docker without replacing image defaults')
+                if compiler_env: self.assertEqual(create[create.index(compiler_env[0]) - 1], '-e')
 
     def test_auto_image_switch_cancellation_finishes_bootstrap_cleanup(self):
         binary = self.make_image_selection_daemon()
@@ -986,6 +1019,8 @@ elif sys.argv[1] == 'manifest':
 elif sys.argv[1] == 'zephyr-export': pass
 elif sys.argv[1] == 'build':
     print('controlled build boundary reached')
+    with open(os.environ['PROBE_BUILD_ENV'], 'a') as log:
+        log.write(json.dumps({'compiler_jobs': os.environ.get('CMAKE_BUILD_PARALLEL_LEVEL')}) + '\\n')
     build = pathlib.Path(sys.argv[sys.argv.index('-d') + 1])
     (build / 'zephyr').mkdir(parents=True, exist_ok=True)
     (build / 'intermediate.o').write_text('temporary compiler output\\n')
@@ -1031,6 +1066,7 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                    EXTERNAL_MODULES_DIR=str(inputs), OUTPUT_DIR=str(case_root / 'output'),
                    PATH=str(fake_bin) + ('' if fail_remove else os.pathsep + os.environ['PATH']),
                    PROBE_COMMANDS=str(commands), PROBE_ARGV=str(commands.with_suffix('.argv.jsonl')),
+                   PROBE_BUILD_ENV=str(case_root / 'build-env.jsonl'),
                    PROBE_PROJECT_PATH=project_path, PROBE_CONTROL=str(control), PROBE_UPDATE_COUNT=str(counter),
                    PROBE_FAIL_COPY=str(int(fail_copy)), PROBE_PROJECT_DIR=str(project),
                    PROBE_REAL_WEST=shutil.which('west'), PROBE_REAL_RM=shutil.which('rm'))
@@ -1038,6 +1074,27 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                                inputs=inputs, backup=backup, stamp=stamp, manifest_stamp=manifest_stamp,
                                digest=digest, ready=ready, commands=commands, counter=counter, control=control,
                                lock=lock, env=env)
+
+    def test_compiler_jobs_container_validation_before_workspace_mutation(self):
+        for value in (None, '', '2', '0002', '0', '00', '-1', '1.5', ' 2', '2\n', 'bad'):
+            with self.subTest(value=value):
+                case = self.make_workspace()
+                case.env.pop('CMAKE_BUILD_PARALLEL_LEVEL', None)
+                case.env['PROBE_BUILD_EXIT'] = '0'
+                if value is not None: case.env['CMAKE_BUILD_PARALLEL_LEVEL'] = value
+                original_stamp = case.stamp.read_bytes()
+                result, output = self.run_workspace(case)
+                valid = value in (None, '', '2', '0002')
+                self.assertEqual(result.returncode, 0 if valid else 1, output)
+                if valid:
+                    captured = [json.loads(row) for row in pathlib.Path(case.env['PROBE_BUILD_ENV']).read_text().splitlines()]
+                    self.assertEqual(captured, [{'compiler_jobs': value.lstrip('0') if value else value}])
+                else:
+                    self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL must be a positive integer', output)
+                    self.assertEqual(case.commands.read_bytes(), b'')
+                    self.assertEqual(case.stamp.read_bytes(), original_stamp)
+                    self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+                    self.assertFalse(pathlib.Path(case.env['PROBE_BUILD_ENV']).exists())
 
     def run_workspace(self, case):
         result = subprocess.run(['bash', str(BUILD), 'build'], env=case.env,

@@ -410,13 +410,25 @@ fi
 # contradictory status or a second mode/count/fallback later in the file.
 # All fields are read before the failure excerpt; sequence has already been checked.
 for field in Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed \
-    'Built targets' Pristine 'Build jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
+    'Built targets' Pristine 'Build jobs' 'Compiler jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
   field_count="$(summary_metadata "${build_summary}" | grep -c "^${field}:" || true)"
   if [ "${field_count}" -gt 1 ]; then
     echo "duplicate summary field: ${field}: ${build_summary}" >&2
     exit 1
   fi
 done
+
+# Older summaries omit this field. New ones record an explicit decimal cap or
+# auto, which leaves the selected image/build tool in control.
+compiler_jobs="$(summary_metadata "${build_summary}" | sed -n 's/^Compiler jobs: //p')"
+case "${compiler_jobs}" in
+  '')
+    if summary_metadata "${build_summary}" | grep '^Compiler jobs:' >/dev/null; then
+      echo 'invalid Compiler jobs in summary' >&2; exit 1
+    fi ;;
+  auto) ;;
+  *[!0-9]*|0*) echo 'invalid Compiler jobs in summary' >&2; exit 1 ;;
+esac
 
 # Drain metadata; grep -q can terminate the producer with SIGPIPE on large summaries.
 if ! summary_metadata "${build_summary}" | grep -x 'Status: SUCCESS' >/dev/null; then
@@ -474,7 +486,7 @@ fi
 
 check_expected_output() {
   local key value field actual count name previous file matched
-  local expected_image=0 expected_target=0 expected_cache=0
+  local expected_image=0 expected_target=0 expected_cache=0 expected_jobs=0 expected_compiler_jobs=0
   local artifacts=()
   # NUL-delimited key/value pairs preserve paths and literal shell characters.
   # The caller supplies the oracle before the run; do not learn it from outputs.
@@ -492,6 +504,12 @@ check_expected_output() {
       cache)
         [ "${expected_cache}" = 0 ] || { echo 'Invalid output expectations: duplicate cache.' >&2; return 1; }
         expected_cache=1; field='Docker cache volume' ;;
+      jobs)
+        [ "${expected_jobs}" = 0 ] || { echo 'Invalid output expectations: duplicate jobs.' >&2; return 1; }
+        expected_jobs=1; field='Build jobs' ;;
+      compiler-jobs)
+        [ "${expected_compiler_jobs}" = 0 ] || { echo 'Invalid output expectations: duplicate compiler-jobs.' >&2; return 1; }
+        expected_compiler_jobs=1; field='Compiler jobs' ;;
       artifact)
         case "${value}" in
           ''|.|..|*/*|*\\*|build.log|build-summary.txt)

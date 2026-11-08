@@ -51,6 +51,7 @@ Environment:
   ZMK_DOCKER_CACHE_VOLUME    Docker volume mounted at /workspaces (default: zmk-cache).
   ZMK_CCACHE_DIR             ccache directory inside the container (default: /workspaces/.ccache, on the cache volume).
   ZMK_BUILD_JOBS             Number of build.yaml targets to build in parallel (default: 1).
+  CMAKE_BUILD_PARALLEL_LEVEL Compiler jobs per target (default: build-image/tool default).
   ZMK_WEST_UPDATE_ATTEMPTS   Number of west update attempts before failing (default: 3).
   ZMK_FALLBACK_BINARY        Fallback firmware extension after uf2 (default: bin).
   ZMK_COPY_IGNORED           Set to 1 to copy files that Git ignores too (default: skipped in a Git working tree).
@@ -64,6 +65,16 @@ validate_positive_int() {
         *[1-9]*) return 0 ;;
     esac
     die "${label} must be a positive integer: ${value}"
+}
+
+configure_compiler_jobs() {
+    [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ] || return 0
+    validate_positive_int "CMAKE_BUILD_PARALLEL_LEVEL" "${CMAKE_BUILD_PARALLEL_LEVEL}"
+    # CMake expects decimal; avoid octal interpretation and shell integer overflow.
+    while [ "${CMAKE_BUILD_PARALLEL_LEVEL#0}" != "${CMAKE_BUILD_PARALLEL_LEVEL}" ]; do
+        CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL#0}"
+    done
+    export CMAKE_BUILD_PARALLEL_LEVEL
 }
 
 validate_firmware_extension() {
@@ -1250,6 +1261,7 @@ PY
         echo -e "\n${GREEN}Build complete: ${built} target(s).${NC}"
     }
 
+    configure_compiler_jobs
     case "${1:-}" in
         validate)
             shift
@@ -1828,6 +1840,7 @@ write_summary() (
         fi
         echo "Pristine: ${PRISTINE}"
         echo "Build jobs: ${BUILD_JOBS}"
+        echo "Compiler jobs: ${CMAKE_BUILD_PARALLEL_LEVEL:-auto}"
         echo "Fallback binary: ${ZMK_FALLBACK_BINARY:-bin}"
         echo "Extra snippets: ${HOST_SNIPPETS:-<none>}"
         if [ ${#MODULES[@]} -gt 0 ]; then
@@ -1929,6 +1942,7 @@ create_run_directory() {
 validate_host_layout
 validate_module_inputs
 validate_positive_int "build jobs" "${BUILD_JOBS}"
+configure_compiler_jobs
 validate_positive_int "ZMK_WEST_UPDATE_ATTEMPTS" "${ZMK_WEST_UPDATE_ATTEMPTS:-3}"
 validate_firmware_extension "${ZMK_FALLBACK_BINARY:-bin}"
 require_host_commands docker tar
@@ -1958,6 +1972,7 @@ msg "Target: ${TARGET_DIR}"
 msg "Docker image: ${zmk_build_image}"
 msg "Docker cache volume: ${zmk_cache_volume}"
 msg "Build jobs: ${BUILD_JOBS}"
+msg "Compiler jobs: ${CMAKE_BUILD_PARALLEL_LEVEL:-auto}"
 msg "Container: ${container_name}"
 run_phase=reserved
 [ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
@@ -1976,6 +1991,9 @@ start_build_container() {
     docker_create_args=(create --name "${container_name}")
     if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
         docker_create_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
+    fi
+    if [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
+        docker_create_args+=(-e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}")
     fi
     # Keep platform and default paths on one set of volume/environment arguments.
     container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"

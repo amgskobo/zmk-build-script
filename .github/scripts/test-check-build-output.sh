@@ -430,7 +430,7 @@ run_ok validate "${run_path}"
 
 # Reject contradictory/duplicate summary fields instead of accepting one matching line.
 for field in Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed \
-    'Built targets' Pristine 'Build jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
+    'Built targets' Pristine 'Build jobs' 'Compiler jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
   reset_case
   write_summary <<'EOF'
 Status: SUCCESS
@@ -445,6 +445,16 @@ EOF
   esac
   printf '%s: conflicting\n' "${field}" >> "${run_path}/build-summary.txt"
   run_fail build "duplicate summary field: ${field}"
+done
+
+# Old summaries without compiler metadata remain valid; explicit values are strict.
+for compiler in auto 2 10 '' 0 00 02 -1 1.5 ' 2' bad; do
+  reset_case
+  printf 'Status: SUCCESS\nMode: validate\nCompiler jobs: %s\n' "${compiler}" > "${run_path}/build-summary.txt"
+  case "${compiler}" in
+    auto|2|10) run_ok validate "${run_path}" ;;
+    *) run_fail validate 'invalid Compiler jobs' "${run_path}" ;;
+  esac
 done
 
 # Caller-owned expectations catch wrong outputs even when their count is unchanged.
@@ -484,6 +494,18 @@ strict_summary
 : > "${run_path}/left.uf2"
 run_fail build 'empty expected firmware' "${run_path}" "${expected_file}"
 printf 'synthetic firmware\n' > "${run_path}/left.uf2"
+
+strict_summary
+printf 'Build jobs: 2\nCompiler jobs: 2\n' >> "${run_path}/build-summary.txt"
+cp "${expected_file}" "${tmp_dir}/parallel.expect"
+printf '%s\0' jobs 2 compiler-jobs 2 >> "${tmp_dir}/parallel.expect"
+run_ok build "${run_path}" "${tmp_dir}/parallel.expect"
+for key in jobs compiler-jobs; do
+  printf '%s\0' image synthetic/build:stable artifact left.uf2 artifact right.bin "${key}" 3 > "${tmp_dir}/jobs.expect"
+  run_fail build 'does not match summary' "${run_path}" "${tmp_dir}/jobs.expect"
+  printf '%s\0' image synthetic/build:stable artifact left.uf2 artifact right.bin "${key}" 2 "${key}" 2 > "${tmp_dir}/jobs.expect"
+  run_fail build "Invalid output expectations: duplicate ${key}" "${run_path}" "${tmp_dir}/jobs.expect"
+done
 
 for invalid in duplicate-image duplicate-artifact unknown-key truncated-value truncated-key no-image no-artifact path-artifact reserved-artifact; do
   case "${invalid}" in
