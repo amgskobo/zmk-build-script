@@ -137,26 +137,28 @@ archive_private_evidence() (
   local root="$1" parent base archive=""
   # Resolve the existing parent before creating anything; never archive into checkout.
   root="${root%/}"
-  parent="$(cd "$(dirname "${root}")" && pwd -P)"
+  parent="$(cd "$(dirname "${root}")" && pwd -P)" || exit "$?"
   base="$(basename "${root}")"
   case "${base}" in ''|.|..) echo 'Invalid private evidence directory.' >&2; exit 1 ;; esac
   root="${parent}/${base}"
   case "${root}/" in "${repo_root}/"*) echo 'Private evidence must be outside checkout.' >&2; exit 1 ;; esac
   [ ! -L "${root}" ] || { echo 'Private evidence root must not be a symlink.' >&2; exit 1; }
-  mkdir -p "${root}"
-  root="$(cd "${root}" && pwd -P)"
+  mkdir -p "${root}" || exit "$?"
+  root="$(cd "${root}" && pwd -P)" || exit "$?"
   case "${root}/" in "${repo_root}/"*) echo 'Private evidence must be outside checkout.' >&2; exit 1 ;; esac
-  archive="$(mktemp -d "${root}/execution-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  archive="$(mktemp -d "${root}/execution-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")" || exit "$?"
   trap 'status=$?; if [ "$status" != 0 ]; then printf "FAILED\n" > "$archive/archive-status.txt"; fi; exit "$status"' EXIT
-  printf 'INCOMPLETE\n' > "${archive}/archive-status.txt"
+  # Explicitly propagate failures: Bash 3.2 can continue past a failed pipeline
+  # in this subshell function when its EXIT trap is installed.
+  printf 'INCOMPLETE\n' > "${archive}/archive-status.txt" || exit "$?"
   {
-    printf 'Run: %s\nAttempt: %s\nJob: %s\n' "${GITHUB_RUN_ID:-local}" "${GITHUB_RUN_ATTEMPT:-1}" "${GITHUB_JOB:-local}"
-    printf 'Source revision: '
-    git rev-parse HEAD 2>/dev/null || printf 'unavailable\n'
-  } > "${archive}/context.txt"
-  printf '%s\n' "${archive}" > .build/ci-evidence.record
-  tar cf - .build | (cd "${archive}" && tar xf -)
-  printf 'COMPLETE\n' > "${archive}/archive-status.txt"
+    printf 'Run: %s\nAttempt: %s\nJob: %s\n' "${GITHUB_RUN_ID:-local}" "${GITHUB_RUN_ATTEMPT:-1}" "${GITHUB_JOB:-local}" || exit "$?"
+    printf 'Source revision: ' || exit "$?"
+    git rev-parse HEAD 2>/dev/null || printf 'unavailable\n' || exit "$?"
+  } > "${archive}/context.txt" || exit "$?"
+  printf '%s\n' "${archive}" > .build/ci-evidence.record || exit "$?"
+  tar cf - .build | (cd "${archive}" && tar xf -) || exit "$?"
+  printf 'COMPLETE\n' > "${archive}/archive-status.txt" || exit "$?"
 )
 
 if [ "${mode}" = ci-archive ]; then

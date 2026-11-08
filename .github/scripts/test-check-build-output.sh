@@ -736,22 +736,34 @@ archive_bin="${tmp_dir}/archive-bin"
 mkdir "${archive_bin}"
 cat > "${archive_bin}/tar" <<'EOF'
 #!/usr/bin/env bash
+case "${ARCHIVE_FAILURE_SIDE}:$1" in
+  both:*) ;;
+  pack:cf|unpack:xf) "${ARCHIVE_REAL_TAR}" "$@" || exit "$?" ;;
+  *) exec "${ARCHIVE_REAL_TAR}" "$@" ;;
+esac
 echo 'injected archive copy failure' >&2
 exit 23
 EOF
 chmod +x "${archive_bin}/tar"
-if (cd "${ci_root}"; PATH="${archive_bin}:${PATH}" \
-    bash .github/scripts/check-build-output.sh ci-archive "${archive_root}") \
-    >"${tmp_dir}/archive-failure-console" 2>&1; then
-  echo 'private archive copy failure was accepted' >&2; exit 1
-fi
-partial_archive="$(cat "${ci_root}/.build/ci-evidence.record")"
-[ "${partial_archive}" != "${archive}" ]
-grep -qx FAILED "${partial_archive}/archive-status.txt"
-grep -qx COMPLETE "${archive}/archive-status.txt"
-if grep -Eq 'injected|private archives|synthetic-private|secret=' "${tmp_dir}/archive-failure-console"; then
-  echo 'private archive failure diagnostics reached the CI console' >&2; exit 1
-fi
+archive_real_tar="$(command -v tar)"
+for archive_failure_side in both pack unpack; do
+  if (cd "${ci_root}"; PATH="${archive_bin}:${PATH}" \
+      ARCHIVE_REAL_TAR="${archive_real_tar}" ARCHIVE_FAILURE_SIDE="${archive_failure_side}" \
+      bash .github/scripts/check-build-output.sh ci-archive "${archive_root}") \
+      >"${tmp_dir}/archive-${archive_failure_side}-failure-console" 2>&1; then
+    echo "private archive ${archive_failure_side} failure was accepted" >&2; exit 1
+  else
+    archive_failure_status=$?
+  fi
+  [ "${archive_failure_status}" = 23 ] || { echo 'private archive lost the copy failure status' >&2; exit 1; }
+  partial_archive="$(cat "${ci_root}/.build/ci-evidence.record")"
+  [ "${partial_archive}" != "${archive}" ]
+  grep -qx FAILED "${partial_archive}/archive-status.txt"
+  grep -qx COMPLETE "${archive}/archive-status.txt"
+  if grep -Eq 'injected|private archives|synthetic-private|secret=' "${tmp_dir}/archive-${archive_failure_side}-failure-console"; then
+    echo 'private archive failure diagnostics reached the CI console' >&2; exit 1
+  fi
+done
 git -C "${ci_root}" init -q
 git -C "${ci_root}" clean -ffdx -- .build >"${tmp_dir}/archive-checkout-clean.log"
 [ ! -e "${ci_root}/.build" ]

@@ -18,6 +18,8 @@ fixture="${tool_root}/.github/fixtures/ci-zmk-config"
 container_logs=()
 last_container=""
 test_failure_line=""
+test_current_line=0
+test_previous_line=0
 
 remember_host_failure() {
   [ -n "${test_failure_line}" ] || test_failure_line="$1"
@@ -48,8 +50,14 @@ cleanup() {
   fi
   rm -rf "${tmp_dir}"
 }
-trap 'remember_host_failure "$LINENO"' ERR
-trap 'cleanup "$?" "${test_failure_line:-$LINENO}"' EXIT
+trap 'remember_host_failure "${test_previous_line}"' ERR
+trap 'cleanup "$?" "${test_failure_line:-$test_previous_line}"' EXIT
+if [ "${mode}" = host ]; then
+  # Bash 3.2 reports the enclosing compound command's final line in ERR/EXIT.
+  # DEBUG also runs before those handlers; retain the preceding command's line.
+  # Keep only numeric locations, never command text or raw diagnostic contents.
+  trap 'test_previous_line=$test_current_line; test_current_line=$LINENO' DEBUG
+fi
 
 summary_from_log() {
   local run
