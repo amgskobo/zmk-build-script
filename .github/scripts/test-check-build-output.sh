@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 checker="${repo_root}/.github/scripts/check-build-output.sh"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/zmk-output-check.XXXXXX")"
 case_root="${tmp_dir}/case"
-run_name="run-2026-05-23_00-00-00-pid-1"
+run_name="run-2026-05-23_00-00-00-ci-zmk-config"
 run_path="${case_root}/.build/${run_name}"
 
 cleanup() {
@@ -69,6 +69,23 @@ Mode: validate
 EOF
 run_ok validate
 
+# The config label follows the timestamp; collision suffixes use hyphens.
+for suffix in -2 -10; do
+  renamed="${run_path}${suffix}"
+  mv "${run_path}" "${renamed}"
+  run_ok validate "${renamed}"
+  mv "${renamed}" "${run_path}"
+done
+for suffix in .0 .00 .1 .01 .2x . .2.3; do
+  run_fail validate 'run directory' "${run_path}${suffix}"
+done
+for historical_name in run-2026-05-23_00-00-00 run-2026-05-23_00-00-00-2 run-2026-05-23_00-00-00-pid-1 run-2026-05-23_00-00-00-ci-zmk-config.2; do
+  historical_path="${case_root}/.build/${historical_name}"
+  mv "${run_path}" "${historical_path}"
+  run_ok validate "${historical_path}"
+  mv "${historical_path}" "${run_path}"
+done
+
 reset_case
 write_summary <<'EOF'
 ZMK Build Summary
@@ -113,6 +130,86 @@ Built targets: 2
 EOF
 touch "${run_path}/left.uf2" "${run_path}/right.hex"
 run_ok build
+
+# Every run is self-contained; other runs and nested outputs do not change its count.
+for name in left.uf2 right.hex; do
+  printf 'synthetic firmware\n' > "${run_path}/${name}"
+done
+mkdir -p "${run_path}/nested" "${case_root}/.build/unrelated-output/${run_name}"
+printf 'unrelated nested firmware\n' > "${run_path}/nested/extra.bin"
+printf 'unrelated firmware\n' > "${case_root}/.build/unrelated-output/${run_name}/extra.bin"
+printf '%s\0' image synthetic/build artifact left.uf2 artifact right.hex > "${tmp_dir}/layout.expect"
+printf 'Docker image: synthetic/build\n' >> "${run_path}/build-summary.txt"
+run_ok build "${run_path}" "${tmp_dir}/layout.expect"
+legacy_run="${case_root}/.build/run-2026-05-23_00-00-00-pid-1"
+mv "${run_path}" "${legacy_run}"
+run_ok build "${legacy_run}" "${tmp_dir}/layout.expect"
+mv "${legacy_run}" "${run_path}"
+
+# The summary disambiguates a collision from a numeric repository-name suffix.
+reset_case
+write_summary <<'EOF'
+Status: FAILED
+Mode: validate
+Run sequence: 1
+EOF
+for sequence in 9 10; do
+  mkdir -p "${run_path}-${sequence}"
+  printf 'synthetic log\n' > "${run_path}-${sequence}/build.log"
+  printf 'Status: FAILED\nMode: validate\nRun sequence: %s\n' "${sequence}" > "${run_path}-${sequence}/build-summary.txt"
+done
+printf 'Status: SUCCESS\nMode: validate\nRun sequence: 10\n' > "${run_path}-10/build-summary.txt"
+run_ok validate
+
+# A numeric repository suffix belongs to its label, never to the collision number.
+reset_case
+write_summary <<'EOF'
+Status: FAILED
+Mode: validate
+Run sequence: 1
+EOF
+numeric_path="${case_root}/.build/run-2026-05-23_00-00-00-numeric-10"
+mv "${run_path}" "${numeric_path}"
+mkdir -p "${numeric_path}-2"
+printf 'synthetic log\n' > "${numeric_path}-2/build.log"
+printf 'Status: SUCCESS\nMode: validate\nRun sequence: 2\n' > "${numeric_path}-2/build-summary.txt"
+run_ok validate
+
+# New sequence metadata is optional for legacy evidence, but must be valid and match when present.
+reset_case
+for sequence in '' 0 00 01 -1 bad; do
+  printf 'Status: SUCCESS\nMode: validate\nRun sequence: %s\n' "${sequence}" > "${run_path}/build-summary.txt"
+  run_fail validate 'Invalid run sequence' "${run_path}"
+done
+printf 'Status: SUCCESS\nMode: validate\nRun sequence: 2\n' > "${run_path}/build-summary.txt"
+run_fail validate 'Run sequence does not match' "${run_path}"
+printf 'Status: SUCCESS\nMode: validate\nRun sequence: 1\nRun sequence: 2\n' > "${run_path}/build-summary.txt"
+run_fail validate 'duplicate summary field: Run sequence' "${run_path}"
+
+# Failed log excerpts are raw evidence, not sequence metadata for later run selection.
+for metadata in current legacy; do
+  reset_case
+  case "${metadata}" in current) sequence_line='Run sequence: 1' ;; legacy) sequence_line='' ;; esac
+  write_summary <<EOF
+Status: FAILED
+Mode: validate
+${sequence_line}
+
+Files
+-----
+- build.log
+
+Failure excerpt
+---------------
+Run sequence: 7
+EOF
+  later_run="${case_root}/.build/run-2026-05-24_00-00-00-ci-zmk-config"
+  mkdir -p "${later_run}"
+  printf 'synthetic later log\n' > "${later_run}/build.log"
+  printf 'Status: SUCCESS\nMode: validate\nRun sequence: 1\n' > "${later_run}/build-summary.txt"
+  run_ok validate
+  run_fail validate 'does not report success' "${run_path}"
+done
 
 reset_case
 write_summary <<'EOF'
@@ -241,8 +338,99 @@ EOF
   run_ok build
 done
 
+# Required metadata cannot be supplied by raw output in the failure excerpt.
+echo '[output-contract] metadata header boundary'
+reset_case
+write_summary <<'EOF'
+Mode: validate
+Run sequence: 1
+
+Files
+-----
+- build.log
+
+Failure excerpt
+---------------
+Status: SUCCESS
+EOF
+run_fail validate 'does not report success' "${run_path}"
+
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+
+Failure excerpt
+---------------
+Mode: validate
+EOF
+run_fail validate 'mode is <missing>' "${run_path}"
+
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+
+Failure excerpt
+---------------
+Built targets: 1
+EOF
+printf 'synthetic firmware\n' > "${run_path}/selected.bin"
+run_fail build 'does not include Built targets' "${run_path}"
+
+# Expected image/input/cache values must also appear in metadata, even when raw output matches.
+for missing in image target cache; do
+  reset_case
+  case "${missing}" in
+    image) field='Docker image'; field_value=synthetic/build:stable ;;
+    target) field=Target; field_value=/synthetic/config ;;
+    cache) field='Docker cache volume'; field_value=synthetic-cache ;;
+  esac
+  {
+    printf 'Status: SUCCESS\nMode: build\nBuilt targets: 1\n'
+    [ "${missing}" = image ] || printf 'Docker image: synthetic/build:stable\n'
+    [ "${missing}" = target ] || printf 'Target: /synthetic/config\n'
+    [ "${missing}" = cache ] || printf 'Docker cache volume: synthetic-cache\n'
+    printf '\nFailure excerpt\n---------------\n'
+    printf '%s: %s\n' "${field}" "${field_value}"
+  } > "${run_path}/build-summary.txt"
+  printf 'synthetic firmware\n' > "${run_path}/selected.bin"
+  printf '%s\0' image synthetic/build:stable target /synthetic/config cache synthetic-cache \
+    artifact selected.bin > "${tmp_dir}/header.expect"
+  run_fail build "missing or duplicate expected summary field: ${field}" "${run_path}" "${tmp_dir}/header.expect"
+done
+
+# Real header fields are unaffected by misleading excerpt lines.
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 1
+Fallback binary: img
+
+Failure excerpt
+---------------
+Status: FAILED
+Mode: validate
+Built targets: 99
+Fallback binary: other
+EOF
+printf 'synthetic firmware\n' > "${run_path}/selected.img"
+run_ok build "${run_path}"
+
+# Reading a large metadata section must drain its producers instead of failing through SIGPIPE.
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+Module inputs:
+EOF
+awk 'BEGIN { for (i=0; i<20000; i++) print "  - synthetic/module-with-a-long-and-clearly-synthetic-name-" i }' \
+  >> "${run_path}/build-summary.txt"
+run_ok validate "${run_path}"
+
 # Reject contradictory/duplicate summary fields instead of accepting one matching line.
-for field in Status Mode 'Built targets' 'Fallback binary'; do
+for field in Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed \
+    'Built targets' Pristine 'Build jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
   reset_case
   write_summary <<'EOF'
 Status: SUCCESS
@@ -251,6 +439,10 @@ Built targets: 1
 Fallback binary: bin
 EOF
   touch "${run_path}/selected.bin"
+  case "${field}" in
+    Status|Mode|'Built targets'|'Fallback binary') ;;
+    *) printf '%s: original\n' "${field}" >> "${run_path}/build-summary.txt" ;;
+  esac
   printf '%s: conflicting\n' "${field}" >> "${run_path}/build-summary.txt"
   run_fail build "duplicate summary field: ${field}"
 done
@@ -287,7 +479,7 @@ strict_summary synthetic/build:stable /synthetic/config wrong-cache
 run_fail build 'expected Docker cache volume' "${run_path}" "${expected_file}"
 strict_summary
 printf 'Docker image: synthetic/build:stable\n' >> "${run_path}/build-summary.txt"
-run_fail build 'duplicate expected summary field' "${run_path}" "${expected_file}"
+run_fail build 'duplicate summary field: Docker image' "${run_path}" "${expected_file}"
 strict_summary
 : > "${run_path}/left.uf2"
 run_fail build 'empty expected firmware' "${run_path}" "${expected_file}"

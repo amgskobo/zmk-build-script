@@ -400,6 +400,8 @@ reclamation belongs to the host operating system.
 During execution, SIGINT and SIGTERM finalize a FAILED run with the interruption
 reason. A retained container is stopped on interruption; its identity and logs
 remain available.
+Initial run-directory reservation defers cancellation until ownership, the run
+sequence and log are recorded, retaining a FAILED summary before Docker starts.
 During container creation (including an automatic image pull), cancellation is
 deferred until the returned ID has been acquired, including process-group
 interruptions. Repeated cancellation does not abandon an unidentified container.
@@ -424,11 +426,38 @@ or leading dot/hyphen. CI uploads the publication reports described below;
 firmware and raw logs remain in local `.build/` storage.
 
 ```text
-.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
+.build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne/
 +-- example_corne_left.uf2
++-- example_corne_right.uf2
 +-- build.log
 +-- build-summary.txt
 ```
+
+Each run keeps all firmware, its combined log and summary together. The timestamp
+uses local time and is followed by the config repository's directory name, such
+as `zmk-config-corne`. The display label is lowercased, replaces runs of characters
+outside ASCII letters/digits/underscore/hyphen with a hyphen, and is limited to
+80 characters with edge hyphens removed; an empty result uses `config`. Dots in
+repository names become hyphens as part of this normalization.
+Simultaneous runs with the same timestamp and label add `-2`, `-3`, and so on
+through an atomic directory reservation. Existing output is never overwritten.
+The summary records `Run sequence` (1 for the first run), so a label ending in
+digits can be distinguished from the collision suffix. Status, mode, count,
+fallback, sequence and expected image/input/cache checks read metadata before
+the failure excerpt. Raw log lines cannot supply or override these fields.
+
+Identify the built targets inside the run from the firmware names and summary's
+file list. Firmware names come from the existing container-side `build.yaml`
+parser: `artifact-name` and its placeholders take precedence; without it, the
+existing shield/board name is used. Matrix expansion, defaults, exclusions,
+snippets and settings-reset targets keep the same rules. The command reports the
+run directory at startup and again on success, including evidence for setup
+failures before target selection.
+
+Artifact recovery imports only regular firmware files with safe, unique names.
+Unexpected names, links, directories and collisions with the log or summary fail
+the run while preserving the host evidence files. Imported firmware permissions
+are normalized to `0644` on Unix; executable and special permission bits are removed.
 
 Started runs retain a failure summary and error excerpt even when setup, source
 copy, artifact recovery or container cleanup fails. Build output also goes to the
@@ -436,17 +465,23 @@ container log stream; inspect a retained container with `docker logs <container>
 Check a specific run with:
 
 ```bash
-bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID
+bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne
 ```
 
 Use `validate` instead of `build` for validation output. Both modes require a
 successful summary with the matching mode and a log file. Build checks also
 require a positive target count and exactly one firmware per build target.
+Known metadata fields must be unique, including target, image and cache fields
+when no expectations file is supplied.
 Relative run paths resolve from the caller's directory. Without a run path, the
 checker searches that directory's `.build/`. Pass the run path when checking from
 elsewhere.
-Run names must follow the displayed convention. The summary records the selected
-fallback; older summaries default to `bin`.
+Run names follow the displayed convention with an optional `-N` collision suffix
+from 2. Automatic selection orders timestamps and config labels, then collision
+sequences recorded in summaries numerically for matching labels; pass an explicit run path to identify
+one invocation. Legacy timestamp-only, `-N` and `-pid-PID` run directories remain
+checkable, including earlier dotted suffixes without sequence metadata. The summary records the selected fallback; older summaries default to
+`bin`.
 
 For a quality gate, define expected outputs independently before building and pass
 `--expect FILE` with an explicit run directory. The file contains NUL-delimited
@@ -458,7 +493,7 @@ only the metadata keys. For example:
 printf '%s\0' image zmkfirmware/zmk-build-arm:stable \
   artifact example_corne_left.uf2 > expected-output.nul
 bash .github/scripts/check-build-output.sh build \
-  .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID --expect expected-output.nul
+  .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne --expect expected-output.nul
 ```
 
 Expected metadata must match exactly and appear once in the summary. Build checks
@@ -585,7 +620,7 @@ cache and full artifact name set immediately after each successful build.
 ### Evidence and test caches
 
 Each invocation records commands, raw logs, status/timing, image identity and
-source checksums before/after in a fresh `.build/test-<UTC>-pid-<PID>/`.
+source checksums before/after in a fresh `.build/test-<UTC>.XXXXXX/`.
 `ZMK_TEST_RESULTS` can select another new directory outside the repository or
 fully ignored by Git. Existing evidence is never overwritten. Use UTF-8/LF via
 `.gitattributes` and `.editorconfig`; checks preserve the working tree.

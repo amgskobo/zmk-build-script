@@ -1456,9 +1456,8 @@ resolve_docker_image() {
     fi
 }
 
-run_id="run-$(date +%Y-%m-%d_%H-%M-%S)-pid-$$"
-container_name="zmk-build-${run_id}"
-container_name="${ZMK_CONTAINER_NAME:-${container_name}}"
+run_id=""
+container_name=""
 container_created=0
 container_id=""
 container_create_output=""
@@ -1476,7 +1475,7 @@ handle_run_signal() {
     # A signal can arrive before the EXIT handler's first body command.
     case " ${FUNCNAME[*]} " in *" finish_run "*) return 0 ;; esac
     # Acquire ownership and finish cleanup before honoring a pending interruption.
-    case "${run_phase}" in create|cleanup|finish) return 0 ;; esac
+    case "${run_phase}" in reserve|create|cleanup|finish) return 0 ;; esac
     exit "${run_signal_status}"
 }
 
@@ -1681,19 +1680,82 @@ copy_target_to_container() {
     done
 }
 
-copy_artifacts_from_container() {
-    local artifact_dir="$1"
-    mkdir -p "${artifact_dir}"
-    if ! docker exec "${container_id}" tar -C /root/zmk-config/.build -cf - . |
-        (cd "${artifact_dir}" && tar xf -); then
-        echo "failed to copy build output from the container" >&2
+copy_artifacts_from_container() (
+    local artifact_dir="$1" temporary path name lower stem copy_status
+    local LC_ALL=C
+    local names=() folded_names=()
+    temporary="$(mktemp -d "${artifact_dir}/artifact-tmp-XXXXXX")" || return 1
+    trap 'copy_status=$?; trap "" INT TERM; if ! rm -rf "${temporary}"; then
+        echo "failed to remove artifact staging directory" >&2
+        [ "${copy_status}" != 0 ] || copy_status=1
+    fi; exit "${copy_status}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Container tools and output are untrusted. Never extract their tar stream into
+    # the host run: it already owns the log and will receive the final summary.
+    if ! docker exec "${container_id}" find /root/zmk-config/.build \
+        -mindepth 1 -maxdepth 1 -print0 > "${temporary}/list"; then
+        echo "failed to list build output from the container" >&2
         return 1
     fi
-    if ! firmware_files "${artifact_dir}" | grep . >/dev/null; then
+    while :; do
+        path=""
+        if ! IFS= read -r -d '' path; then
+            [ -z "${path}" ] || { echo "unterminated artifact path from the container" >&2; return 1; }
+            break
+        fi
+        case "${path}" in
+            /root/zmk-config/.build/*) name="${path#/root/zmk-config/.build/}" ;;
+            *) echo "artifact path is outside the container output directory" >&2; return 1 ;;
+        esac
+        case "${name}" in
+            ''|[._-]*|*[!A-Za-z0-9._-]*) echo "unsafe artifact filename from the container" >&2; return 1 ;;
+        esac
+        lower="$(printf '%s' "${name}" | LC_ALL=C tr 'A-Z' 'a-z')" || return 1
+        stem="${lower%%.*}"
+        case "${stem}" in
+            con|prn|aux|nul|com[1-9]|lpt[1-9]) echo "reserved artifact filename from the container" >&2; return 1 ;;
+        esac
+        case "${lower}" in
+            build.log|build-summary.txt) echo "artifact filename collides with host evidence" >&2; return 1 ;;
+        esac
+        case "${name}" in
+            *.uf2|*.hex|*.bin|*."${ZMK_FALLBACK_BINARY:-bin}") ;;
+            *) echo "unexpected artifact extension from the container" >&2; return 1 ;;
+        esac
+        if name_in "${lower}" ${folded_names[@]+"${folded_names[@]}"}; then
+            echo "duplicate artifact filename from the container" >&2
+            return 1
+        fi
+        names+=("${name}") folded_names+=("${lower}")
+    done < "${temporary}/list"
+    if [ "${#names[@]}" = 0 ]; then
         echo "no firmware artifact was copied from the container" >&2
         return 1
     fi
-}
+    for name in ${names[@]+"${names[@]}"}; do
+        # An existing regular destination prevents recursive directory imports.
+        # Relative Docker paths avoid passing MSYS host paths to native Docker.
+        : > "${temporary}/firmware" || return 1
+        if ! (cd "${temporary}" && docker cp "${container_id}:/root/zmk-config/.build/${name}" ./firmware); then
+            echo "failed to copy build output from the container" >&2
+            return 1
+        fi
+        if [ -L "${temporary}/firmware" ] || [ ! -f "${temporary}/firmware" ]; then
+            echo "artifact is not a regular file" >&2
+            return 1
+        fi
+        if ! chmod 0644 "${temporary}/firmware"; then
+            echo "failed to normalize artifact permissions" >&2
+            return 1
+        fi
+        if [ -e "${artifact_dir}/${name}" ] || [ -L "${artifact_dir}/${name}" ]; then
+            echo "artifact destination already exists" >&2
+            return 1
+        fi
+        mv "${temporary}/firmware" "${artifact_dir}/${name}" || return 1
+    done
+)
 
 failure_excerpt() {
     if [ -f "${LOG_FILE}" ]; then
@@ -1735,6 +1797,7 @@ write_summary() (
         echo "Status: ${status}"
         [ -z "${reason}" ] || echo "Reason: ${reason}"
         echo "Mode: ${MODE}"
+        echo "Run sequence: ${RUN_SEQUENCE}"
         echo "Target: ${TARGET_DIR}"
         echo "Docker image: ${zmk_build_image}"
         echo "Docker cache volume: ${zmk_cache_volume}"
@@ -1790,6 +1853,33 @@ reset_cache_volume() {
     msg "Cache volume is not present; starting fresh: ${zmk_cache_volume}" | tee -a "${LOG_FILE}"
 }
 
+create_run_directory() {
+    local root="${SCRIPT_DIR}/.build" label stem candidate number=1
+    mkdir -p "${root}" || return 1
+    # Derive only a display label on the host; YAML target parsing stays in Docker.
+    label="$(printf '%s' "${TARGET_DIR##*/}" | LC_ALL=C tr -cs 'A-Za-z0-9_-' '-' | LC_ALL=C tr 'A-Z' 'a-z')" || return 1
+    label="${label:0:80}"
+    label="$(printf '%s' "${label}" | sed 's/^-*//; s/-*$//')" || return 1
+    label="${label:-config}"
+    stem="${root}/run-$(date +%Y-%m-%d_%H-%M-%S)-${label}"
+    candidate="${stem}"
+    # Commit directory ownership and an initialized log before honoring cancellation.
+    # A group signal must not kill mkdir after it created an otherwise unrecorded run.
+    run_phase=reserve
+    while ! (trap - EXIT; trap '' INT TERM; mkdir "${candidate}") 2>/dev/null; do
+        if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+            echo "Cannot create run directory: ${candidate}" >&2
+            return 1
+        fi
+        [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+        number=$((number + 1))
+        candidate="${stem}-${number}"
+    done
+    # Keep the actual sequence in the summary; a config name may itself end in digits.
+    RUN_SEQUENCE="${number}" artifact_dir="${candidate}" LOG_FILE="${candidate}/build.log"
+    : > "${LOG_FILE}"
+}
+
 validate_host_layout
 validate_module_inputs
 validate_positive_int "build jobs" "${BUILD_JOBS}"
@@ -1811,18 +1901,20 @@ zmk_cache_volume="${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}"
 # ccache lives on the cache volume so that it survives the throw-away build container (see README.md).
 zmk_ccache_dir="${ZMK_CCACHE_DIR:-/workspaces/.ccache}"
 RUN_STARTED_AT="$(date +%s)"
-artifact_dir="${SCRIPT_DIR}/.build/${run_id}"
-LOG_FILE="${artifact_dir}/build.log"
-mkdir -p "${artifact_dir}"
-touch "${LOG_FILE}"
+create_run_directory
+run_id="${artifact_dir##*/}"
+container_name="${ZMK_CONTAINER_NAME:-zmk-build-${run_id}-pid-$$}"
 touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 
 echo -e "${CYAN}Starting ZMK ${MODE}...${NC}"
+msg "Run directory: ${artifact_dir}" | tee -a "${LOG_FILE}"
 msg "Target: ${TARGET_DIR}"
 msg "Docker image: ${zmk_build_image}"
 msg "Docker cache volume: ${zmk_cache_volume}"
 msg "Build jobs: ${BUILD_JOBS}"
 msg "Container: ${container_name}"
+run_phase=reserved
+[ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
 
 if [ "${PRISTINE}" = 1 ]; then
     RUN_FAILURE_REASON="cache reset failed"

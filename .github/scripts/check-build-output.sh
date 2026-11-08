@@ -226,8 +226,18 @@ case "${mode}" in
     ;;
 esac
 
+summary_metadata() {
+  # Raw build output can contain text resembling any summary field.
+  awk '/^Failure excerpt$/ {exit} {print}' "$1"
+}
+
+is_run_sequence() {
+  case "$1" in 1|[2-9]|[1-9][0-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+}
+
 is_valid_run_dir() {
-  local candidate="${1%/}" parent base pid
+  local candidate="${1%/}" parent base suffix label sequence
   case "/${candidate}/" in
     */../*) return 1 ;;
   esac
@@ -239,21 +249,68 @@ is_valid_run_dir() {
     *) return 1 ;;
   esac
   case "${base}" in
-    run-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-pid-[0-9]*) ;;
+    run-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) ;;
     *) return 1 ;;
   esac
-  pid="${base##*-pid-}"
-  case "${pid}" in
-    ""|*[!0-9]*) return 1 ;;
+  suffix="${base:23}"
+  case "${suffix}" in
+    '') return 0 ;;
+    -*) suffix="${suffix#-}" ;;
+    *) return 1 ;;
   esac
+  case "${suffix}" in
+    pid-[0-9]*)
+      label="${suffix#pid-}"
+      case "${label}" in *[!0-9]*) ;; *) return 0 ;; esac ;;
+  esac
+  label="${suffix%%.*}"
+  if [ "${#label}" -gt 80 ]; then
+    sequence="${label##*-}"
+    [ "${sequence}" != 1 ] && is_run_sequence "${sequence}" || return 1
+    label="${label%-*}"
+  fi
+  case "${label}" in ''|-*|*-|*[!a-z0-9_-]*) return 1 ;; esac
+  [ "${#label}" -le 80 ] || return 1
+  # Also accept the earlier dotted suffix convention when checking retained evidence.
+  case "${suffix}" in *.*) ;; *) return 0 ;; esac
+  suffix="${suffix#*.}"
+  [ "${suffix}" != 1 ] && is_run_sequence "${suffix}"
 }
 
 require_valid_run_dir() {
   local candidate="$1" label="$2"
   if ! is_valid_run_dir "${candidate}"; then
-    echo "${label} does not match .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID: ${candidate:-<empty>}" >&2
+    echo "${label} does not match .build/run-YYYY-MM-DD_HH-MM-SS-CONFIG[-N] (or a legacy run name): ${candidate:-<empty>}" >&2
     exit 1
   fi
+}
+
+read_run_order() {
+  local directory="$1" summary="$2" base count sequence key label fields
+  base="${directory##*/}"
+  RUN_ORDER_KEY="${base%%.*}" RUN_ORDER_NUMBER=1
+  case "${base}" in *.*) RUN_ORDER_NUMBER="${base##*.}" ;; esac
+  # Excerpts can contain arbitrary build output, including lines resembling metadata.
+  fields="$(summary_metadata "${summary}" | sed -n '/^Run sequence:/p')" || return 1
+  count="$(printf '%s\n' "${fields}" | grep -c '^Run sequence:' || true)"
+  case "${count}" in
+    0) return 0 ;;
+    1) ;;
+    *) echo 'duplicate summary field: Run sequence' >&2; return 1 ;;
+  esac
+  sequence="$(printf '%s\n' "${fields}" | sed -n 's/^Run sequence: //p')" || return 1
+  is_run_sequence "${sequence}" || { echo 'Invalid run sequence in summary.' >&2; return 1; }
+  key="${base}"
+  if [ "${sequence}" != 1 ]; then
+    case "${base}" in
+      *-"${sequence}") key="${base%"-${sequence}"}" ;;
+      *) echo 'Run sequence does not match run directory.' >&2; return 1 ;;
+    esac
+  fi
+  label="${key:24}"
+  case "${label}" in ''|-*|*-|*[!a-z0-9_-]*) echo 'Invalid config label in run directory.' >&2; return 1 ;; esac
+  [ "${#label}" -le 80 ] || { echo 'Config label is too long.' >&2; return 1; }
+  RUN_ORDER_KEY="${key}" RUN_ORDER_NUMBER="${sequence}"
 }
 
 case "${mode}" in
@@ -286,10 +343,21 @@ else
   fi
 
   build_summary=""
+  latest_key="" latest_number=0
   while IFS= read -r summary; do
     candidate_dir="$(dirname "${summary}")"
     require_valid_run_dir "${candidate_dir}" "build summary directory"
-    build_summary="${summary}"
+    read_run_order "${candidate_dir}" "${summary}"
+    candidate_key="${RUN_ORDER_KEY}" candidate_number="${RUN_ORDER_NUMBER}"
+    # Compare decimal strings without octal interpretation or machine integer overflow.
+    if [[ "${candidate_key}" > "${latest_key}" ]] ||
+        { [ "${candidate_key}" = "${latest_key}" ] && {
+          [ "${#candidate_number}" -gt "${#latest_number}" ] ||
+          { [ "${#candidate_number}" = "${#latest_number}" ] && [[ "${candidate_number}" > "${latest_number}" || "${candidate_number}" = "${latest_number}" ]]; };
+        }; }; then
+      build_summary="${summary}"
+      latest_key="${candidate_key}" latest_number="${candidate_number}"
+    fi
   done < <(find .build -mindepth 2 -maxdepth 2 -type f -name build-summary.txt -print | sort)
 fi
 
@@ -299,6 +367,7 @@ if [ -z "${build_summary}" ] || [ ! -f "${build_summary}" ]; then
 fi
 
 run_dir="$(dirname "${build_summary}")"
+read_run_order "${run_dir}" "${build_summary}"
 build_log="${run_dir}/build.log"
 
 if [ ! -f "${build_log}" ]; then
@@ -308,20 +377,23 @@ fi
 
 # A summary has one value per field. A matching SUCCESS line must not hide a
 # contradictory status or a second mode/count/fallback later in the file.
-for field in Status Mode 'Built targets' 'Fallback binary'; do
-  field_count="$(grep -c "^${field}:" "${build_summary}" || true)"
+# All fields are read before the failure excerpt; sequence has already been checked.
+for field in Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed \
+    'Built targets' Pristine 'Build jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
+  field_count="$(summary_metadata "${build_summary}" | grep -c "^${field}:" || true)"
   if [ "${field_count}" -gt 1 ]; then
     echo "duplicate summary field: ${field}: ${build_summary}" >&2
     exit 1
   fi
 done
 
-if ! grep -qx 'Status: SUCCESS' "${build_summary}"; then
+# Drain metadata; grep -q can terminate the producer with SIGPIPE on large summaries.
+if ! summary_metadata "${build_summary}" | grep -x 'Status: SUCCESS' >/dev/null; then
   echo "build-summary.txt does not report success: ${build_summary}" >&2
   exit 1
 fi
 
-summary_mode="$(sed -n 's/^Mode: //p' "${build_summary}" | tail -n 1)"
+summary_mode="$(summary_metadata "${build_summary}" | sed -n 's/^Mode: //p' | tail -n 1)"
 if [ "${summary_mode}" != "${mode}" ]; then
   echo "build-summary.txt mode is ${summary_mode:-<missing>}, expected ${mode}: ${build_summary}" >&2
   exit 1
@@ -331,13 +403,13 @@ echo "[output] build log: ${build_log}"
 echo "[output] build summary: ${build_summary}"
 
 if [ "${mode}" = "build" ]; then
-  built_targets="$(sed -n 's/^Built targets: \([0-9][0-9]*\)$/\1/p' "${build_summary}" | tail -n 1)"
+  built_targets="$(summary_metadata "${build_summary}" | sed -n 's/^Built targets: \([0-9][0-9]*\)$/\1/p' | tail -n 1)"
   if [ -z "${built_targets}" ]; then
     echo "build-summary.txt does not include Built targets for build mode: ${build_summary}" >&2
     exit 1
   fi
 
-  fallback="$(sed -n 's/^Fallback binary: //p' "${build_summary}" | tail -n 1)"
+  fallback="$(summary_metadata "${build_summary}" | sed -n 's/^Fallback binary: //p' | tail -n 1)"
   fallback="${fallback:-bin}"
   case "${fallback}" in
     .*|-*|*[!A-Za-z0-9._-]*) echo "Invalid fallback firmware extension in summary" >&2; exit 1 ;;
@@ -402,9 +474,9 @@ check_expected_output() {
       *) echo 'Invalid output expectations: unknown key.' >&2; return 1 ;;
     esac
     [ -n "${value}" ] || { echo 'Invalid output expectations: empty value.' >&2; return 1; }
-    count="$(grep -c "^${field}:" "${build_summary}" || true)"
+    count="$(summary_metadata "${build_summary}" | grep -c "^${field}:" || true)"
     [ "${count}" = 1 ] || { echo "missing or duplicate expected summary field: ${field}" >&2; return 1; }
-    actual="$(sed -n "s/^${field}: //p" "${build_summary}")"
+    actual="$(summary_metadata "${build_summary}" | sed -n "s/^${field}: //p")" || return 1
     [ "${actual}" = "${value}" ] || { echo "expected ${field} does not match summary" >&2; return 1; }
   done < "${expected_file}"
   [ "${expected_image}" = 1 ] || { echo 'Invalid output expectations: image is required.' >&2; return 1; }

@@ -42,6 +42,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+summary_from_log() {
+  local run
+  run="$(sed $'s/\033\[[0-9;]*m//g' "$1" | tr -d '\r' | sed -n 's/^Run directory: //p')"
+  [ -n "${run}" ] || { echo "Run directory was not reported: $1" >&2; return 1; }
+  printf '%s/build-summary.txt\n' "${run}"
+}
+
 mkdir -p "${fixture}/config" "${tool_root}/.build"
 cp "${repo_root}/build.sh" "${tool_root}/build.sh"
 cp "${repo_root}/.github/fixtures/ci-zmk-config/config/west.yml" "${fixture}/config/west.yml"
@@ -306,7 +313,7 @@ for phase in create start copy; do
     echo "injected host ${phase} failure was accepted" >&2
     exit 1
   fi
-  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+  summary="$(summary_from_log "${tmp_dir}/host-${phase}.log")"
   [ -n "${summary}" ] || { echo "host ${phase} failure lost its summary" >&2; exit 1; }
   grep -qx 'Status: FAILED' "${summary}"
   grep -qx "Reason: ${reason}" "${summary}"
@@ -328,7 +335,7 @@ case "$1" in
     [ "${IDENTITY_PHASE}" != start ] || { echo 'injected start failure' >&2; exit 23; } ;;
   exec)
     case "$*" in
-      *'tar -C /root/zmk-config/.build'*) echo 'injected artifact failure' >&2; exit 23 ;;
+      *'find /root/zmk-config/.build'*) printf '/root/zmk-config/.build/selected.bin\0' ;;
       *'tar --no-same-owner'*)
         cat >/dev/null
         [ "${IDENTITY_PHASE}" != copy ] || { echo 'injected copy failure' >&2; exit 23; } ;;
@@ -338,6 +345,7 @@ case "$1" in
       *'mkdir -p /root/zmk-config'*) ;;
       *) exit 99 ;;
     esac ;;
+  cp) echo 'injected artifact failure' >&2; exit 23 ;;
   rm) ;;
   *) exit 99 ;;
 esac
@@ -374,7 +382,7 @@ for phase in start copy validate artifact module; do
     validate|module) reason='validation failed' ;;
     artifact) reason='artifact copy failed' ;;
   esac
-  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+  summary="$(summary_from_log "${tmp_dir}/identity-${phase}.log")"
   grep -qx 'Status: FAILED' "${summary}"
   grep -qx "Reason: ${reason}" "${summary}"
 done
@@ -445,9 +453,9 @@ for phase in cleanup-failure both-failures keep reset-failure list-failure missi
   if [ "${status}" != "${expected}" ]; then
     echo "lifecycle ${phase}: expected status ${expected}, got ${status}" >&2; lifecycle_failed=1
   fi
-  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+  summary="$(summary_from_log "${tmp_dir}/lifecycle-${phase}.log")"
   if [ ! -f "${summary}" ]; then
-    echo "lifecycle ${phase}: missing run summary for PID ${build_pid}" >&2; lifecycle_failed=1; continue
+    echo "lifecycle ${phase}: missing run summary" >&2; lifecycle_failed=1; continue
   fi
   if [ "${expected}" = 0 ]; then
     if ! bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}" \
@@ -538,7 +546,7 @@ for signal_mode in build validate; do
     if wait "${build_pid}"; then status=0; else status=$?; fi
     : > "${signal_prefix}.release"
     [ "${status}" = 143 ] || { echo 'SIGTERM exit status lost' >&2; exit 1; }
-    summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+    summary="$(summary_from_log "${signal_prefix}.log")"
     grep -qx 'Status: FAILED' "${summary}"
     grep -qx 'Reason: interrupted by SIGTERM' "${summary}"
     if [ "${keep}" = 1 ]; then
@@ -705,22 +713,64 @@ case "$1" in
   exec)
     case "$*" in
       *'tar -C /root/zmk-config/.build'*) tar -C "${NEW_PAYLOAD}" -cf - . ;;
+      *'find /root/zmk-config/.build'*)
+        case "${NEW_ATTACK:-}" in
+          absolute-entry) printf '/tmp/escape.bin\0' ;;
+          parent-entry) printf '/root/zmk-config/.build/../escape.bin\0' ;;
+          truncated-list) printf '/root/zmk-config/.build/selected.bin' ;;
+          duplicate-entry) printf '/root/zmk-config/.build/selected.bin\0/root/zmk-config/.build/selected.bin\0' ;;
+          duplicate-case) printf '/root/zmk-config/.build/selected.bin\0/root/zmk-config/.build/SELECTED.bin\0' ;;
+          reserved-name) printf '/root/zmk-config/.build/CON.part.bin\0' ;;
+          unsafe-name) printf '/root/zmk-config/.build/line\nbreak.bin\0' ;;
+          *)
+            while IFS= read -r -d '' file; do
+              printf '/root/zmk-config/.build/%s\0' "${file##*/}"
+            done < <(find "${NEW_PAYLOAD}" -mindepth 1 -maxdepth 1 -print0) ;;
+        esac
+        [ "${NEW_ATTACK:-}" != list-failure ] || exit 23 ;;
       *'tar --no-same-owner'*|*'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
       *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
       *'./build.sh build'*) printf 'Build complete: %s target(s).\n' "${NEW_COUNT}" ;;
       *'mkdir -p /root/zmk-config'*) ;;
       *) exit 99 ;;
     esac ;;
+  cp)
+    case "$2" in
+      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:/root/zmk-config/.build/*) ;;
+      *) echo 'artifact copy did not use its acquired container ID' >&2; exit 99 ;;
+    esac
+    [ "$3" = ./firmware ] && [ -f ./firmware ] && [ ! -L ./firmware ] || exit 99
+    [ "${NEW_ATTACK:-}" != copy-failure ] || exit 23
+    cp -P "${NEW_PAYLOAD}/${2##*/}" "$3" ;;
   rm)
     if [ "${NEW_PHASE}" = cleanup-rm ]; then
       : > "${NEW_REACHED}"
       while [ ! -f "${NEW_RELEASE}" ]; do sleep .01; done
     fi
-    [ -z "${NEW_COMPLETE:-}" ] || : > "${NEW_COMPLETE}" ;;
+    [ -z "${NEW_COMPLETE:-}" ] || : > "${NEW_COMPLETE}"
+    printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
   *) exit 99 ;;
 esac
 EOF
 chmod +x "${fake_bin}/docker"
+export NEW_REAL_RM="$(command -v rm)"
+cat > "${fake_bin}/rm" <<'EOF'
+#!/usr/bin/env bash
+if [ "${NEW_ATTACK:-}" = staging-cleanup ] && [ "${1:-}" = -rf ]; then
+  case "${2:-}" in */artifact-tmp-*) echo 'injected artifact staging cleanup failure' >&2; exit 23 ;; esac
+fi
+exec "${NEW_REAL_RM}" "$@"
+EOF
+chmod +x "${fake_bin}/rm"
+export NEW_REAL_CHMOD="$(command -v chmod)"
+cat > "${fake_bin}/chmod" <<'EOF'
+#!/usr/bin/env bash
+if [ "${NEW_ATTACK:-}" = permissions-failure ] && [ "${1:-}" = 0644 ]; then
+  echo 'injected artifact permissions failure' >&2; exit 23
+fi
+exec "${NEW_REAL_CHMOD}" "$@"
+EOF
+chmod +x "${fake_bin}/chmod"
 for count in 1 512; do
   payload="${tmp_dir}/firmware-${count}"
   mkdir -p "${payload}"
@@ -733,7 +783,7 @@ for count in 1 512; do
       bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-${count}.log" 2>&1 &
   build_pid=$!
   if wait "${build_pid}"; then status=0; else status=$?; fi
-  summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+  summary="$(summary_from_log "${tmp_dir}/firmware-${count}.log")"
   if [ "${status}" != 0 ] || ! grep -qx 'Status: SUCCESS' "${summary}" ||
       [ "$(grep -c '^- target-' "${summary}")" != "${count}" ]; then
     echo "artifact stream ${count}: successful firmware collection was rejected or omitted" >&2
@@ -742,6 +792,158 @@ for count in 1 512; do
     bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
   fi
 done
+
+# YAML-derived firmware names, including dots and multi-part fallback, stay inside the run.
+payload="${tmp_dir}/firmware-dotted"
+mkdir -p "${payload}"
+printf 'synthetic signed firmware\n' > "${payload}/target.with.dots.signed.bin"
+PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=1 NEW_PAYLOAD="${payload}" \
+    NEW_CALLS="${tmp_dir}/firmware-dotted.commands.log" ZMK_FALLBACK_BINARY=signed.bin \
+    bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-dotted.log" 2>&1
+summary="$(summary_from_log "${tmp_dir}/firmware-dotted.log")"
+test -s "${summary%/*}/target.with.dots.signed.bin"
+bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
+
+# Container output cannot replace evidence, traverse paths or import special files.
+for attack in log-link summary-link log-case summary-case firmware-link firmware-directory \
+    reserved-name unsafe-name duplicate-case duplicate-entry absolute-entry parent-entry \
+    truncated-list list-failure copy-failure permissions-failure staging-cleanup; do
+  payload="${tmp_dir}/artifact-${attack}"
+  outside="${tmp_dir}/outside-${attack}"
+  mkdir -p "${payload}" "${outside}"
+  printf 'preserve host canary\n' > "${outside}/canary"
+  printf 'synthetic firmware\n' > "${payload}/selected.bin"
+  case "${attack}" in
+    log-link) MSYS=winsymlinks:sys ln -s "${outside}/canary" "${payload}/build.log" ;;
+    summary-link) MSYS=winsymlinks:sys ln -s "${outside}" "${payload}/build-summary.txt" ;;
+    log-case) printf 'fake log\n' > "${payload}/BUILD.LOG" ;;
+    summary-case) printf 'fake summary\n' > "${payload}/BUILD-SUMMARY.TXT" ;;
+    firmware-link)
+      rm "${payload}/selected.bin"
+      MSYS=winsymlinks:sys ln -s "${outside}/canary" "${payload}/selected.bin" ;;
+    firmware-directory) rm "${payload}/selected.bin"; mkdir "${payload}/selected.bin" ;;
+  esac
+  case "${attack}" in
+    log-link|summary-link|firmware-link)
+      [ -L "${payload}/build.log" ] || [ -L "${payload}/build-summary.txt" ] || [ -L "${payload}/selected.bin" ] ||
+        { echo 'artifact attack fixture is not a symlink' >&2; exit 1; } ;;
+  esac
+  if PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=1 NEW_PAYLOAD="${payload}" NEW_ATTACK="${attack}" \
+      NEW_CALLS="${tmp_dir}/artifact-${attack}.commands.log" \
+      bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/artifact-${attack}.log" 2>&1; then
+    status=0
+  else status=$?; fi
+  summary="$(summary_from_log "${tmp_dir}/artifact-${attack}.log")"
+  if [ -n "${ZMK_TEST_ARTIFACT_DIR:-}" ]; then
+    attack_evidence="${ZMK_TEST_ARTIFACT_DIR}/artifact-security/${attack}"
+    mkdir -p "${attack_evidence}"
+    cp "${outside}/canary" "${attack_evidence}/host-canary"
+    find "${outside}" -mindepth 1 -maxdepth 1 -print > "${attack_evidence}/outside-entries.txt"
+    printf '%s\n' "${status}" > "${attack_evidence}/build.exit"
+  fi
+  if [ "${status}" = 0 ] || ! cmp -s "${outside}/canary" <(printf 'preserve host canary\n') ||
+      [ "$(find "${outside}" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" != 1 ] ||
+      [ -L "${summary}" ] || [ -L "${summary%/*}/build.log" ] ||
+      ! grep -qx 'Status: FAILED' "${summary}"; then
+    echo "artifact ${attack}: container output replaced evidence or wrote outside the run" >&2
+    finalization_failed=1
+  else
+    grep -qx 'Reason: artifact copy failed' "${summary}"
+    staging_count="$(find "${summary%/*}" -mindepth 1 -maxdepth 1 -name 'artifact-tmp-*' | wc -l | tr -d '[:space:]')"
+    if [ "${attack}" = staging-cleanup ]; then
+      [ "${staging_count}" = 1 ]
+    else [ "${staging_count}" = 0 ]; fi
+    # Independently inspect rejection and copy argv so an unrelated error is no PASS.
+    case "${attack}" in
+      log-*|summary-*) expected='artifact filename collides with host evidence' ;;
+      firmware-link) expected='artifact is not a regular file' ;;
+      firmware-directory|copy-failure) expected='failed to copy build output from the container' ;;
+      reserved-name) expected='reserved artifact filename from the container' ;;
+      unsafe-name|parent-entry) expected='unsafe artifact filename from the container' ;;
+      duplicate-*) expected='duplicate artifact filename from the container' ;;
+      absolute-entry) expected='artifact path is outside the container output directory' ;;
+      truncated-list) expected='unterminated artifact path from the container' ;;
+      list-failure) expected='failed to list build output from the container' ;;
+      permissions-failure) expected='failed to normalize artifact permissions' ;;
+      staging-cleanup) expected='failed to remove artifact staging directory' ;;
+    esac
+    grep -Fx "${expected}" "${summary%/*}/build.log" >/dev/null
+    case "${attack}" in
+      firmware-*|copy-failure|permissions-failure|staging-cleanup)
+        grep -Fx 'cp aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:/root/zmk-config/.build/selected.bin ./firmware' \
+          "${tmp_dir}/artifact-${attack}.commands.log" >/dev/null ;;
+      *)
+        if grep '^cp ' "${tmp_dir}/artifact-${attack}.commands.log" >/dev/null; then
+          echo "artifact ${attack}: rejected names reached docker cp" >&2; exit 1
+        fi ;;
+    esac
+  fi
+done
+rm "${fake_bin}/rm" "${fake_bin}/chmod"
+
+# A frozen clock and concurrent invocations must reserve separate run directories.
+real_date="$(command -v date)"
+cat > "${fake_bin}/date" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = '+%Y-%m-%d_%H-%M-%S' ]; then printf '%s\n' 2000-01-02_03-04-05
+else exec "${ZMK_TEST_REAL_DATE}" "$@"; fi
+EOF
+chmod +x "${fake_bin}/date"
+reserved="${tool_root}/.build/run-2000-01-02_03-04-05-ci-zmk-config"
+printf 'preserve existing file\n' > "${reserved}"
+MSYS=winsymlinks:sys ln -s "${tmp_dir}/missing-run" "${reserved}-2"
+[ -L "${reserved}-2" ] || { echo 'run reservation fixture is not a symlink' >&2; exit 1; }
+reservation_pids=()
+for number in $(seq 1 10); do
+  PATH="${fake_bin}:${PATH}" ZMK_TEST_REAL_DATE="${real_date}" NEW_PHASE=reservation \
+      NEW_CALLS="${tmp_dir}/reservation-${number}.commands.log" \
+      bash "${tool_root}/build.sh" validate "${fixture}" > "${tmp_dir}/reservation-${number}.log" 2>&1 &
+  reservation_pids+=("$!")
+done
+for pid in "${reservation_pids[@]}"; do wait "${pid}"; done
+for number in $(seq 1 10); do
+  summary="$(summary_from_log "${tmp_dir}/reservation-${number}.log")"
+  case "${summary}" in "${reserved}"-[3-9]/build-summary.txt|"${reserved}"-1[0-2]/build-summary.txt) ;;
+    *) echo "Unexpected reserved run directory: ${summary}" >&2; exit 1 ;;
+  esac
+  bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}"
+done
+[ "$(find "${tool_root}/.build" -maxdepth 1 -type d -name 'run-2000-01-02_03-04-05-ci-zmk-config-*' | wc -l | tr -d '[:space:]')" = 10 ]
+grep -qx 'preserve existing file' "${reserved}"
+[ -L "${reserved}-2" ]
+rm "${reserved}" "${reserved}-2"
+
+# Names are safe display labels from the selected config root, not parsed YAML on the host.
+for naming_case in hidden numeric unicode long; do
+  case "${naming_case}" in
+    hidden) source_name='.Hidden Config.V2-10'; expected_label=hidden-config-v2-10 ;;
+    numeric) source_name=numeric-10; expected_label=numeric-10 ;;
+    unicode) source_name=名前; expected_label=config ;;
+    long)
+      source_name="$(printf '%100s' '' | tr ' ' a)"
+      expected_label=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  esac
+  source_root="${tmp_dir}/${source_name}"
+  mkdir -p "${source_root}/config"
+  cp "${fixture}/build.yaml" "${source_root}/build.yaml"
+  cp "${fixture}/config/west.yml" "${source_root}/config/west.yml"
+  PATH="${fake_bin}:${PATH}" ZMK_TEST_REAL_DATE="${real_date}" NEW_PHASE=naming \
+      NEW_CALLS="${tmp_dir}/naming-${naming_case}.commands.log" \
+      bash "${tool_root}/build.sh" validate "${source_root}/." > "${tmp_dir}/naming-${naming_case}.log" 2>&1
+  summary="$(summary_from_log "${tmp_dir}/naming-${naming_case}.log")"
+  [ "${summary}" = "${tool_root}/.build/run-2000-01-02_03-04-05-${expected_label}/build-summary.txt" ]
+  bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}"
+  if [ "${naming_case}" = long ]; then
+    PATH="${fake_bin}:${PATH}" ZMK_TEST_REAL_DATE="${real_date}" NEW_PHASE=naming \
+        NEW_CALLS="${tmp_dir}/naming-long-second.commands.log" \
+        bash "${tool_root}/build.sh" validate "${source_root}" > "${tmp_dir}/naming-long-second.log" 2>&1
+    second_summary="$(summary_from_log "${tmp_dir}/naming-long-second.log")"
+    [ "${second_summary}" = "${summary%/*}-2/build-summary.txt" ]
+    grep -qx 'Run sequence: 2' "${second_summary}"
+    bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${second_summary%/*}"
+  fi
+done
+rm "${fake_bin}/date"
 
 # A failing external receipt filter must not lose ownership after a successful create.
 real_tr="$(command -v tr)"
@@ -783,7 +985,7 @@ for phase in cleanup-entry cleanup-rm; do
     kill -TERM "${build_pid}"
     : > "${prefix}.release"
     if wait "${build_pid}"; then status=0; else status=$?; fi
-    summary="$(find "${tool_root}/.build" -path "*-pid-${build_pid}/build-summary.txt" -print)"
+    summary="$(summary_from_log "${prefix}.log")"
     expected=143 reason='interrupted by SIGTERM'
     [ "${initial_failure}" != 1 ] || { expected=23; reason='container start failed'; }
     if [ "${status}" != "${expected}" ] || [ ! -f "${prefix}.complete" ] ||
@@ -814,6 +1016,84 @@ echo '[host-contract] passed'
   exit 0
 fi
 
+# Exercise the production host import with the real Docker daemon. Only compilation
+# is replaced with synthetic output; these controls do not claim a firmware build.
+test_artifact_import_boundary() {
+local artifact_bin real_docker attack outside log_path status summary expectations expected
+artifact_bin="${tmp_dir}/artifact-bin"
+mkdir -p "${artifact_bin}"
+cat > "${artifact_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = exec ] && [[ "$*" == *'./build.sh build'* ]]; then
+  exec "${ZMK_TEST_REAL_DOCKER}" exec "$2" /bin/bash -c '
+    set -e
+    output=/root/zmk-config/.build
+    mkdir -p "$output"
+    printf "synthetic firmware\n" > "$output/selected.bin"
+    case "$1" in
+      regular) chmod 4777 "$output/selected.bin" ;;
+      log-link) ln -s "$2/canary" "$output/build.log" ;;
+      summary-link) ln -s "$2" "$output/build-summary.txt" ;;
+      firmware-link) rm "$output/selected.bin"; ln -s "$2/canary" "$output/selected.bin"; test -L "$output/selected.bin" ;;
+      firmware-directory) rm "$output/selected.bin"; mkdir "$output/selected.bin"; ln -s "$2/canary" "$output/selected.bin/build.log" ;;
+      firmware-fifo) rm "$output/selected.bin"; mkfifo "$output/selected.bin"; test -p "$output/selected.bin" ;;
+      *) exit 99 ;;
+    esac
+    printf "Build complete: 1 target(s).\n"
+  ' _ "${ZMK_TEST_ARTIFACT_ATTACK}" "${ZMK_TEST_HOST_CANARY}"
+fi
+exec "${ZMK_TEST_REAL_DOCKER}" "$@"
+EOF
+chmod +x "${artifact_bin}/docker"
+real_docker="$(command -v docker)"
+for attack in regular log-link summary-link firmware-link firmware-directory firmware-fifo; do
+  echo "[build-contract] artifact-import-${attack} (synthetic output)"
+  outside="${tmp_dir}/docker-artifact-${attack}"
+  mkdir -p "${outside}"
+  printf 'preserve host canary\n' > "${outside}/canary"
+  log_path="${tmp_dir}/docker-artifact-${attack}.log"
+  container_logs+=("${log_path}")
+  if PATH="${artifact_bin}:${PATH}" ZMK_TEST_REAL_DOCKER="${real_docker}" \
+      ZMK_TEST_ARTIFACT_ATTACK="${attack}" ZMK_TEST_HOST_CANARY="${outside}" ZMK_KEEP_CONTAINER=0 \
+      bash "${tool_root}/build.sh" "${fixture}" > "${log_path}" 2>&1; then
+    status=0
+  else status=$?; fi
+  summary="$(summary_from_log "${log_path}")"
+  cmp "${outside}/canary" <(printf 'preserve host canary\n')
+  [ "$(find "${outside}" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" = 1 ]
+  [ ! -L "${summary}" ] && [ ! -L "${summary%/*}/build.log" ]
+  if [ "${attack}" = regular ]; then
+    [ "${status}" = 0 ]
+    expectations="${tmp_dir}/docker-artifact-regular.expect"
+    printf '%s\0' image "${ZMK_BUILD_IMAGE}" target "$(cd "${fixture}" && pwd -P)" \
+      cache "${ZMK_DOCKER_CACHE_VOLUME}" artifact selected.bin > "${expectations}"
+    bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}" --expect "${expectations}"
+    cmp "${summary%/*}/selected.bin" <(printf 'synthetic firmware\n')
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*) echo 'artifact-mode: NOT APPLICABLE (native Windows POSIX permission bits)' ;;
+      *)
+        if [ -z "$(find "${summary%/*}/selected.bin" -perm 0644 -print)" ]; then
+          echo 'artifact-mode: container permissions were retained instead of normalized to 0644' >&2
+          exit 1
+        fi ;;
+    esac
+  else
+    [ "${status}" != 0 ]
+    grep -qx 'Status: FAILED' "${summary}"
+    grep -qx 'Reason: artifact copy failed' "${summary}"
+    case "${attack}" in
+      log-link|summary-link) expected='artifact filename collides with host evidence' ;;
+      firmware-link|firmware-fifo) expected='artifact is not a regular file|failed to copy build output from the container' ;;
+      firmware-directory) expected='failed to copy build output from the container' ;;
+    esac
+    grep -Ex "${expected}" "${summary%/*}/build.log" >/dev/null || { cat "${log_path}" >&2; exit 1; }
+    [ ! -e "${summary%/*}/selected.bin" ] && [ ! -L "${summary%/*}/selected.bin" ]
+  fi
+  [ "$(find "${summary%/*}" -mindepth 1 -maxdepth 1 -name 'artifact-tmp-*' | wc -l | tr -d '[:space:]')" = 0 ]
+done
+}
+
 # Combine independent module and target inputs without repeating identical validation containers.
 target_no_west="$(make_target target-no-west none)"
 external_no_west="$(make_module external-no-west none)"
@@ -831,6 +1111,7 @@ assert_payload "${last_container}" /root/external_modules/dot-module keep
 assert_payload "${last_container}" /root/zmk-config keep
 assert_payload "${last_container}" /root/external_modules/external-no-west keep
 assert_payload "${last_container}" /root/external_modules/external-west keep
+test_artifact_import_boundary
 
 target_west="$(make_target target-west west)"
 mkdir -p "${target_west}/boards" "${target_west}/snippets" "${target_west}/dts"
@@ -933,7 +1214,7 @@ pristine_pid=$!
 if wait "${pristine_pid}"; then
   echo 'pristine continued with an in-use cache volume' >&2; exit 1
 fi
-summary="$(find "${tool_root}/.build" -path "*-pid-${pristine_pid}/build-summary.txt" -print)"
+summary="$(summary_from_log "${tmp_dir}/pristine-in-use.log")"
 grep -qx 'Status: FAILED' "${summary}"
 grep -qx 'Reason: cache reset failed' "${summary}"
 grep -q 'volume is in use' "${summary%/*}/build.log"

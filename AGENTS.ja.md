@@ -99,18 +99,28 @@
   create失敗を同名の既存コンテナを削除する根拠にしない。
   `ZMK_KEEP_CONTAINER=1` を尊重し、中断時は保持するコンテナを停止する。
   元のビルドエラーを隠さず後始末の失敗も伝え、cloneコンテナ削除失敗後は再試行・builder起動を止める。
-  ID取得・終了ハンドラー入口・後始末中はsignalを保留し、真の終了値を確定してから最終summaryを一度だけ不可分に公開する。
+  run directoryの所有権・logの初期化、ID取得・終了ハンドラー入口・後始末中はsignalを保留し、真の終了値を確定してから最終summaryを一度だけ不可分に公開する。
   stdbufのLD_PRELOADを子プロセスへ漏らさない。
 
 - 対象ごとに `.uf2`、指定fallback、`.hex`、`.bin` の順で一つ回収する。
   fallback拡張子内のパス・glob、先頭dot・ハイフンを拒否する。
   ホスト列挙・summary・検証処理で拡張子をそろえ、ログ・summary自体は数えない。
   存在確認はSIGPIPEを起こさず列挙を最後まで読む。
-  開始した実行は `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/` を使い、準備・pristine・create・start・ソースコピー・ビルド・成果物コピー・後始末の失敗や中断でも `build.log`、`build-summary.txt`、失敗理由・抜粋を残す。
+  コンテナから戻る出力は信頼せず、完結したNUL区切りの平置きfirmware名を検証し、予約名・衝突を拒否してDocker経由で専用の仮領域へコピーする。
+  通常ファイルだけを取り込み、symlink・directoryやコンテナ製tarをホストのrunへ展開しない。
+  firmwareの権限を0644へ揃え、権限設定・仮領域の後始末の失敗も伝える。
+  PID を使わず `.build/run-YYYY-MM-DD_HH-MM-SS-CONFIG[-N]/` を atomic に確保する。
+  CONFIG は選択した config root の basename を ASCII の安全な小文字の表示名へ変換し、dot を正規化して 80 文字までに制限する。
+  空になった場合は `config` を使い、衝突時の連番は 2 から付ける。
+  config 名の末尾の数字と区別するため、実際の `Run sequence` を summary に記録し、正の十進数・重複なし・directory 名との一致を検証する。
+  全 firmware、実行全体の log、summary は同じ run directory に保持し、YAML 由来の target は firmware の basename と summary で判断できるようにする。
+  checker は平置きの旧日時・連番・PID run に対応し、新しい衝突連番は数値として並べる。
+  開始した実行は準備・pristine・create・start・ソースコピー・ビルド・成果物コピー・後始末の失敗や中断でも `build.log`、`build-summary.txt`、失敗理由・抜粋を残す。
   成果物コピーの失敗も呼び出し元へ返す。
 
-- summaryと検証処理で、状態・失敗理由・mode・対象・イメージ／キャッシュ・経過時間・ビルド数・pristine／jobs／fallback／snippets／modules・ファイル一覧を一致させる。
-  主要フィールドの重複と不正な実行パスを拒否する。
+- summaryと検証処理で、状態・失敗理由・mode・対象・イメージ／キャッシュ・経過時間・ビルド数・run sequence・pristine／jobs／fallback／snippets／modules・ファイル一覧を一致させる。
+  既知のmetadata fieldの重複と不正な実行パスを拒否する。
+  全 field と期待値の検証で Failure excerpt より前の metadata を読み、生の log 行で metadata を補ったり上書きしたりしない。
   CR・ANSI・接頭辞を除いてビルド完了行を数え、成功時だけファームウェア数で代用する。
   検証処理は成功状態、mode、ログ、正の対象数、それと完全に一致するファームウェア数を要求する。
   fallback欄がない旧summaryはbinとする。

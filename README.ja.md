@@ -367,6 +367,7 @@ file 削除は WSL の memory cache を Windows へ強制返却する処理で�
 
 実行中の SIGINT / SIGTERM では中断理由を含む FAILED run を確定します。保持指定の container は中断時に停止し、
 ID と log を確認できる状態で残します。
+run directory の初期確保中も、所有権・連番・log の記録まで中断を遅延し、Docker 起動前の中断でも FAILED summary を残します。
 container 作成中（image の自動 pull を含む）は中断を遅延し、process group 全体への signal でも ID を回収してから終了します。
 中断を繰り返しても、識別前の container を放置しません。終了 handler の入口から cleanup 完了まで中断を遅延します。
 先の build error があれば理由と終了 status を保持し、それ以外の中断は FAILED summary にします。
@@ -385,25 +386,47 @@ path / glob と先頭 dot / hyphen は拒否します。CI は後述の公開用
 firmware と raw log は local の `.build/` に保持します。
 
 ```text
-.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
+.build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne/
 +-- example_corne_left.uf2
++-- example_corne_right.uf2
 +-- build.log
 +-- build-summary.txt
 ```
+
+各 run は全 firmware、実行全体の log、summary を一か所に保持します。日時は local time を使い、
+その後ろに `zmk-config-corne` のような config repository の directory 名を付けます。表示用の名前は小文字化し、
+ASCII 英数字・underscore・hyphen 以外の文字の連続を hyphen に置換します。80 文字までに制限して両端の hyphen を除き、
+空になった場合は `config` を使い、repository 名の dot も hyphen に変換します。
+同じ日時・表示名の実行が重なる場合は directory の atomic な確保によって `-2`、`-3` と連番を付け、既存の出力は上書きしません。
+summary に `Run sequence`（最初の実行は 1）を記録するため、表示名の末尾の数字と衝突時の連番を区別できます。
+status・mode・件数・fallback・連番・期待する image / input / cache の検証は Failure excerpt より前の metadata を読みます。
+生の log 行でこれらの field を補ったり上書きしたりしません。
+
+何をビルドしたかは run 内の firmware 名と summary の file 一覧で判断できます。firmware 名は既存の container 内の
+`build.yaml` parser で決まり、`artifact-name` とその placeholder を優先し、省略時は既存の shield / board 由来の名前を使います。
+matrix 展開、defaults、exclude、snippet、settings-reset target の規則も共通です。command は開始時と成功時に run directory を
+表示し、target 選択前の準備失敗でも実行記録を残します。
+
+成果物回収では、安全で重複しない名前の通常の firmware ファイルだけを取り込みます。
+想定外の名前、link、directory、log・summary との衝突は実行を失敗させ、ホストの実行記録を保持します。
+Unix では回収した firmware の権限を `0644` に揃え、実行権限・特殊権限 bit を取り除きます。
 
 開始済み run は setup、source copy、成果物回収、container 削除の失敗にも FAILED summary と error excerpt を残します。
 build 出力は container の log stream にも流れ、保持した container は `docker logs <container>` で確認できます。
 特定 run の成果物確認は次のように実行します。
 
 ```bash
-bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID
+bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne
 ```
 
 validate の結果は `build` を `validate` に置き換えます。両 mode とも、成功 status と一致する mode を持つ summary、
 および log file が必要です。build の確認では、さらに正の target 数と build target 数・firmware 数の完全一致を要求します。
+既知の metadata field は重複を拒否し、期待値 file がない場合も target・image・cache の field を検証します。
 相対run pathは呼び出し元のdirectoryを基準に解決し、省略時はそのdirectoryの `.build/` を探します。
 別の directory から確認するときは run path を指定します。
-run 名は上記の規則に従います。
+run 名は上記の規則に従い、衝突時だけ 2 から始まる `-N` を付けます。自動選択では日時と config 表示名を並べ、
+同じ表示名の summary に記録した連番を数値として扱います。実行を特定する場合は run path を明示します。
+日時のみ、旧 `-N`、旧 `-pid-PID`、連番 metadata のない旧 dot 区切りの directory も検証できます。
 fallback は summary に記録し、記録のない旧 summary は `bin` と解釈します。
 
 品質の検証では、実行前に独立した出力の期待値を定義し、明示run directoryとともに `--expect FILE` を渡します。
@@ -414,7 +437,7 @@ build modeでは期待するfirmwareのbasenameごとの `artifact` を記録し
 printf '%s\0' image zmkfirmware/zmk-build-arm:stable \
   artifact example_corne_left.uf2 > expected-output.nul
 bash .github/scripts/check-build-output.sh build \
-  .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID --expect expected-output.nul
+  .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne --expect expected-output.nul
 ```
 
 期待するmetadataはsummaryに一度だけ現れ、値の完全一致が必要です。buildではfirmware名の集合の完全一致と
@@ -522,7 +545,7 @@ upstream の動く branch に対する互換性確認は、別途明示して実
 
 ### 検証記録とtest cache
 
-実行ごとに新しい `.build/test-<UTC>-pid-<PID>/` へ command、raw log、結果と時間、image identity、
+実行ごとに新しい `.build/test-<UTC>.XXXXXX/` へ command、raw log、結果と時間、image identity、
 実行前後の source checksum を保存します。`ZMK_TEST_RESULTS` で repository 外、または directory 全体を
 Git が ignore する新しい保存先を選べます。既存記録は上書きしません。
 `.gitattributes` / `.editorconfig` の UTF-8 / LF を使い、検証のために working tree を書き換えません。

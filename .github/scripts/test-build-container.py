@@ -28,6 +28,14 @@ def target(artifact, board='A', shield='', snippet='', cmake=''):
 
 
 class ContainerContracts(unittest.TestCase):
+    def run_directory(self, output):
+        paths = [line[len('Run directory: '):] for line in ANSI.sub('', output).splitlines()
+                 if line.startswith('Run directory: ')]
+        self.assertEqual(len(paths), 1, output)
+        path = pathlib.Path(paths[0])
+        self.assertRegex(path.name, r'^run-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[a-z0-9_-]+$')
+        return path
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='zmk-contract-')
         self.root = pathlib.Path(self.temp.name)
@@ -453,7 +461,7 @@ elif args[0] != "start": sys.exit(99)
             commands = [json.loads(row) for row in calls.read_text().splitlines()]
             self.assertEqual(sum(row[0] == 'create' for row in commands), 1)
             self.assertEqual([row for row in commands if row[0] == 'rm'], [['rm', '-f', 'a' * 64]])
-            summary = next((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid)).read_text()
+            summary = (self.run_directory(output) / 'build-summary.txt').read_text()
             self.assertIn('Status: FAILED', summary)
             self.assertIn('Reason: interrupted by SIGTERM', summary)
         finally:
@@ -993,6 +1001,73 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                 self.assertEqual(case.manifest_stamp.read_text(), 'stale\n')
                 self.assertEqual(case.stamp.read_text(), 'project\tmodules/project\n')
 
+    def test_run_reservation_signals_retain_evidence_before_docker(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'mkdir').write_text('''#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, time
+status = subprocess.call([os.environ['RESERVE_REAL_MKDIR']] + sys.argv[1:])
+destination = pathlib.Path(sys.argv[-1])
+if status == 0 and destination.name.startswith('run-'):
+    pathlib.Path(os.environ['RESERVE_REACHED']).write_text(str(destination))
+    while not pathlib.Path(os.environ['RESERVE_RELEASE']).exists(): time.sleep(.01)
+sys.exit(status)
+''')
+        (binary / 'docker').write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+pathlib.Path(os.environ['RESERVE_DOCKER_CALLED']).write_text(repr(sys.argv[1:]))
+sys.exit(99)
+''')
+        for script in binary.iterdir(): script.chmod(0o755)
+        for group in (False, True):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(group=group, signal=signum):
+                    case = self.root / ('reserve-%s-%s' % (group, signum))
+                    case.mkdir()
+                    env = dict(os.environ, ZMK_IN_CONTAINER='0',
+                               PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                               RESERVE_REAL_MKDIR=shutil.which('mkdir'),
+                               RESERVE_REACHED=str(case / 'reached'), RESERVE_RELEASE=str(case / 'release'),
+                               RESERVE_DOCKER_CALLED=str(case / 'docker-called'))
+                    process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                               start_new_session=True, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not (case / 'reached').exists() and time.monotonic() < deadline:
+                            self.assertIsNone(process.poll())
+                            time.sleep(.01)
+                        self.assertTrue((case / 'reached').exists())
+                        if group: os.killpg(process.pid, signum)
+                        else: os.kill(process.pid, signum)
+                        time.sleep(.05)
+                        try:
+                            if group: os.killpg(process.pid, signum)
+                            else: os.kill(process.pid, signum)
+                        except ProcessLookupError:
+                            pass
+                        (case / 'release').touch()
+                        output, _ = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 128 + signum, output)
+                        run = pathlib.Path((case / 'reached').read_text())
+                        self.assertTrue(run.is_dir())
+                        print('RESERVATION: signal=%s group=%s files=%r' %
+                              (signal.Signals(signum).name, group, sorted(p.name for p in run.iterdir())))
+                        self.assertTrue((run / 'build.log').is_file(), output)
+                        self.assertTrue((run / 'build-summary.txt').is_file(), output)
+                        summary = (run / 'build-summary.txt').read_text()
+                        self.assertIn('Status: FAILED', summary)
+                        self.assertIn('Reason: interrupted by ' + signal.Signals(signum).name, summary)
+                        self.assertRegex(summary, r'(?m)^Run sequence: [1-9][0-9]*$')
+                        self.assertEqual(self.run_directory(output), run)
+                        self.assertFalse((case / 'docker-called').exists(), output)
+                    finally:
+                        (case / 'release').touch()
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        if process.poll() is None: process.wait(timeout=3)
+
     def test_create_group_signals_acquire_identity_before_cleanup(self):
         binary = self.root / 'bin'
         binary.mkdir()
@@ -1040,9 +1115,7 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             calls = [json.loads(line) for line in (case / 'calls').read_text().splitlines()]
                             self.assertFalse(any(call[0] == 'start' for call in calls), calls)
                             self.assertEqual(['rm', '-f', 'a' * 64] in calls, keep == 0, calls)
-                            summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
-                            self.assertEqual(len(summaries), 1)
-                            summary = summaries[0].read_text()
+                            summary = (self.run_directory(output) / 'build-summary.txt').read_text()
                             self.assertIn('Status: FAILED', summary)
                             self.assertIn('Reason: interrupted by ' + signal.Signals(signum).name, summary)
                         finally:
@@ -1094,9 +1167,7 @@ else: sys.exit(99)
                         output, _ = process.communicate(timeout=5)
                         self.assertTrue((folder / 'complete').exists(), output)
                         self.assertEqual(process.returncode, initial or 128 + signum, output)
-                        summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
-                        self.assertEqual(len(summaries), 1)
-                        summary = summaries[0].read_text()
+                        summary = (self.run_directory(output) / 'build-summary.txt').read_text()
                         self.assertIn('Status: FAILED', summary)
                         reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
                         self.assertIn('Reason: ' + reason, summary)
@@ -1144,9 +1215,7 @@ trap 'if [ "${FUNCNAME[0]:-}" = finish_run ]; then trap - DEBUG; : > "$ENTRY_REA
                     self.assertTrue((folder / 'reached').exists(), output)
                     self.assertTrue((folder / 'cleaned').exists(), output)
                     self.assertEqual(process.returncode, initial or 128 + signum, output)
-                    summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
-                    self.assertEqual(len(summaries), 1, output)
-                    summary = summaries[0].read_text()
+                    summary = (self.run_directory(output) / 'build-summary.txt').read_text()
                     self.assertIn('Status: FAILED', summary)
                     reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
                     self.assertIn('Reason: ' + reason, summary)
@@ -1192,16 +1261,15 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
                 output, _ = process.communicate(timeout=10)
                 self.assertTrue((folder / 'reached').exists(), output)
                 self.assertTrue((folder / 'cleaned').exists(), output)
-                runs = list((BUILD.parent / '.build').glob('*-pid-%s' % process.pid))
-                self.assertEqual(len(runs), 1)
-                summary = runs[0] / 'build-summary.txt'
+                run = self.run_directory(output)
+                summary = run / 'build-summary.txt'
                 if name == 'late-signal':
                     self.assertEqual(process.returncode, 0, output)
                     self.assertIn('Status: SUCCESS', summary.read_text())
                 else:
                     self.assertNotEqual(process.returncode, 0, output)
                     self.assertFalse(summary.exists(), output)
-                self.assertFalse(list(runs[0].glob('summary-tmp-*')))
+                self.assertFalse(list(run.glob('summary-tmp-*')))
 
     def test_restore_copy_failure_preserves_recovery_state(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project', True)

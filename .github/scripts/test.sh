@@ -6,8 +6,12 @@ cd "${repo_root}"
 mode="${1:-shell}"
 case "${mode}" in shell|docker|build|all) ;; *) echo "usage: $0 shell|docker|build|all" >&2; exit 2 ;; esac
 mkdir -p .build
-result_dir="${ZMK_TEST_RESULTS:-.build/test-$(date -u +%Y%m%dT%H%M%SZ)-pid-$$}"
-mkdir "${result_dir}" || { echo "Evidence directory must be new: ${result_dir}" >&2; exit 1; }
+if [ -n "${ZMK_TEST_RESULTS:-}" ]; then
+  result_dir="${ZMK_TEST_RESULTS}"
+  mkdir "${result_dir}" || { echo "Evidence directory must be new: ${result_dir}" >&2; exit 1; }
+else
+  result_dir="$(mktemp -d ".build/test-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+fi
 result_dir="$(cd "${result_dir}" && pwd -P)"
 case "${result_dir}/" in
   "${repo_root}/"*)

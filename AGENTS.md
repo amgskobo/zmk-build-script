@@ -98,21 +98,33 @@ together.
 - Operate build/clone/test containers by the immutable ID returned from create. Create failure never
   authorizes deleting an existing same-named container. Respect `ZMK_KEEP_CONTAINER=1`, stopping
   retained containers on interruption. Propagate cleanup failures without hiding prior build errors;
-  clone-container deletion failure stops retries/builder invocation. Defer signals through ID
-  acquisition, handler entry and cleanup, commit the true exit status, then publish one atomic final
-  summary. Do not leak stdbuf LD_PRELOAD to children.
+  clone-container deletion failure stops retries/builder invocation. Defer signals through run
+  directory ownership/log initialization, ID acquisition, handler entry and cleanup, commit the
+  true exit status, then publish one atomic final summary. Do not leak stdbuf LD_PRELOAD to children.
 
 - Collect one firmware per target: `.uf2`, configured fallback, `.hex`, then `.bin`. Reject fallback
   extensions containing paths/globs or leading dots/hyphens; host enumeration, summaries and
   checkers use the same extensions and exclude logs/summaries. Existence probes drain without
-  SIGPIPE. Every started run uses `.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/` and retains `build.log`,
+  SIGPIPE. Treat returned container output as untrusted: validate complete NUL-delimited flat
+  firmware names, reject reserved/colliding names and copy through Docker into private staging.
+  Import only regular files, never symlinks/directories or container-produced tar into a host run;
+  normalize firmware permissions to 0644 and propagate permission/staging cleanup failure.
+  Reserve `.build/run-YYYY-MM-DD_HH-MM-SS-CONFIG[-N]/` atomically without a PID. Derive
+  CONFIG from the selected config root basename as an ASCII-safe lowercase label, with dots
+  normalized and an 80-character limit; use `config` when empty. Collision suffixes start at 2.
+  Record the actual `Run sequence` in summaries to distinguish numeric config-name endings;
+  validate its positive decimal value, uniqueness and agreement with the directory name.
+  Keep all firmware, combined logs and summary in that run directory; identify YAML-derived
+  targets from firmware basenames and the summary. Retain legacy flat timestamp/number/PID runs
+  in the checker and order new collision suffixes numerically. Every started run retains `build.log`,
   `build-summary.txt`, failure reason/excerpt on
   setup/pristine/create/start/source-copy/build/artifact-copy/cleanup failures or interruption.
   Propagate artifact-copy failures.
 
 - Summary/checker agree on status, failure reason, mode, target, image/cache, elapsed time, built
-  count, pristine/jobs/fallback/snippets/modules and files. Reject duplicate major fields and
-  invalid run paths. Count build markers after stripping CR/ANSI/prefixes; fall back to firmware
+  count, run sequence, pristine/jobs/fallback/snippets/modules and files. Reject duplicate known metadata fields and
+  invalid run paths. Read metadata before the failure excerpt for all field and expectation checks;
+  raw log lines cannot supply or override metadata. Count build markers after stripping CR/ANSI/prefixes; fall back to firmware
   counts only for successful builds. The checker requires success, mode, log, positive target count
   and exactly matching firmware count. Legacy summaries without fallback use bin.
 
