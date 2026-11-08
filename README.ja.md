@@ -467,6 +467,9 @@ repository の Settings → Actions → Runners から、GitHub が表示する 
 runner user で `bash .github/scripts/check-runner-tools.sh` と「保守と検証」を実行します。
 Windows step は標準 install path の Git Bash を明示します。Docker Desktop は同じ account / session で使えることを
 確認します。Linux は sudo 無しの daemon access が必要で、group 変更後は login / service を更新します。
+手動 workflow は native test suite の前に Docker access を確認します。Windows では対話 terminal に加え、
+runner の non-login Git Bash 環境でも Docker を確認します。service は起動時の環境を保持している場合があるため、
+PATH を変更した後は runner の session / service を更新します。
 self-hosted runner は信頼できる workflow に限定します。
 
 ### scheduleと並列数

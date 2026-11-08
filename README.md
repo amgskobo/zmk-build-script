@@ -529,6 +529,10 @@ Run `bash .github/scripts/check-runner-tools.sh` and the maintenance checks as
 that user. Windows steps explicitly use Git Bash at its standard installation
 path. Docker Desktop must be accessible in the same account/session. Linux needs
 Docker daemon access without sudo; refresh the login/service after group changes.
+The manual workflow checks Docker access before the native test suite. On Windows,
+check Docker from the runner's non-login Git Bash environment as well as an
+interactive terminal; a running service may still have the environment from when
+it started. Refresh the runner session/service after changing its PATH.
 Limit self-hosted execution to trusted workflows.
 
 ### Scheduling and parallelism

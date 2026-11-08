@@ -54,6 +54,8 @@ jobs:
       - name: Initialize publication reports
         id: publication-init
         run: bash .github/scripts/check-build-output.sh publish clear
+      - name: Check Docker access
+        run: bash .github/scripts/check-build-output.sh ci-tools
       - name: Verify shell and Docker contracts
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
@@ -97,6 +99,8 @@ jobs:
       - name: Initialize publication reports
         id: publication-init
         run: bash .github/scripts/check-build-output.sh publish clear
+      - name: Check Docker access
+        run: bash .github/scripts/check-build-output.sh ci-tools
       - name: Verify shell and Docker contracts
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
@@ -140,6 +144,8 @@ jobs:
       - name: Initialize publication reports
         id: publication-init
         run: bash .github/scripts/check-build-output.sh publish clear
+      - name: Check Docker access
+        run: bash .github/scripts/check-build-output.sh ci-tools
       - name: Verify shell and Docker contracts
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi

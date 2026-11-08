@@ -372,6 +372,48 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                         executions += 1
         self.assertEqual(executions, 18)
 
+    def test_self_hosted_workflow_checks_docker_before_native_suite(self):
+        workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        folder = self.root / '.github/scripts'
+        folder.mkdir(parents=True)
+        (folder / 'check-build-output.sh').write_text(
+            '#!/usr/bin/env bash\nset -eu\n'
+            'printf "%s\\0" "$@" >> "$WORKFLOW_CAPTURE"\n'
+            'if [ "$1" = ci-tools ]; then exit "$PREFLIGHT_STATUS"; fi\n')
+        calls = self.root / 'calls'
+        executions = 0
+        for job_id in ('macos', 'windows', 'linux'):
+            steps = workflow['jobs'][job_id]['steps']
+            preflights = [s for s in steps if s.get('name') == 'Check Docker access']
+            self.assertEqual(len(preflights), 1, 'native Docker preflight is missing')
+            preflight = preflights[0]
+            suite = next(s for s in steps if s.get('name') == 'Verify shell and Docker contracts')
+            initialize = next(s for s in steps if s.get('id') == 'publication-init')
+            self.assertLess(steps.index(initialize), steps.index(preflight))
+            self.assertLess(steps.index(preflight), steps.index(suite))
+            self.assertEqual(preflight['run'], 'bash .github/scripts/check-build-output.sh ci-tools')
+            self.assertNotIn('if', preflight)
+            self.assertNotIn('continue-on-error', preflight)
+            for mode in ('validate', 'build'):
+                for status in (0, 127):
+                    with self.subTest(job=job_id, mode=mode, status=status):
+                        calls.write_bytes(b'')
+                        env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT='',
+                                   DOCKER_PLATFORM_INPUT='', PREFLIGHT_STATUS=str(status),
+                                   WORKFLOW_CAPTURE=str(calls))
+                        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
+                                                 preflight['run'] + '\n' + suite['run']],
+                                                cwd=self.root, env=env, capture_output=True)
+                        self.assertEqual(result.returncode, status, result.stderr.decode())
+                        expected = ['ci-tools']
+                        if status == 0:
+                            for selection in (('all',) if mode == 'build' else ('shell', 'docker')):
+                                expected += ['ci-tests', selection]
+                        self.assertEqual(calls.read_bytes().decode().split('\0'), expected + [''])
+                        executions += 1
+        self.assertEqual(executions, 12)
+
     def make_image_selection_daemon(self):
         binary = self.root / 'bin'
         binary.mkdir()
