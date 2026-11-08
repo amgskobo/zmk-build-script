@@ -109,8 +109,10 @@ together.
   firmware names, reject reserved/colliding names and copy through Docker into private staging.
   Import only regular files, never symlinks/directories or container-produced tar into a host run;
   normalize firmware permissions to 0644 and propagate permission/staging cleanup failure.
-  Reserve `.build/run-YYYY-MM-DD_HH-MM-SS-CONFIG[-N]/` atomically without a PID. Derive
-  CONFIG from the selected config root basename as an ASCII-safe lowercase label, with dots
+  Reserve `.build/run-YYYY-MM-DD_HH-MM-SS-CONFIG[-N]/` atomically without a PID. Establish
+  directory ownership with an exclusive temporary sibling claim, not mkdir success or existence;
+  preserve foreign claims and release an owned claim once after log initialization, failing on errors.
+  Derive CONFIG from the selected config root basename as an ASCII-safe lowercase label, with dots
   normalized and an 80-character limit; use `config` when empty. Collision suffixes start at 2.
   Record the actual `Run sequence` in summaries to distinguish numeric config-name endings;
   validate its positive decimal value, uniqueness and agreement with the directory name.

@@ -441,6 +441,8 @@ outside ASCII letters/digits/underscore/hyphen with a hyphen, and is limited to
 repository names become hyphens as part of this normalization.
 Simultaneous runs with the same timestamp and label add `-2`, `-3`, and so on
 through an atomic directory reservation. Existing output is never overwritten.
+A temporary exclusive sibling claim establishes ownership before directory
+creation and log initialization; failure to release it fails the run before Docker starts.
 The summary records `Run sequence` (1 for the first run), so a label ending in
 digits can be distinguished from the collision suffix. Status, mode, count,
 fallback, sequence and expected image/input/cache checks read metadata before

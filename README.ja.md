@@ -398,6 +398,7 @@ firmware と raw log は local の `.build/` に保持します。
 ASCII 英数字・underscore・hyphen 以外の文字の連続を hyphen に置換します。80 文字までに制限して両端の hyphen を除き、
 空になった場合は `config` を使い、repository 名の dot も hyphen に変換します。
 同じ日時・表示名の実行が重なる場合は directory の atomic な確保によって `-2`、`-3` と連番を付け、既存の出力は上書きしません。
+directory 作成・log 初期化の前に隣接する一時 claim を排他的に確保して所有権を決め、claim の解放失敗は Docker 起動前に実行を失敗させます。
 summary に `Run sequence`（最初の実行は 1）を記録するため、表示名の末尾の数字と衝突時の連番を区別できます。
 status・mode・件数・fallback・連番・期待する image / input / cache の検証は Failure excerpt より前の metadata を読みます。
 生の log 行でこれらの field を補ったり上書きしたりしません。

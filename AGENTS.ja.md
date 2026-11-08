@@ -110,6 +110,8 @@
   通常ファイルだけを取り込み、symlink・directoryやコンテナ製tarをホストのrunへ展開しない。
   firmwareの権限を0644へ揃え、権限設定・仮領域の後始末の失敗も伝える。
   PID を使わず `.build/run-YYYY-MM-DD_HH-MM-SS-CONFIG[-N]/` を atomic に確保する。
+  mkdir の成功・存在だけでは所有権を判定せず、隣接する一時 claim を排他的に確保する。
+  他の claim は保持し、自分の claim は log 初期化後に一度だけ解放し、失敗はエラーにする。
   CONFIG は選択した config root の basename を ASCII の安全な小文字の表示名へ変換し、dot を正規化して 80 文字までに制限する。
   空になった場合は `config` を使い、衝突時の連番は 2 から付ける。
   config 名の末尾の数字と区別するため、実際の `Run sequence` を summary に記録し、正の十進数・重複なし・directory 名との一致を検証する。

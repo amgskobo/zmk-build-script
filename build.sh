@@ -1463,6 +1463,7 @@ container_id=""
 container_create_output=""
 image_probe_output=""
 active_phase_pid=""
+run_claim=""
 run_signal_status=0
 run_phase=""
 
@@ -1509,6 +1510,20 @@ run_logged_command() {
     return "${status}"
 }
 
+release_run_claim() {
+    local claim="${run_claim}"
+    [ -n "${claim}" ] || return 0
+    # Release once: an unsuccessful unlink may already have removed the claim.
+    run_claim=""
+    if ! (trap '' INT TERM; rm -f "${claim}"); then
+        echo 'failed to release run directory claim' >&2
+        if [ -n "${LOG_FILE:-}" ]; then
+            echo 'failed to release run directory claim' >> "${LOG_FILE}"
+        fi
+        return 1
+    fi
+}
+
 cleanup_container() {
     if [ "${container_created}" = "1" ] && { [ "${1:-0}" = 1 ] || [ "${ZMK_KEEP_CONTAINER:-0}" != "1" ]; }; then
         if ! (trap '' INT TERM; docker rm -f "${container_id}" >>"${LOG_FILE}" 2>&1); then
@@ -1524,6 +1539,12 @@ finish_run() {
     original_status="${status}"
     run_phase=finish
     trap - EXIT
+    if ! release_run_claim; then
+        if [ "${status}" = 0 ]; then
+            status=1
+            reason="run directory reservation cleanup failed"
+        fi
+    fi
     # A signal here records cancellation without recursively exiting the EXIT handler.
     if ! cleanup_container; then
         if [ "${status}" = 0 ]; then
@@ -1854,7 +1875,7 @@ reset_cache_volume() {
 }
 
 create_run_directory() {
-    local root="${SCRIPT_DIR}/.build" label stem candidate number=1
+    local root="${SCRIPT_DIR}/.build" label stem candidate claim number=1
     mkdir -p "${root}" || return 1
     # Derive only a display label on the host; YAML target parsing stays in Docker.
     label="$(printf '%s' "${TARGET_DIR##*/}" | LC_ALL=C tr -cs 'A-Za-z0-9_-' '-' | LC_ALL=C tr 'A-Z' 'a-z')" || return 1
@@ -1866,10 +1887,33 @@ create_run_directory() {
     # Commit directory ownership and an initialized log before honoring cancellation.
     # A group signal must not kill mkdir after it created an otherwise unrecorded run.
     run_phase=reserve
-    while ! (trap - EXIT; trap '' INT TERM; mkdir "${candidate}") 2>/dev/null; do
-        if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
-            echo "Cannot create run directory: ${candidate}" >&2
-            return 1
+    while :; do
+        claim="${candidate}.reserve"
+        if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ] &&
+            [ ! -e "${claim}" ] && [ ! -L "${claim}" ]; then
+            # Some mkdir commands accept a directory created by another process.
+            # Shell noclobber claims ownership before any mkdir or log writes.
+            if (trap - EXIT; trap '' INT TERM; umask 077; set -C; : > "${claim}") 2>/dev/null; then
+                run_claim="${claim}"
+                if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                    if (trap - EXIT; trap '' INT TERM; mkdir "${candidate}") 2>/dev/null &&
+                        [ -d "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                        break
+                    fi
+                    if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                        release_run_claim || return 1
+                        [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+                        echo "Cannot create run directory: ${candidate}" >&2
+                        return 1
+                    fi
+                fi
+                release_run_claim || return 1
+            elif [ ! -e "${claim}" ] && [ ! -L "${claim}" ] &&
+                [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+                echo "Cannot reserve run directory: ${candidate}" >&2
+                return 1
+            fi
         fi
         [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
         number=$((number + 1))
@@ -1878,6 +1922,8 @@ create_run_directory() {
     # Keep the actual sequence in the summary; a config name may itself end in digits.
     RUN_SEQUENCE="${number}" artifact_dir="${candidate}" LOG_FILE="${candidate}/build.log"
     : > "${LOG_FILE}"
+    msg "Run directory: ${artifact_dir}" | tee -a "${LOG_FILE}"
+    release_run_claim
 }
 
 validate_host_layout
@@ -1901,13 +1947,13 @@ zmk_cache_volume="${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}"
 # ccache lives on the cache volume so that it survives the throw-away build container (see README.md).
 zmk_ccache_dir="${ZMK_CCACHE_DIR:-/workspaces/.ccache}"
 RUN_STARTED_AT="$(date +%s)"
+RUN_FAILURE_REASON="run directory reservation failed"
 create_run_directory
 run_id="${artifact_dir##*/}"
 container_name="${ZMK_CONTAINER_NAME:-zmk-build-${run_id}-pid-$$}"
 touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 
 echo -e "${CYAN}Starting ZMK ${MODE}...${NC}"
-msg "Run directory: ${artifact_dir}" | tee -a "${LOG_FILE}"
 msg "Target: ${TARGET_DIR}"
 msg "Docker image: ${zmk_build_image}"
 msg "Docker cache volume: ${zmk_cache_volume}"

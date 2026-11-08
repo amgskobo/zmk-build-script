@@ -883,35 +883,105 @@ rm "${fake_bin}/rm" "${fake_bin}/chmod"
 
 # A frozen clock and concurrent invocations must reserve separate run directories.
 real_date="$(command -v date)"
+real_mkdir="$(command -v mkdir)"
 cat > "${fake_bin}/date" <<'EOF'
 #!/usr/bin/env bash
-if [ "${1:-}" = '+%Y-%m-%d_%H-%M-%S' ]; then printf '%s\n' 2000-01-02_03-04-05
+if [ "${1:-}" = '+%Y-%m-%d_%H-%M-%S' ]; then printf '%s\n' "${ZMK_TEST_RUN_TIMESTAMP:-2000-01-02_03-04-05}"
 else exec "${ZMK_TEST_REAL_DATE}" "$@"; fi
 EOF
 chmod +x "${fake_bin}/date"
-reserved="${tool_root}/.build/run-2000-01-02_03-04-05-ci-zmk-config"
-printf 'preserve existing file\n' > "${reserved}"
-MSYS=winsymlinks:sys ln -s "${tmp_dir}/missing-run" "${reserved}-2"
-[ -L "${reserved}-2" ] || { echo 'run reservation fixture is not a symlink' >&2; exit 1; }
-reservation_pids=()
-for number in $(seq 1 10); do
-  PATH="${fake_bin}:${PATH}" ZMK_TEST_REAL_DATE="${real_date}" NEW_PHASE=reservation \
-      NEW_CALLS="${tmp_dir}/reservation-${number}.commands.log" \
-      bash "${tool_root}/build.sh" validate "${fixture}" > "${tmp_dir}/reservation-${number}.log" 2>&1 &
-  reservation_pids+=("$!")
-done
-for pid in "${reservation_pids[@]}"; do wait "${pid}"; done
-for number in $(seq 1 10); do
-  summary="$(summary_from_log "${tmp_dir}/reservation-${number}.log")"
-  case "${summary}" in "${reserved}"-[3-9]/build-summary.txt|"${reserved}"-1[0-2]/build-summary.txt) ;;
-    *) echo "Unexpected reserved run directory: ${summary}" >&2; exit 1 ;;
+# Some mkdir implementations report success for a concurrently created directory.
+# Model that behavior explicitly while retaining the native-command lane.
+cat > "${fake_bin}/mkdir" <<'EOF'
+#!/usr/bin/env bash
+if [ "${ZMK_TEST_OPTIMISTIC_MKDIR:-0}" = 1 ]; then
+  destination=
+  for argument in "$@"; do destination="$argument"; done
+  case "${destination##*/}" in
+    run-*)
+      "${ZMK_TEST_REAL_MKDIR}" "$@" 2>/dev/null
+      status=$?
+      [ ! -d "${destination}" ] || exit 0
+      exit "${status}" ;;
   esac
-  bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}"
+fi
+exec "${ZMK_TEST_REAL_MKDIR}" "$@"
+EOF
+chmod +x "${fake_bin}/mkdir"
+for reservation_kind in native optimistic; do
+  case "${reservation_kind}" in
+    native) frozen_time=2000-01-02_03-04-05; optimistic_mkdir=0 ;;
+    optimistic) frozen_time=2000-01-02_03-04-06; optimistic_mkdir=1 ;;
+  esac
+  reserved="${tool_root}/.build/run-${frozen_time}-ci-zmk-config"
+  printf 'preserve existing file\n' > "${reserved}"
+  MSYS=winsymlinks:sys ln -s "${tmp_dir}/missing-run" "${reserved}-2"
+  [ -L "${reserved}-2" ] || { echo 'run reservation fixture is not a symlink' >&2; exit 1; }
+  if [ "${reservation_kind}" = optimistic ]; then
+    printf 'preserve foreign claim\n' > "${reserved}-3.reserve"
+    MSYS=winsymlinks:sys ln -s "${tmp_dir}/missing-claim" "${reserved}-4.reserve"
+    [ -L "${reserved}-4.reserve" ] || { echo 'claim fixture is not a symlink' >&2; exit 1; }
+  fi
+  reservation_pids=()
+  for number in $(seq 1 10); do
+    PATH="${fake_bin}:${PATH}" ZMK_TEST_REAL_DATE="${real_date}" ZMK_TEST_REAL_MKDIR="${real_mkdir}" \
+        ZMK_TEST_RUN_TIMESTAMP="${frozen_time}" ZMK_TEST_OPTIMISTIC_MKDIR="${optimistic_mkdir}" NEW_PHASE=reservation \
+        NEW_CALLS="${tmp_dir}/reservation-${reservation_kind}-${number}.commands.log" \
+        bash "${tool_root}/build.sh" validate "${fixture}" > "${tmp_dir}/reservation-${reservation_kind}-${number}.log" 2>&1 &
+    reservation_pids+=("$!")
+  done
+  for pid in "${reservation_pids[@]}"; do wait "${pid}"; done
+  for number in $(seq 1 10); do
+    summary="$(summary_from_log "${tmp_dir}/reservation-${reservation_kind}-${number}.log")"
+    case "${reservation_kind}:${summary}" in
+      native:"${reserved}"-[3-9]/build-summary.txt|native:"${reserved}"-1[0-2]/build-summary.txt|\
+      optimistic:"${reserved}"-[5-9]/build-summary.txt|optimistic:"${reserved}"-1[0-4]/build-summary.txt) ;;
+      *) echo "Unexpected reserved run directory: ${summary}" >&2; exit 1 ;;
+    esac
+    bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}"
+  done
+  [ "$(find "${tool_root}/.build" -maxdepth 1 -type d -name "run-${frozen_time}-ci-zmk-config-*" | wc -l | tr -d '[:space:]')" = 10 ]
+  grep -qx 'preserve existing file' "${reserved}"
+  [ -L "${reserved}-2" ]
+  if [ "${reservation_kind}" = optimistic ]; then
+    grep -qx 'preserve foreign claim' "${reserved}-3.reserve"
+    [ -L "${reserved}-4.reserve" ]
+    [ "$(find "${tool_root}/.build" -maxdepth 1 -name "run-${frozen_time}-*.reserve" | wc -l | tr -d '[:space:]')" = 2 ]
+    rm "${reserved}-3.reserve" "${reserved}-4.reserve"
+  else
+    [ "$(find "${tool_root}/.build" -maxdepth 1 -name "run-${frozen_time}-*.reserve" | wc -l | tr -d '[:space:]')" = 0 ]
+  fi
+  rm "${reserved}" "${reserved}-2"
 done
-[ "$(find "${tool_root}/.build" -maxdepth 1 -type d -name 'run-2000-01-02_03-04-05-ci-zmk-config-*' | wc -l | tr -d '[:space:]')" = 10 ]
-grep -qx 'preserve existing file' "${reserved}"
-[ -L "${reserved}-2" ]
-rm "${reserved}" "${reserved}-2"
+rm "${fake_bin}/mkdir"
+
+# A failed claim release retains failure evidence and stops before Docker.
+cat > "${fake_bin}/rm" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = -f ]; then
+  case "${2:-}" in
+    *.reserve)
+      printf 'claim release attempted\n' >> "${ZMK_TEST_CLAIM_RM_CALLS}"
+      echo 'injected run claim release failure' >&2; exit 23 ;;
+  esac
+fi
+exec "${NEW_REAL_RM}" "$@"
+EOF
+chmod +x "${fake_bin}/rm"
+prefix="${tmp_dir}/claim-release-failure"
+if PATH="${fake_bin}:${PATH}" ZMK_TEST_REAL_DATE="${real_date}" ZMK_TEST_RUN_TIMESTAMP=2000-01-02_03-04-07 \
+    ZMK_TEST_CLAIM_RM_CALLS="${prefix}.rm-calls.log" NEW_PHASE=reservation NEW_CALLS="${prefix}.commands.log" \
+    bash "${tool_root}/build.sh" validate "${fixture}" > "${prefix}.log" 2>&1; then
+  echo 'failed run claim release was accepted' >&2; exit 1
+fi
+summary="$(summary_from_log "${prefix}.log")"
+grep -qx 'Status: FAILED' "${summary}"
+grep -qx 'Reason: run directory reservation failed' "${summary}"
+grep -qx 'failed to release run directory claim' "${summary%/*}/build.log"
+[ -f "${summary%/*}.reserve" ]
+[ "$(wc -l < "${prefix}.rm-calls.log" | tr -d '[:space:]')" = 1 ]
+[ ! -e "${prefix}.commands.log" ]
+rm "${fake_bin}/rm"
 
 # Names are safe display labels from the selected config root, not parsed YAML on the host.
 for naming_case in hidden numeric unicode long; do
