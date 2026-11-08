@@ -540,7 +540,7 @@ bash .github/scripts/test.sh all
 
 | 層 | 確認範囲 |
 | --- | --- |
-| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白入り target / module path、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
+| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白・Unicode 入り target / module / 一時 path、option や shell 構文に見える文字・絵文字を含む literal file 名、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
 | `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
@@ -548,6 +548,8 @@ bash .github/scripts/test.sh all
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。
+runner の検証結果は、実行した OS・architecture・image の条件に対応します。UNC / drive path の解釈の検証は、
+実 SMB 共有へのアクセスを保証しません。他の architecture・filesystem policy・host 設定は個別の実行が必要です。
 fixture の manifest は ZMK と Zephyr の両方を検証済みコミットに固定し、firmware suite は
 取得した checkout と pin の一致も確認します。更新時は依存の差分をレビューし、影響する test layer を実行します。
 upstream の動く branch に対する互換性確認は、別途明示して実行します。

@@ -616,7 +616,7 @@ bash .github/scripts/test.sh all
 
 | Layer | Scope |
 | --- | --- |
-| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module paths with spaces, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
+| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module and temporary paths with spaces/Unicode, literal option-like/shell-character/emoji filenames, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
 | `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
 | `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run the `shell`, `docker` and `build` layers in that order. |
@@ -624,6 +624,9 @@ bash .github/scripts/test.sh all
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.
+Runner coverage is specific to the exercised OS, architecture and image. UNC/drive
+path classification does not establish access to an actual SMB share. Other
+architectures, filesystem policies and host configurations need their own runs.
 Their manifests pin both ZMK and Zephyr to tested commits; the firmware suite
 also verifies the resolved checkouts against those pins. Update them deliberately
 with dependency review and the affected test layers. Keep tests against moving

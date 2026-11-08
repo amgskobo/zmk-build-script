@@ -2004,7 +2004,8 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
         root = pathlib.Path('/tmp/windows-copy')
         root.mkdir()
         keep = ['keep.txt', 'nested/valid name.txt', 'nested/COM0.txt',
-                'nested/my..file.txt', 'unicode-名前.txt', 'DEL-\x7f.txt', 'COM⁴.txt']
+                'nested/my..file.txt', 'unicode-名前.txt', 'DEL-\x7f.txt', 'COM⁴.txt',
+                '-C', '--exclude=src', 'literal [ab] $value; & (test).txt', 'unicode-名前-📦.txt']
         bad = ['tail ', 'tail.', 'CON.txt', 'lpt1.extra', 'bad:colon', 'bad?name',
                'bad*name', 'bad"quote', 'bad<name', 'bad>name', 'bad|name',
                'bad\\name', 'bad\nline', 'bad\tcontrol', 'bad\x01control',

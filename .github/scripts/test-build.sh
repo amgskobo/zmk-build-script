@@ -319,7 +319,7 @@ fi
 EOF
 chmod +x "${fake_bin}/tar"
 
-create_tmp="${tmp_dir}/create-temporaries"
+create_tmp="${tmp_dir}/.temporary inputs 名前 [test]"
 mkdir -p "${create_tmp}"
 # Another run may sort after this invocation even when its PID is unrelated.
 foreign_run="${tool_root}/.build/run-9999-12-31_23-59-59-pid-1"
@@ -416,6 +416,9 @@ add_native_copy_payload() {
   printf '%s\n' "${role}" > "${root}/source-identity.txt"
   printf 'LF\nCRLF\r\nCR\rControl-Z\032NUL\000end\n' > "${root}/.hidden payload/mixed bytes.bin"
   printf 'unicode payload\n' > "${root}/.hidden payload/unicode-名前.txt"
+  for name in '-C' '--exclude=src' 'literal [ab] $value; & (test).txt' 'unicode-名前-📦.txt'; do
+    printf 'literal filename payload\n' > "${root}/${name}"
+  done
   awk 'BEGIN { for (i=0;i<65536;i++) printf "0123456789abcdef" }' > "${root}/large input.bin"
   MSYS=winsymlinks:sys ln -s src/keep.txt "${root}/input-link"
   [ -L "${root}/input-link" ] || { echo 'native copy source fixture is not a symlink' >&2; return 1; }
@@ -428,6 +431,10 @@ assert_native_copy_payload() {
   cmp "${copied}/source-identity.txt" <(printf '%s\n' "${role}") || return 1
   for name in 'src/keep.txt' '.hidden payload/mixed bytes.bin' '.hidden payload/unicode-名前.txt' 'large input.bin'; do
     cmp "${original}/${name}" "${copied}/${name}" || return 1
+  done
+  for name in '-C' '--exclude=src' 'literal [ab] $value; & (test).txt' 'unicode-名前-📦.txt'; do
+    [ -f "${copied}/${name}" ] || { echo 'native copy lost literal filename' >&2; return 1; }
+    cmp "${copied}/${name}" <(printf 'literal filename payload\n') || return 1
   done
   [ -L "${copied}/input-link" ] || { echo 'native copy lost the symlink type' >&2; return 1; }
   [ "$(readlink "${copied}/input-link")" = src/keep.txt ] || return 1
@@ -518,6 +525,15 @@ for copy_case in git-visible git-opt-out git-failure git-empty no-null generated
   assert_native_copy_payload "${copy_target}" "${copy_streams}/target" target "${copy_policy}" "${copy_generated}"
   assert_native_copy_payload "${copy_module}" "${copy_streams}/module" module "${copy_policy}" "${copy_generated}"
   if [ "${copy_case}" = git-visible ]; then
+    # Named control: losing one literal filename fails even when the archive extracts.
+    rm "${copy_streams}/target/literal [ab] \$value; & (test).txt"
+    if assert_native_copy_payload "${copy_target}" "${copy_streams}/target" target visible keep \
+        > "${tmp_dir}/native-copy-lost-literal-name.log" 2>&1; then
+      echo 'native copy accepted a missing literal filename' >&2; exit 1
+    fi
+    grep -qx 'native copy lost literal filename' "${tmp_dir}/native-copy-lost-literal-name.log"
+    cp "${copy_target}/literal [ab] \$value; & (test).txt" "${copy_streams}/target/"
+    echo '[host-contract] control lost-literal-name rejected'
     # Named controls prove a swapped input or materialized link cannot pass the oracle.
     if assert_native_copy_payload "${copy_target}" "${copy_streams}/module" target visible keep \
         > "${tmp_dir}/native-copy-wrong-input.log" 2>&1; then
@@ -1486,8 +1502,9 @@ ccache_dir=
   mkdir -p "${tmp_dir}/.clone destination 名前/returned files"
   docker_no_pathconv cp "${last_container}:/tmp/windows-copy/." "$(docker_host_path "${tmp_dir}/.clone destination 名前/returned files")"
 )
-[ "$(find "${tmp_dir}/.clone destination 名前/returned files" -type f | wc -l | tr -d '[:space:]')" = 7 ]
-for file in keep.txt 'nested/valid name.txt' nested/COM0.txt nested/my..file.txt unicode-名前.txt $'DEL-\177.txt' COM⁴.txt; do
+[ "$(find "${tmp_dir}/.clone destination 名前/returned files" -type f | wc -l | tr -d '[:space:]')" = 11 ]
+for file in keep.txt 'nested/valid name.txt' nested/COM0.txt nested/my..file.txt unicode-名前.txt $'DEL-\177.txt' COM⁴.txt \
+    '-C' '--exclude=src' 'literal [ab] $value; & (test).txt' 'unicode-名前-📦.txt'; do
   cmp "${tmp_dir}/.clone destination 名前/returned files/${file}" <(printf 'clone payload\n')
 done
 # Use the existing validate container as the holder; never reset a production cache.
