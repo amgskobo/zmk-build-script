@@ -476,6 +476,7 @@ online / busy / label / 登録先を確認し、外部 job から除外する場
 ### 公開レポートとCI helper
 
 CI の自動 upload は `.build/public/` の固定項目の text report に限定し、command の結果と既知の test status を記録します。
+host test の失敗時は、検証済みの数値のソース行番号も記録できます。生のエラー文は含めません。
 raw な環境情報、path、source label、runner 名、log、firmware は自動 upload しません。
 外部 job の公開名には source の数値 index を使います。report は raw evidence と別の公開用コピーです。
 hosted runner の raw evidence は一時的で、job の削除後は残りません。詳細な診断には local での再現、

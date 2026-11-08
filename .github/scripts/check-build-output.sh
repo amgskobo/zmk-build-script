@@ -30,8 +30,14 @@ public_case_status() {
   esac
 }
 
+public_source_line() {
+  case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 6 ]
+}
+
 publish_report() {
   local kind="$1" status="${2:-}" evidence="${3:-}" public_dir=.build/public file temporary label value rest number rows=0 outcome
+  local host_failed=0 receipt
   [ ! -L .build ] && [ ! -L "${public_dir}" ] || { echo 'Publication directory must not be a symlink.' >&2; return 1; }
   mkdir -p "${public_dir}" || return 1
   if [ "${kind}" = clear ]; then
@@ -42,14 +48,14 @@ publish_report() {
     return 0
   fi
   if [ "${kind}" = verify ]; then
-    local reports=0 header modes outcomes codes notices line report_status report_outcome has_failure
+    local reports=0 header modes outcomes codes notices locations line report_status report_outcome has_failure
     for label in "${PUBLIC_REPORT_KINDS[@]}"; do
       file="${public_dir}/${label}.txt"
       [ ! -L "${file}" ] || { echo 'Publication report must not be a symlink.' >&2; return 1; }
       [ ! -e "${file}" ] || [ -f "${file}" ] || return 1
       [ -f "${file}" ] || continue
       reports=$((reports + 1))
-      header=0 modes=0 outcomes=0 codes=0 notices=0 has_failure=0 report_status= report_outcome=
+      header=0 modes=0 outcomes=0 codes=0 notices=0 locations=0 host_failed=0 has_failure=0 report_status= report_outcome=
       while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in
           'Sanitized publication report') header=$((header + 1)) ;;
@@ -61,13 +67,22 @@ publish_report() {
             [ "${report_status}" -le 255 ] || return 1
             codes=$((codes + 1)) ;;
           'Detailed logs and firmware, when produced, are retained locally.') notices=$((notices + 1)) ;;
+          'Host contract failure line: '*)
+            public_source_line "${line#Host contract failure line: }" || return 1
+            locations=$((locations + 1)) ;;
           *)
             value="${line#*: }"; number="${line%%: *}"
             public_case_label "${number}" && public_case_status "${value}" || return 1
+            case "${number}:${value}" in host-contract:FAIL*) host_failed=1 ;; esac
             [ "${value}" = PASS ] || has_failure=1 ;;
         esac
       done < "${file}"
       [ "${header}" = 1 ] && [ "${modes}" = 1 ] && [ "${outcomes}" = 1 ] && [ "${codes}" = 1 ] && [ "${notices}" = 1 ] || return 1
+      [ "${locations}" -le 1 ] || return 1
+      if [ "${locations}" = 1 ]; then
+        case "${label}" in tests-shell|tests-all) ;; *) return 1 ;; esac
+        [ "${host_failed}" = 1 ] || return 1
+      fi
       if [ "${report_outcome}" = SUCCESS ]; then [ "${report_status}" = 0 ] && [ "${has_failure}" = 0 ] || return 1; fi
     done
     [ "${reports}" -gt 0 ] || { echo 'No publication reports were produced.' >&2; return 1; }
@@ -84,12 +99,26 @@ publish_report() {
       while IFS=$'\t' read -r label value rest; do
         public_case_label "${label}" && public_case_status "${value}" || continue
         if [ "${value}" != PASS ] && [ "${status}" = 0 ]; then status=1; fi
+        case "${label}:${value}" in host-contract:FAIL*) host_failed=1 ;; esac
         printf '%s: %s\n' "${label}" "${value}" >> "${temporary}" || return 1
         rows=$((rows + 1))
       done < "${evidence}/results.tsv"
     fi
     [ "${rows}" -gt 0 ] || status=1
   fi
+  case "${kind}" in
+    tests-shell|tests-all)
+      receipt="${evidence}/host-evidence/host-failure-line.txt"
+      if [ "${host_failed}" = 1 ] && { [ -e "${receipt}" ] || [ -L "${receipt}" ]; }; then
+        [ -f "${receipt}" ] && [ ! -L "${receipt}" ] || { echo 'Invalid host failure receipt.' >&2; return 1; }
+        if ! IFS= read -r value < "${receipt}" || ! public_source_line "${value}" ||
+            ! cmp -s "${receipt}" <(printf '%s\n' "${value}"); then
+          echo 'Invalid host failure source line.' >&2
+          return 1
+        fi
+        printf 'Host contract failure line: %s\n' "${value}" >> "${temporary}" || return 1
+      fi ;;
+  esac
   file="${public_dir}/${kind}.txt"
   outcome=FAILED
   [ "${status}" != 0 ] || outcome=SUCCESS

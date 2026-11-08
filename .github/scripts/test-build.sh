@@ -17,9 +17,14 @@ tool_root="${tmp_dir}/tool-root"
 fixture="${tool_root}/.github/fixtures/ci-zmk-config"
 container_logs=()
 last_container=""
+test_failure_line=""
+
+remember_host_failure() {
+  [ -n "${test_failure_line}" ] || test_failure_line="$1"
+}
 
 cleanup() {
-  local container log
+  local container log failure_status="$1" failure_line="$2"
   # Docker create writes its immutable ID to stdout. A name collision writes no ID.
   # Read only logs registered for our validate calls, including calls that later fail.
   for log in ${container_logs[@]+"${container_logs[@]}"}; do
@@ -29,6 +34,9 @@ cleanup() {
   done
   if [ -n "${ZMK_TEST_ARTIFACT_DIR:-}" ]; then
     mkdir -p "${ZMK_TEST_ARTIFACT_DIR}/runs"
+    if [ "${mode}" = host ] && [ "${failure_status}" != 0 ]; then
+      printf '%s\n' "${failure_line}" > "${ZMK_TEST_ARTIFACT_DIR}/host-failure-line.txt"
+    fi
     for log in "${tmp_dir}"/*.log "${tmp_dir}"/*.err; do
       [ ! -f "${log}" ] || cp "${log}" "${ZMK_TEST_ARTIFACT_DIR}/"
     done
@@ -40,7 +48,8 @@ cleanup() {
   fi
   rm -rf "${tmp_dir}"
 }
-trap cleanup EXIT
+trap 'remember_host_failure "$LINENO"' ERR
+trap 'cleanup "$?" "${test_failure_line:-$LINENO}"' EXIT
 
 summary_from_log() {
   local run
@@ -362,18 +371,18 @@ for phase in start copy validate artifact module; do
       >"${tmp_dir}/identity-${phase}.log" 2>&1 &
   build_pid=$!
   if wait "${build_pid}"; then
-    echo "injected identity ${phase} failure was accepted" >&2; identity_failed=1
+    echo "injected identity ${phase} failure was accepted" >&2; identity_failed=1; remember_host_failure "$LINENO"
   fi
   if ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"; then
-    echo "identity ${phase}: cleanup addressed a replaceable container name" >&2; identity_failed=1
+    echo "identity ${phase}: cleanup addressed a replaceable container name" >&2; identity_failed=1; remember_host_failure "$LINENO"
   fi
   if grep -v '^create ' "${commands}" | grep -q 'replaceable-test-name'; then
-    echo "identity ${phase}: an operation addressed a replaceable container name" >&2; identity_failed=1
+    echo "identity ${phase}: an operation addressed a replaceable container name" >&2; identity_failed=1; remember_host_failure "$LINENO"
   fi
   grep -q "injected ${phase} failure" "${tmp_dir}/identity-${phase}.log"
   if [ "${phase}" = module ]; then
     if ! grep '/root/external_modules' "${commands}" | grep -q '_ dot-module$'; then
-      echo 'module path ending in /. was copied under the wrong name' >&2; identity_failed=1
+      echo 'module path ending in /. was copied under the wrong name' >&2; identity_failed=1; remember_host_failure "$LINENO"
     fi
   fi
   case "${phase}" in
@@ -451,43 +460,43 @@ for phase in cleanup-failure both-failures keep reset-failure list-failure missi
     status=$?
   fi
   if [ "${status}" != "${expected}" ]; then
-    echo "lifecycle ${phase}: expected status ${expected}, got ${status}" >&2; lifecycle_failed=1
+    echo "lifecycle ${phase}: expected status ${expected}, got ${status}" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"
   fi
   summary="$(summary_from_log "${tmp_dir}/lifecycle-${phase}.log")"
   if [ ! -f "${summary}" ]; then
-    echo "lifecycle ${phase}: missing run summary" >&2; lifecycle_failed=1; continue
+    echo "lifecycle ${phase}: missing run summary" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"; continue
   fi
   if [ "${expected}" = 0 ]; then
     if ! bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}" \
-        >"${tmp_dir}/lifecycle-${phase}.checker.log" 2>&1; then lifecycle_failed=1; fi
+        >"${tmp_dir}/lifecycle-${phase}.checker.log" 2>&1; then lifecycle_failed=1; remember_host_failure "$LINENO"; fi
   elif ! grep -qx 'Status: FAILED' "${summary}" || ! grep -qx "Reason: ${reason}" "${summary}"; then
-    echo "lifecycle ${phase}: missing FAILED summary or original reason" >&2; lifecycle_failed=1
+    echo "lifecycle ${phase}: missing FAILED summary or original reason" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"
   fi
   case "${phase}" in
     cleanup-failure|both-failures)
       if ! grep -q 'injected container cleanup failure' "${summary%/*}/build.log" ||
           ! grep -q 'failed to remove build container' "${summary}"; then
-        echo "lifecycle ${phase}: cleanup diagnostics lost" >&2; lifecycle_failed=1
+        echo "lifecycle ${phase}: cleanup diagnostics lost" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"
       fi ;;
     reset-failure|list-failure)
       if grep -q '^create ' "${commands}" || ! grep -q 'injected .* failure' "${summary%/*}/build.log"; then
-        echo "lifecycle ${phase}: build started after reset failure or diagnostics lost" >&2; lifecycle_failed=1
+        echo "lifecycle ${phase}: build started after reset failure or diagnostics lost" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"
       fi ;;
   esac
   if [ "${phase}" = keep ] || [ "${phase}" = create-failure ]; then
     if grep -q '^rm ' "${commands}"; then
-      echo "lifecycle ${phase}: removed a kept or unowned container" >&2; lifecycle_failed=1
+      echo "lifecycle ${phase}: removed a kept or unowned container" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"
     fi
   elif [ "${phase}" != reset-failure ] && [ "${phase}" != list-failure ]; then
-    if ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"; then lifecycle_failed=1; fi
+    if ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${commands}"; then lifecycle_failed=1; remember_host_failure "$LINENO"; fi
   fi
   case "${phase}" in
     missing|list-failure)
       if grep -q '^volume rm ' "${commands}"; then
-        echo "lifecycle ${phase}: removed an absent or unverified volume" >&2; lifecycle_failed=1
+        echo "lifecycle ${phase}: removed an absent or unverified volume" >&2; lifecycle_failed=1; remember_host_failure "$LINENO"
       fi ;;
     present|present-crlf|reset-failure)
-      if ! grep -qx 'volume rm lifecycle-cache' "${commands}"; then lifecycle_failed=1; fi ;;
+      if ! grep -qx 'volume rm lifecycle-cache' "${commands}"; then lifecycle_failed=1; remember_host_failure "$LINENO"; fi ;;
   esac
 done
 
@@ -582,17 +591,17 @@ for order in forward reverse; do
   if PATH="${fake_bin}:${PATH}" bash "${tool_root}/build.sh" validate "${fixture}" "${module_args[@]}" \
       >"${tmp_dir}/module-names-${order}.log" 2>&1; then :; fi
   if ! grep -q 'fake docker reached' "${tmp_dir}/module-names-${order}.log"; then
-    echo "distinct module names were rejected: ${order}" >&2; module_names_failed=1
+    echo "distinct module names were rejected: ${order}" >&2; module_names_failed=1; remember_host_failure "$LINENO"
   fi
 done
 same="$(make_module beta none "${tmp_dir}/other-parent")"
 if PATH="${fake_bin}:${PATH}" bash "${tool_root}/build.sh" validate "${fixture}" -m "${short}" -m "${same}" \
     >"${tmp_dir}/module-names-duplicate.log" 2>&1; then
-  echo 'duplicate module basename was accepted' >&2; module_names_failed=1
+  echo 'duplicate module basename was accepted' >&2; module_names_failed=1; remember_host_failure "$LINENO"
 fi
 grep -q 'duplicate module input name: beta' "${tmp_dir}/module-names-duplicate.log"
 if grep -q 'fake docker reached' "${tmp_dir}/module-names-duplicate.log"; then
-  echo 'duplicate module basename reached Docker' >&2; module_names_failed=1
+  echo 'duplicate module basename reached Docker' >&2; module_names_failed=1; remember_host_failure "$LINENO"
 fi
 
 compat_dir="${tmp_dir}/compat-zmk-config"
@@ -741,7 +750,12 @@ case "$1" in
     esac
     [ "$3" = ./firmware ] && [ -f ./firmware ] && [ ! -L ./firmware ] || exit 99
     [ "${NEW_ATTACK:-}" != copy-failure ] || exit 23
-    cp -P "${NEW_PAYLOAD}/${2##*/}" "$3" ;;
+    source="${NEW_PAYLOAD}/${2##*/}"
+    # The daemon preserves link type. MSYS's default deepcopy is not that model.
+    MSYS=winsymlinks:sys cp -P "${source}" "$3" || exit "$?"
+    if [ -L "${source}" ] && [ ! -L "$3" ]; then
+      echo 'artifact-copy fixture materialized a symlink' >&2; exit 99
+    fi ;;
   rm)
     if [ "${NEW_PHASE}" = cleanup-rm ]; then
       : > "${NEW_REACHED}"
@@ -787,7 +801,7 @@ for count in 1 512; do
   if [ "${status}" != 0 ] || ! grep -qx 'Status: SUCCESS' "${summary}" ||
       [ "$(grep -c '^- target-' "${summary}")" != "${count}" ]; then
     echo "artifact stream ${count}: successful firmware collection was rejected or omitted" >&2
-    finalization_failed=1
+    finalization_failed=1; remember_host_failure "$LINENO"
   else
     bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
   fi
@@ -846,7 +860,7 @@ for attack in log-link summary-link log-case summary-case firmware-link firmware
       [ -L "${summary}" ] || [ -L "${summary%/*}/build.log" ] ||
       ! grep -qx 'Status: FAILED' "${summary}"; then
     echo "artifact ${attack}: container output replaced evidence or wrote outside the run" >&2
-    finalization_failed=1
+    finalization_failed=1; remember_host_failure "$LINENO"
   else
     grep -qx 'Reason: artifact copy failed' "${summary}"
     staging_count="$(find "${summary%/*}" -mindepth 1 -maxdepth 1 -name 'artifact-tmp-*' | wc -l | tr -d '[:space:]')"
@@ -1036,7 +1050,7 @@ for crlf in 0 1; do
     status=0
   else status=$?; fi
   if [ "${status}" != 0 ] || ! grep -qx 'rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' "${calls}"; then
-    echo 'receipt parsing lost the created container identity' >&2; finalization_failed=1
+    echo 'receipt parsing lost the created container identity' >&2; finalization_failed=1; remember_host_failure "$LINENO"
   fi
 done
 rm "${fake_bin}/tr"
@@ -1061,10 +1075,10 @@ for phase in cleanup-entry cleanup-rm; do
     if [ "${status}" != "${expected}" ] || [ ! -f "${prefix}.complete" ] ||
         ! grep -qx 'Status: FAILED' "${summary}" || ! grep -qx "Reason: ${reason}" "${summary}"; then
       echo "finalization ${phase}/${initial_failure}: cleanup, status or final summary lost" >&2
-      finalization_failed=1
+      finalization_failed=1; remember_host_failure "$LINENO"
     fi
     if bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}" >/dev/null 2>&1; then
-      echo 'interrupted finalization passed the output checker' >&2; finalization_failed=1
+      echo 'interrupted finalization passed the output checker' >&2; finalization_failed=1; remember_host_failure "$LINENO"
     fi
   done
 done

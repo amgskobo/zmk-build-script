@@ -561,6 +561,89 @@ fi
 (cd "${case_root}" && bash "${checker}" publish clear)
 [ "$(find "${case_root}/.build/public" -type f | wc -l | tr -d '[:space:]')" = 0 ]
 
+# Unexpected host assertions expose only a numeric source line in public reports.
+diagnostic_bin="${tmp_dir}/diagnostic-bin"
+diagnostic_evidence="${case_root}/diagnostic evidence"
+mkdir -p "${diagnostic_bin}"
+cat > "${diagnostic_bin}/grep" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = -q ] && [ "${2:-}" = 'tar must support --exclude' ]; then
+  echo 'synthetic-private-host /synthetic/private/path secret=value' >&2
+  exit 1
+fi
+exec "${DIAGNOSTIC_REAL_GREP}" "$@"
+EOF
+chmod +x "${diagnostic_bin}/grep"
+if PATH="${diagnostic_bin}:${PATH}" DIAGNOSTIC_REAL_GREP="$(command -v grep)" \
+    ZMK_TEST_ARTIFACT_DIR="${diagnostic_evidence}/host-evidence" \
+    bash "${repo_root}/.github/scripts/test-build.sh" host > "${tmp_dir}/diagnostic-raw.log" 2>&1; then
+  echo 'controlled host assertion did not fail' >&2; exit 1
+fi
+grep -q 'synthetic-private-host' "${tmp_dir}/diagnostic-raw.log"
+failure_receipt="${diagnostic_evidence}/host-evidence/host-failure-line.txt"
+if [ ! -f "${failure_receipt}" ]; then
+  echo 'host failure did not record its assertion line' >&2; exit 1
+fi
+expected_line="$(awk '/^grep -q .*tar must support --exclude/ {print NR; exit}' "${repo_root}/.github/scripts/test-build.sh")"
+[ -n "${expected_line}" ] && [ "$(cat "${failure_receipt}")" = "${expected_line}" ]
+printf 'case\tstatus\tseconds\nhost-contract\tFAIL(1)\t1\n' > "${diagnostic_evidence}/results.tsv"
+for report_mode in tests-shell tests-all; do
+  (cd "${case_root}"; bash "${checker}" publish "${report_mode}" 1 'diagnostic evidence')
+  diagnostic_report="${case_root}/.build/public/${report_mode}.txt"
+  grep -qx "Host contract failure line: ${expected_line}" "${diagnostic_report}"
+  if grep -Eq 'synthetic-private-host|/synthetic/private|secret=' "${diagnostic_report}"; then
+    echo 'host failure location disclosed raw evidence' >&2; exit 1
+  fi
+done
+(cd "${case_root}"; bash "${checker}" publish verify)
+for invalid_line in 0 00 01 -1 bad 1000000 '/synthetic/private/path' '1\nsecret=value' '12\000'; do
+  printf '%b\n' "${invalid_line}" > "${failure_receipt}"
+  if (cd "${case_root}"; bash "${checker}" publish tests-shell 1 'diagnostic evidence') >/dev/null 2>&1; then
+    echo 'publication accepted an invalid host failure line' >&2; exit 1
+  fi
+done
+printf '%s\n' "${expected_line}" > "${failure_receipt}"
+mv "${failure_receipt}" "${failure_receipt}.saved"
+MSYS=winsymlinks:sys ln -s "${failure_receipt}.saved" "${failure_receipt}"
+[ -L "${failure_receipt}" ] || { echo 'diagnostic receipt fixture is not a symlink' >&2; exit 1; }
+if (cd "${case_root}"; bash "${checker}" publish tests-shell 1 'diagnostic evidence') >/dev/null 2>&1; then
+  echo 'publication followed a host failure receipt symlink' >&2; exit 1
+fi
+rm "${failure_receipt}"
+mv "${failure_receipt}.saved" "${failure_receipt}"
+diagnostic_report="${case_root}/.build/public/tests-shell.txt"
+printf 'Host contract failure line: %s\n' "${expected_line}" >> "${diagnostic_report}"
+if (cd "${case_root}"; bash "${checker}" publish verify) >/dev/null 2>&1; then
+  echo 'publication accepted duplicate host failure locations' >&2; exit 1
+fi
+printf 'case\tstatus\tseconds\nhost-contract\tPASS\t1\n' > "${diagnostic_evidence}/results.tsv"
+(cd "${case_root}"; bash "${checker}" publish clear)
+(cd "${case_root}"; bash "${checker}" publish tests-shell 0 'diagnostic evidence')
+if grep '^Host contract failure line:' "${diagnostic_report}" >/dev/null; then
+  echo 'successful host tests published a stale failure line' >&2; exit 1
+fi
+printf 'Host contract failure line: %s\n' "${expected_line}" >> "${diagnostic_report}"
+if (cd "${case_root}"; bash "${checker}" publish verify) >/dev/null 2>&1; then
+  echo 'publication accepted a failure location without a failed host test' >&2; exit 1
+fi
+(cd "${case_root}"; bash "${checker}" publish clear)
+
+# Docker/build reports cannot acquire the host-only diagnostic field.
+printf 'case\tstatus\tseconds\nhost-contract\tFAIL(1)\t1\n' > "${diagnostic_evidence}/results.tsv"
+for report_mode in tests-docker tests-build; do
+  (cd "${case_root}"; bash "${checker}" publish "${report_mode}" 1 'diagnostic evidence')
+  diagnostic_report="${case_root}/.build/public/${report_mode}.txt"
+  if grep '^Host contract failure line:' "${diagnostic_report}" >/dev/null; then
+    echo 'non-host report published a host failure location' >&2; exit 1
+  fi
+  (cd "${case_root}"; bash "${checker}" publish verify)
+  printf 'Host contract failure line: %s\n' "${expected_line}" >> "${diagnostic_report}"
+  if (cd "${case_root}"; bash "${checker}" publish verify) >/dev/null 2>&1; then
+    echo 'non-host report accepted a host failure location' >&2; exit 1
+  fi
+  (cd "${case_root}"; bash "${checker}" publish clear)
+done
+
 # CI wrappers retain raw data locally and preserve the actual failure status.
 ci_root="${tmp_dir}/ci fixture"
 mkdir -p "${ci_root}/.github/scripts" "${ci_root}/scripts" "${ci_root}/.build/${run_name}"
