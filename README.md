@@ -513,6 +513,11 @@ without an additional host parser dependency.
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Resolve the list on Ubuntu, then route each source to an eligible self-hosted runner. |
 | [Heartbeat](.github/workflows/heartbeat.yml) | Update the tracked heartbeat record; this workflow commits and pushes. |
 
+Self-hosted Build accepts optional `build_image` and `docker_platform` inputs,
+passed through the existing `ZMK_BUILD_IMAGE` and `ZMK_DOCKER_PLATFORM` variables.
+Blank inputs retain the runner's environment and the builder/Docker defaults.
+The macOS job uses `/bin/bash`; the Windows job uses Git Bash explicitly.
+
 ### Runner setup
 
 Register runners through repository Settings → Actions → Runners with GitHub's
@@ -599,7 +604,7 @@ bash .github/scripts/test.sh all
 
 | Layer | Scope |
 | --- | --- |
-| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Git is required for this test layer. |
+| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module paths with spaces, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
 | `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
 | `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets; exact outputs and dependency identities. |
 | `all` | Run the `shell`, `docker` and `build` layers in that order. |

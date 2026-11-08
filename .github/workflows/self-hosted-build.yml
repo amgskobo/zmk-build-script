@@ -20,6 +20,16 @@ on:
         required: true
         type: boolean
         default: true
+      build_image:
+        description: Optional image name or digest; blank preserves runner environment and builder defaults
+        required: false
+        type: string
+        default: ''
+      docker_platform:
+        description: Optional Docker platform; blank preserves runner environment and Docker defaults
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -27,6 +37,8 @@ permissions:
 env:
   BUILD_MODE: ${{ inputs.mode }}
   ZMK_TEST_PRISTINE: ${{ inputs.pristine && '1' || '0' }}
+  BUILD_IMAGE_INPUT: ${{ inputs.build_image }}
+  DOCKER_PLATFORM_INPUT: ${{ inputs.docker_platform }}
 
 jobs:
   macos:
@@ -36,7 +48,7 @@ jobs:
     timeout-minutes: 180
     defaults:
       run:
-        shell: bash
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
     steps:
       - uses: actions/checkout@v6
       - name: Initialize publication reports
@@ -44,6 +56,8 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell and Docker contracts
         run: |
+          if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
+          if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else
@@ -85,6 +99,8 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell and Docker contracts
         run: |
+          if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
+          if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else
@@ -126,6 +142,8 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Verify shell and Docker contracts
         run: |
+          if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
+          if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else

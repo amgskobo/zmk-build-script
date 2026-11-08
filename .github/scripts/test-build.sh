@@ -26,7 +26,7 @@ remember_host_failure() {
 }
 
 cleanup() {
-  local container log failure_status="$1" failure_line="$2"
+  local container log stream file failure_status="$1" failure_line="$2"
   # Docker create writes its immutable ID to stdout. A name collision writes no ID.
   # Read only logs registered for our validate calls, including calls that later fail.
   for log in ${container_logs[@]+"${container_logs[@]}"}; do
@@ -38,6 +38,14 @@ cleanup() {
     mkdir -p "${ZMK_TEST_ARTIFACT_DIR}/runs"
     if [ "${mode}" = host ] && [ "${failure_status}" != 0 ]; then
       printf '%s\n' "${failure_line}" > "${ZMK_TEST_ARTIFACT_DIR}/host-failure-line.txt"
+      for stream in "${tmp_dir}"/native-copy-*; do
+        [ -d "${stream}" ] || continue
+        mkdir -p "${ZMK_TEST_ARTIFACT_DIR}/native-copy/${stream##*/}" || return 1
+        for file in count 1.tar 2.tar; do
+          [ ! -f "${stream}/${file}" ] || cp "${stream}/${file}" \
+            "${ZMK_TEST_ARTIFACT_DIR}/native-copy/${stream##*/}/" || return 1
+        done
+      done
     fi
     for log in "${tmp_dir}"/*.log "${tmp_dir}"/*.err; do
       [ ! -f "${log}" ] || cp "${log}" "${ZMK_TEST_ARTIFACT_DIR}/"
@@ -339,6 +347,192 @@ for phase in create start copy; do
   [ "$(find "${create_tmp}" -type f | wc -l | tr -d '[:space:]')" = 0 ]
 done
 rm "${fake_bin}/tar"
+
+# Exercise production tar/Git selection on the native host, including BSD tar and
+# Git Bash. The daemon captures both actual input streams, then rejects the module
+# copy deliberately; this proves host copying, not a container or firmware build.
+copy_bin="${tmp_dir}/native-copy-bin"
+mkdir -p "${copy_bin}"
+copy_real_tar="$(command -v tar)"
+copy_real_git="$(command -v git)"
+cat > "${copy_bin}/tar" <<'EOF'
+#!/usr/bin/env bash
+if [ "${COPY_CONTROL}" = no-null ]; then
+  if [ "${1:-}" = --help ]; then printf '%s\n' --exclude --null; exit 0; fi
+  for arg in "$@"; do [ "${arg}" != --null ] || exit 2; done
+fi
+exec "${COPY_REAL_TAR}" "$@"
+EOF
+cat > "${copy_bin}/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = ls-files ]; then
+  case "${COPY_CONTROL}" in git-failure) exit 23 ;; git-empty) exit 0 ;; esac
+fi
+exec "${COPY_REAL_GIT}" "$@"
+EOF
+cat > "${fake_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  create) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  start|rm) ;;
+  exec)
+    case "$*" in
+      *'tar --no-same-owner'*)
+        index="$(cat "${COPY_STREAMS}/count")"
+        index=$((index + 1))
+        [ "${index}" -le 2 ] || exit 99
+        if [ "${index}" = 2 ]; then
+          for last_arg in "$@"; do :; done
+          [ "${last_arg}" = "${COPY_MODULE_NAME}" ] || exit 99
+        fi
+        cat > "${COPY_STREAMS}/${index}.tar" || exit "$?"
+        printf '%s\n' "${index}" > "${COPY_STREAMS}/count"
+        if [ "${index}" = 2 ]; then
+          echo 'injected module copy boundary failure' >&2
+          exit 23
+        fi ;;
+      *'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
+      *'mkdir -p /root/zmk-config'*) ;;
+      *) exit 99 ;;
+    esac ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${copy_bin}/tar" "${copy_bin}/git" "${fake_bin}/docker"
+
+add_native_copy_payload() {
+  local root="$1" role="$2" name
+  for name in .zmk .build .cache .ccache .vscode build dist node_modules out tmp zmk_search; do
+    mkdir -p "${root}/${name}" "${root}/nested/${name}"
+    printf 'exclude root\n' > "${root}/${name}/root.txt"
+    printf 'keep nested\n' > "${root}/nested/${name}/keep.txt"
+  done
+  for name in .git .west __pycache__; do
+    mkdir -p "${root}/nested/${name}"
+    printf 'exclude marker\n' > "${root}/nested/${name}/marker.txt"
+  done
+  mkdir -p "${root}/.hidden payload"
+  printf '%s\n' "${role}" > "${root}/source-identity.txt"
+  printf 'LF\nCRLF\r\nCR\rControl-Z\032NUL\000end\n' > "${root}/.hidden payload/mixed bytes.bin"
+  printf 'unicode payload\n' > "${root}/.hidden payload/unicode-名前.txt"
+  awk 'BEGIN { for (i=0;i<65536;i++) printf "0123456789abcdef" }' > "${root}/large input.bin"
+  MSYS=winsymlinks:sys ln -s src/keep.txt "${root}/input-link"
+  [ -L "${root}/input-link" ] || { echo 'native copy source fixture is not a symlink' >&2; return 1; }
+  MSYS=winsymlinks:sys ln -s 'missing destination with spaces' "${root}/dangling-input-link"
+  [ -L "${root}/dangling-input-link" ] && [ ! -e "${root}/dangling-input-link" ] || return 1
+}
+
+assert_native_copy_payload() {
+  local original="$1" copied="$2" role="$3" policy="$4" generated="$5" name
+  cmp "${copied}/source-identity.txt" <(printf '%s\n' "${role}") || return 1
+  for name in 'src/keep.txt' '.hidden payload/mixed bytes.bin' '.hidden payload/unicode-名前.txt' 'large input.bin'; do
+    cmp "${original}/${name}" "${copied}/${name}" || return 1
+  done
+  [ -L "${copied}/input-link" ] || { echo 'native copy lost the symlink type' >&2; return 1; }
+  [ "$(readlink "${copied}/input-link")" = src/keep.txt ] || return 1
+  [ -L "${copied}/dangling-input-link" ] && [ ! -e "${copied}/dangling-input-link" ] || return 1
+  [ "$(readlink "${copied}/dangling-input-link")" = 'missing destination with spaces' ] || return 1
+  for name in .zmk .build .cache .ccache .vscode build dist node_modules out tmp zmk_search; do
+    [ ! -e "${copied}/${name}" ] || return 1
+    cmp "${copied}/nested/${name}/keep.txt" <(printf 'keep nested\n') || return 1
+  done
+  for name in .git .west __pycache__; do
+    [ ! -e "${copied}/${name}" ] || return 1
+    [ ! -e "${copied}/nested/${name}" ] || return 1
+  done
+  for name in zmk modules tools bootloader optional; do
+    if [ "${generated}" = exclude ]; then [ ! -e "${copied}/${name}" ] || return 1;
+    else cmp "${copied}/${name}/generated.txt" <(printf 'generated\n') || return 1; fi
+    [ ! -e "${copied}/${name}/.git" ] || return 1
+  done
+  if [ "${policy}" != none ]; then
+    cmp "${copied}/visible.txt" <(printf 'visible\n') || return 1
+    cmp "${copied}/artifacts/forced.txt" <(printf 'forced\n') || return 1
+    [ ! -e "${copied}/gone.txt" ] || return 1
+    for name in artifacts/run1/big.bin web/node_modules/pkg/index.js; do
+      if [ "${policy}" = visible ]; then [ ! -e "${copied}/${name}" ] || return 1;
+      else cmp "${original}/${name}" "${copied}/${name}" || return 1; fi
+    done
+  fi
+}
+
+native_target="$(make_target 'native copy target' none)"
+native_module="$(make_module '.hidden native module' none)"
+add_native_copy_payload "${native_target}" target
+add_native_copy_payload "${native_module}" module
+for root in "${native_target}" "${native_module}"; do
+  add_git_ignore_payload "${root}"
+  # Keep the nested fixed-exclusion names visible; ignore only the intended bulk.
+  printf '/artifacts/\n/web/node_modules/\n' > "${root}/.gitignore"
+done
+generated_target="$(make_target 'native generated target' west)"
+generated_module="$(make_module '.hidden generated module' west)"
+add_native_copy_payload "${generated_target}" target
+add_native_copy_payload "${generated_module}" module
+add_generated_git_markers "${generated_target}"
+add_generated_git_markers "${generated_module}"
+for copy_case in git-visible git-opt-out git-failure git-empty no-null generated no-west no-markers; do
+  echo "[host-contract] native-copy ${copy_case}"
+  copy_target="${native_target}"
+  copy_module="${native_module}"
+  copy_policy=all
+  copy_generated=keep
+  copy_ignored=0
+  case "${copy_case}" in
+    git-visible) copy_policy=visible ;;
+    git-opt-out) copy_ignored=1 ;;
+    generated|no-west|no-markers)
+      copy_target="${generated_target}"
+      copy_module="${generated_module}"
+      copy_policy=none
+      case "${copy_case}" in
+        generated) copy_generated=exclude ;;
+        no-west) rmdir "${copy_target}/.west" "${copy_module}/.west" ;;
+        no-markers)
+          mkdir "${copy_target}/.west" "${copy_module}/.west"
+          for root in "${copy_target}" "${copy_module}"; do
+            for name in zmk modules tools bootloader optional; do rmdir "${root}/${name}/.git"; done
+          done ;;
+      esac ;;
+  esac
+  copy_streams="${tmp_dir}/native-copy-${copy_case}"
+  mkdir "${copy_streams}" "${copy_streams}/target" "${copy_streams}/module"
+  printf '0\n' > "${copy_streams}/count"
+  if PATH="${copy_bin}:${fake_bin}:${PATH}" COPY_CONTROL="${copy_case}" \
+      COPY_REAL_TAR="${copy_real_tar}" COPY_REAL_GIT="${copy_real_git}" COPY_STREAMS="${copy_streams}" \
+      COPY_MODULE_NAME="${copy_module##*/}" ZMK_COPY_IGNORED="${copy_ignored}" \
+      bash "${tool_root}/build.sh" validate "${copy_target}/." -m "${copy_module}/." \
+      > "${tmp_dir}/native-copy-${copy_case}.log" 2>&1; then
+    echo 'injected source copy boundary failure was accepted' >&2; exit 1
+  else
+    copy_status=$?
+  fi
+  [ "${copy_status}" = 23 ]
+  [ "$(cat "${copy_streams}/count")" = 2 ]
+  summary="$(summary_from_log "${tmp_dir}/native-copy-${copy_case}.log")"
+  grep -qx 'Status: FAILED' "${summary}"
+  grep -qx 'Reason: source copy failed' "${summary}"
+  MSYS=winsymlinks:sys "${copy_real_tar}" --no-same-owner -xf "${copy_streams}/1.tar" -C "${copy_streams}/target"
+  MSYS=winsymlinks:sys "${copy_real_tar}" --no-same-owner -xf "${copy_streams}/2.tar" -C "${copy_streams}/module"
+  assert_native_copy_payload "${copy_target}" "${copy_streams}/target" target "${copy_policy}" "${copy_generated}"
+  assert_native_copy_payload "${copy_module}" "${copy_streams}/module" module "${copy_policy}" "${copy_generated}"
+  if [ "${copy_case}" = git-visible ]; then
+    # Named controls prove a swapped input or materialized link cannot pass the oracle.
+    if assert_native_copy_payload "${copy_target}" "${copy_streams}/module" target visible keep \
+        > "${tmp_dir}/native-copy-wrong-input.log" 2>&1; then
+      echo 'native copy accepted the wrong source identity' >&2; exit 1
+    fi
+    grep -q 'source-identity.txt' "${tmp_dir}/native-copy-wrong-input.log"
+    rm "${copy_streams}/target/input-link"
+    cp "${copy_streams}/target/src/keep.txt" "${copy_streams}/target/input-link"
+    if assert_native_copy_payload "${copy_target}" "${copy_streams}/target" target visible keep \
+        > "${tmp_dir}/native-copy-materialized-link.log" 2>&1; then
+      echo 'native copy accepted a materialized symlink' >&2; exit 1
+    fi
+    grep -qx 'native copy lost the symlink type' "${tmp_dir}/native-copy-materialized-link.log"
+  fi
+done
 
 # Every operation after create must retain the returned identity if a name is reused.
 # This daemon model deliberately accepts either address; assertions inspect the calls.

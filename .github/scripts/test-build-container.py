@@ -324,6 +324,54 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                         self.assertIn('publication-check', step['if'])
         self.assertEqual(uploads, 6)
 
+    def test_self_hosted_workflow_preserves_and_quotes_image_inputs(self):
+        workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        inputs = workflow['on']['workflow_dispatch']['inputs']
+        for name in ('build_image', 'docker_platform'):
+            self.assertIn(name, inputs)
+            self.assertEqual(inputs[name]['type'], 'string')
+            self.assertEqual(inputs[name]['default'], '')
+        self.assertEqual(workflow['env']['BUILD_IMAGE_INPUT'], '${{ inputs.build_image }}')
+        self.assertEqual(workflow['env']['DOCKER_PLATFORM_INPUT'], '${{ inputs.docker_platform }}')
+        folder = self.root / '.github/scripts'
+        folder.mkdir(parents=True)
+        (folder / 'check-build-output.sh').write_text(
+            '#!/usr/bin/env bash\nset -eu\n'
+            'printf "%s\\0" "$ZMK_BUILD_IMAGE" "$ZMK_DOCKER_PLATFORM" "$@" >> "$WORKFLOW_CAPTURE"\n')
+        calls = self.root / 'calls'
+        marker = self.root / 'must-not-execute'
+        executions = 0
+        for job_id, os_label in (('macos', 'macOS'), ('windows', 'Windows'), ('linux', 'Linux')):
+            job = workflow['jobs'][job_id]
+            self.assertEqual(job['runs-on'], ['self-hosted', os_label, 'zmk-docker', 'zmk-docker-active'])
+            shell = job['defaults']['run']['shell']
+            if job_id == 'macos': self.assertTrue(shell.startswith('/bin/bash '), shell)
+            if job_id == 'windows': self.assertTrue(shell.startswith('C:\\Progra~1\\Git\\bin\\bash.exe '), shell)
+            step = next(s for s in job['steps'] if s.get('name') == 'Verify shell and Docker contracts')
+            self.assertNotIn('${{', step['run'])
+            for mode in ('validate', 'build'):
+                for supplied in ('', 'synthetic.invalid/build@sha256:' + '1' * 64,
+                                 'synthetic.invalid/build:tag $(touch %s)\n"literal"' % marker):
+                    with self.subTest(job=job_id, mode=mode, supplied=supplied):
+                        calls.write_bytes(b'')
+                        platform = 'linux/amd64' if supplied else ''
+                        env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT=supplied,
+                                   DOCKER_PLATFORM_INPUT=platform, ZMK_BUILD_IMAGE='synthetic.invalid/retained:v1',
+                                   ZMK_DOCKER_PLATFORM='linux/arm64', WORKFLOW_CAPTURE=str(calls))
+                        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
+                                                cwd=self.root, env=env, capture_output=True)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode())
+                        expected = []
+                        for selection in (('all',) if mode == 'build' else ('shell', 'docker')):
+                            expected += [supplied or 'synthetic.invalid/retained:v1',
+                                         platform or 'linux/arm64', 'ci-tests', selection]
+                        actual = calls.read_bytes().decode().split('\0')
+                        self.assertEqual(actual, expected + [''])
+                        self.assertFalse(marker.exists(), 'input was executed as shell code')
+                        executions += 1
+        self.assertEqual(executions, 18)
+
     def make_image_selection_daemon(self):
         binary = self.root / 'bin'
         binary.mkdir()

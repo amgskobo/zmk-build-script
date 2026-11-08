@@ -454,6 +454,10 @@ local pathを含む期待値fileは非公開で保持します。Bashと標準to
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Ubuntu で list を解決し、source ごとに利用可能な self-hosted runner へ割り当てます。 |
 | [Heartbeat](.github/workflows/heartbeat.yml) | 追跡中の heartbeat 記録を更新します。commit / push を含む workflow です。 |
 
+Self-hosted Build の任意入力 `build_image` / `docker_platform` は、既存の
+`ZMK_BUILD_IMAGE` / `ZMK_DOCKER_PLATFORM` 変数へ渡します。空欄の場合は runner の環境と
+builder / Docker の既定値を保持します。macOS job は `/bin/bash`、Windows job は Git Bash を明示します。
+
 ### runnerの登録
 
 repository の Settings → Actions → Runners から、GitHub が表示する package / 登録 command で登録します。
@@ -527,7 +531,7 @@ bash .github/scripts/test.sh all
 
 | 層 | 確認範囲 |
 | --- | --- |
-| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。この検証層には Git が必要です。 |
+| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白入り target / module path、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
 | `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application、成果物数と依存 identity。 |
 | `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
