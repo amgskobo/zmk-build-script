@@ -506,7 +506,7 @@ for copy_case in git-visible git-opt-out git-failure git-empty no-null generated
   copy_streams="${tmp_dir}/native-copy-${copy_case}"
   mkdir "${copy_streams}" "${copy_streams}/target" "${copy_streams}/module"
   printf '0\n' > "${copy_streams}/count"
-  if PATH="${copy_bin}:${fake_bin}:${PATH}" COPY_CONTROL="${copy_case}" \
+  if TMPDIR="${create_tmp}" PATH="${copy_bin}:${fake_bin}:${PATH}" COPY_CONTROL="${copy_case}" \
       COPY_REAL_TAR="${copy_real_tar}" COPY_REAL_GIT="${copy_real_git}" COPY_STREAMS="${copy_streams}" \
       COPY_MODULE_NAME="${copy_module##*/}" ZMK_COPY_IGNORED="${copy_ignored}" \
       bash "${tool_root}/build.sh" validate "${copy_target}/." -m "${copy_module}/." \
@@ -517,6 +517,8 @@ for copy_case in git-visible git-opt-out git-failure git-empty no-null generated
   fi
   [ "${copy_status}" = 23 ]
   [ "$(cat "${copy_streams}/count")" = 2 ]
+  find "${create_tmp}" -type f > "${tmp_dir}/native-copy-temporaries.log"
+  [ ! -s "${tmp_dir}/native-copy-temporaries.log" ]
   summary="$(summary_from_log "${tmp_dir}/native-copy-${copy_case}.log")"
   grep -qx 'Status: FAILED' "${summary}"
   grep -qx 'Reason: source copy failed' "${summary}"
