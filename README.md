@@ -621,6 +621,11 @@ bash .github/scripts/test.sh all
 | `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run the `shell`, `docker` and `build` layers in that order. |
 
+Artifact tests separate large-list byte pressure and large-count validation from
+per-file import checks. Single and multiple real imports, incomplete-count rejection
+and producer-drain controls remain mandatory without repeating identical copies
+hundreds of times.
+
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.

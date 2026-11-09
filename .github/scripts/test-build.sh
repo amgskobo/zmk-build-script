@@ -31,7 +31,7 @@ cleanup() {
   # Read only logs registered for our validate calls, including calls that later fail.
   for log in ${container_logs[@]+"${container_logs[@]}"}; do
     [ -f "${log}" ] || continue
-    container="$(tr -d '\r' < "${log}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+    container="$(awk '{gsub(/\r/, "")} length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}' "${log}")"
     [ -z "${container}" ] || docker rm -f "${container}" >/dev/null 2>&1 || true
   done
   if [ -n "${ZMK_TEST_ARTIFACT_DIR:-}" ]; then
@@ -69,7 +69,7 @@ fi
 
 summary_from_log() {
   local run
-  run="$(sed $'s/\033\[[0-9;]*m//g' "$1" | tr -d '\r' | sed -n 's/^Run directory: //p')"
+  run="$(awk '{gsub(/\033\[[0-9;]*m/, ""); gsub(/\r/, ""); if (sub(/^Run directory: /, "")) print}' "$1")"
   [ -n "${run}" ] || { echo "Run directory was not reported: $1" >&2; return 1; }
   printf '%s/build-summary.txt\n' "${run}"
 }
@@ -139,9 +139,9 @@ run_validate() {
     bash "${tool_root}/build.sh" validate "${target}" --settings-reset ${modules[@]+"${modules[@]}"} >"${log_path}" 2>&1 ||
     { tail -n 120 "${log_path}" >&2; return 1; }
   local run
-  run="$(sed $'s/\033\[[0-9;]*m//g' "${log_path}" | tail -n 1 | tr -d '\r')"
+  run="$(awk '{gsub(/\033\[[0-9;]*m/, ""); last=$0} END {gsub(/\r/, "", last); print last}' "${log_path}")"
   bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${run}" --expect "${expectations}"
-  last_container="$(tr -d '\r' < "${log_path}" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}')"
+  last_container="$(awk '{gsub(/\r/, "")} length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}' "${log_path}")"
   [ -n "${last_container}" ] || { echo 'validate did not return a container ID' >&2; return 1; }
 }
 
@@ -925,7 +925,7 @@ for phase in create start probe; do
   fi
 done
 
-# Exercise large artifact streams and finalization with the same fake-daemon boundary.
+# Separate byte-pressure/count boundaries from repeated per-file imports.
 finalization_failed=0
 cat > "${fake_bin}/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -941,9 +941,12 @@ case "$1" in
   start) [ "${NEW_INITIAL_FAILURE:-0}" != 1 ] || exit 23 ;;
   exec)
     case "$*" in
-      *'tar -C /root/zmk-config/.build'*) tar -C "${NEW_PAYLOAD}" -cf - . ;;
       *'find /root/zmk-config/.build'*)
         case "${NEW_ATTACK:-}" in
+          large-list)
+            printf '/tmp/escape.bin\0' || exit "$?"
+            awk 'BEGIN {for (i=0; i<32768; i++) printf "/root/zmk-config/.build/padding-for-drain-control.bin%c", 0}' || exit "$?"
+            : > "${NEW_LIST_COMPLETE}" ;;
           absolute-entry) printf '/tmp/escape.bin\0' ;;
           parent-entry) printf '/root/zmk-config/.build/../escape.bin\0' ;;
           truncated-list) printf '/root/zmk-config/.build/selected.bin' ;;
@@ -1005,27 +1008,48 @@ fi
 exec "${NEW_REAL_CHMOD}" "$@"
 EOF
 chmod +x "${fake_bin}/chmod"
-for count in 1 512; do
-  payload="${tmp_dir}/firmware-${count}"
-  mkdir -p "${payload}"
-  padding=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-  for number in $(seq 1 "${count}"); do
-    printf 'synthetic firmware\n' > "${payload}/target-${number}-${padding}.bin"
-  done
-  PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT="${count}" NEW_PAYLOAD="${payload}" \
-      NEW_CALLS="${tmp_dir}/firmware-${count}.commands.log" \
-      bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-${count}.log" 2>&1 &
-  build_pid=$!
-  if wait "${build_pid}"; then status=0; else status=$?; fi
-  summary="$(summary_from_log "${tmp_dir}/firmware-${count}.log")"
-  if [ "${status}" != 0 ] || ! grep -qx 'Status: SUCCESS' "${summary}" ||
-      [ "$(grep -c '^- target-' "${summary}")" != "${count}" ]; then
-    echo "artifact stream ${count}: successful firmware collection was rejected or omitted" >&2
-    finalization_failed=1; remember_host_failure "$LINENO"
-  else
-    bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
-  fi
+payload="${tmp_dir}/firmware-multiple"
+mkdir -p "${payload}"
+padding=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+for number in 1 2; do
+  printf 'synthetic firmware\n' > "${payload}/target-${number}-${padding}.bin"
 done
+PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=2 NEW_PAYLOAD="${payload}" \
+    NEW_CALLS="${tmp_dir}/firmware-multiple.commands.log" \
+    bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-multiple.log" 2>&1
+summary="$(summary_from_log "${tmp_dir}/firmware-multiple.log")"
+grep -qx 'Status: SUCCESS' "${summary}"
+grep -qx 'Built targets: 2' "${summary}"
+[ "$(grep -c '^- target-' "${summary}")" = 2 ]
+for number in 1 2; do
+  cmp "${summary%/*}/target-${number}-${padding}.bin" <(printf 'synthetic firmware\n')
+done
+bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
+
+# A marker above 255 must remain an integer even when the output is incomplete.
+PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=512 NEW_PAYLOAD="${payload}" \
+    NEW_CALLS="${tmp_dir}/firmware-count.commands.log" \
+    bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-count.log" 2>&1
+summary="$(summary_from_log "${tmp_dir}/firmware-count.log")"
+grep -qx 'Built targets: 512' "${summary}"
+if bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}" \
+    > "${tmp_dir}/firmware-count-check.log" 2>&1; then
+  echo 'large build count accepted incomplete firmware output' >&2; exit 1
+fi
+grep -F 'Firmware artifact count (2) is lower than built target count (512).' "${tmp_dir}/firmware-count-check.log" >/dev/null
+
+# Named control: a lazy consumer closes before this >1MiB NUL producer completes.
+control_done="${tmp_dir}/unsafe-list.complete"
+if NEW_PHASE=artifacts NEW_ATTACK=large-list NEW_LIST_COMPLETE="${control_done}" \
+    NEW_CALLS="${tmp_dir}/unsafe-list.commands.log" "${fake_bin}/docker" exec \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa find /root/zmk-config/.build -print0 |
+    (IFS= read -r -d '' first; printf '%s\n' "${first}" > "${tmp_dir}/unsafe-list-first.log"; exit 23) \
+    > "${tmp_dir}/unsafe-list.log" 2>&1; then
+  echo 'unsafe artifact-list consumer unexpectedly succeeded' >&2; exit 1
+fi
+grep -qx '/tmp/escape.bin' "${tmp_dir}/unsafe-list-first.log"
+[ ! -e "${control_done}" ]
+echo '[host-contract] control lazy-list-consumer rejected'
 
 # YAML-derived firmware names, including dots and multi-part fallback, stay inside the run.
 payload="${tmp_dir}/firmware-dotted"
@@ -1035,13 +1059,15 @@ PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=1 NEW_PAYLOAD="${payloa
     NEW_CALLS="${tmp_dir}/firmware-dotted.commands.log" ZMK_FALLBACK_BINARY=signed.bin \
     bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-dotted.log" 2>&1
 summary="$(summary_from_log "${tmp_dir}/firmware-dotted.log")"
+grep -qx 'Status: SUCCESS' "${summary}"
+grep -qx 'Built targets: 1' "${summary}"
 test -s "${summary%/*}/target.with.dots.signed.bin"
 bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
 
 # Container output cannot replace evidence, traverse paths or import special files.
 for attack in log-link summary-link log-case summary-case firmware-link firmware-directory \
     reserved-name unsafe-name duplicate-case duplicate-entry absolute-entry parent-entry \
-    truncated-list list-failure copy-failure permissions-failure staging-cleanup; do
+    truncated-list list-failure large-list copy-failure permissions-failure staging-cleanup; do
   payload="${tmp_dir}/artifact-${attack}"
   outside="${tmp_dir}/outside-${attack}"
   mkdir -p "${payload}" "${outside}"
@@ -1063,6 +1089,7 @@ for attack in log-link summary-link log-case summary-case firmware-link firmware
         { echo 'artifact attack fixture is not a symlink' >&2; exit 1; } ;;
   esac
   if PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=1 NEW_PAYLOAD="${payload}" NEW_ATTACK="${attack}" \
+      NEW_LIST_COMPLETE="${tmp_dir}/artifact-${attack}.list-complete" \
       NEW_CALLS="${tmp_dir}/artifact-${attack}.commands.log" \
       bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/artifact-${attack}.log" 2>&1; then
     status=0
@@ -1095,13 +1122,17 @@ for attack in log-link summary-link log-case summary-case firmware-link firmware
       reserved-name) expected='reserved artifact filename from the container' ;;
       unsafe-name|parent-entry) expected='unsafe artifact filename from the container' ;;
       duplicate-*) expected='duplicate artifact filename from the container' ;;
-      absolute-entry) expected='artifact path is outside the container output directory' ;;
+      absolute-entry|large-list) expected='artifact path is outside the container output directory' ;;
       truncated-list) expected='unterminated artifact path from the container' ;;
       list-failure) expected='failed to list build output from the container' ;;
       permissions-failure) expected='failed to normalize artifact permissions' ;;
       staging-cleanup) expected='failed to remove artifact staging directory' ;;
     esac
     grep -Fx "${expected}" "${summary%/*}/build.log" >/dev/null
+    if [ "${attack}" = large-list ]; then
+      test -f "${tmp_dir}/artifact-${attack}.list-complete"
+      echo '[host-contract] large artifact list drained before rejection'
+    fi
     case "${attack}" in
       firmware-*|copy-failure|permissions-failure|staging-cleanup)
         grep -Fx 'cp aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:/root/zmk-config/.build/selected.bin ./firmware' \

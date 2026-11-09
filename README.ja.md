@@ -545,6 +545,10 @@ bash .github/scripts/test.sh all
 | `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
 
+成果物の検証では、大量 list の byte 数・大きな件数の検証と、file ごとの import 検証を分けます。
+単体・複数 file の実 import、件数不一致の拒否、producer を読み切る対照試験は維持し、
+同じ copy を数百回繰り返す負担を減らします。
+
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。

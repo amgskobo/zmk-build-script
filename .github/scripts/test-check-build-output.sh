@@ -294,6 +294,18 @@ touch "${run_path}/only.uf2"
 run_fail build "lower than built target count"
 
 # Exactly one selected artifact per target, including an explicitly recorded custom extension.
+# Large successful counts do not require hundreds of Docker copy subprocesses.
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 512
+EOF
+for ((number=1; number<=512; number++)); do
+  printf 'synthetic firmware\n' > "${run_path}/bulk-${number}.bin"
+done
+run_ok build "${run_path}"
+
 reset_case
 write_summary <<'EOF'
 Status: SUCCESS
