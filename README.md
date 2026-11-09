@@ -626,6 +626,10 @@ Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
 Ubuntu. Manual self-hosted `mode=validate` runs `shell` and `docker`;
 `mode=build` runs `all` on each selected native host. Use the latter for native
 Docker firmware coverage: a shell or validate result alone does not establish it.
+`mode=firmware` selects the existing `build` layer for focused firmware/concurrency
+checks after the other contracts have been covered on the selected source. It keeps
+the standard, overlay, restoration and standalone assertions. Full `mode=build`
+and hosted three-OS/Docker roles remain unchanged.
 Retain the copy, parser, workspace/overlay recovery, cancellation, artifact and
 publication controls even when they share fixtures across layers.
 
@@ -713,8 +717,17 @@ During profiling, source snapshot diagnostics have separate private logs so warn
 Failures before any case completes retain their original nonzero exit status.
 An unfinished outcome replacement blocks publication until it is finalized or cleared.
 
-Tests create and remove a dedicated cache by default. An explicitly supplied
-`ZMK_DOCKER_CACHE_VOLUME` is reused and retained; never use a production cache.
+Tests create and remove a dedicated cache by default; never use a production cache.
+
+| Test cache control | Behaviour |
+| --- | --- |
+| `ZMK_DOCKER_CACHE_VOLUME` | Explicit dedicated volume; reused and retained, taking precedence over a managed prefix. |
+| `ZMK_TEST_CACHE_PREFIX` | Opt-in prefix starting `zmk-build-script-test-`. With a full image digest and explicit Docker platform, derive and retain a separate cache for that image/platform. Unset, floating or automatic selections keep fresh caches. |
+
+The self-hosted workflow supplies a repository/OS prefix. Jobs for the same OS are
+serialized to protect that cache; different OS jobs remain independent. It prints
+only fixed numeric Docker CPU/memory capacity and presence of an existing cache
+override. Host/device identifiers and actual cache names stay in private evidence.
 `ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while
 restoration always retains it. Each build/validate result is checked immediately
 using its exact run directory. Report local, remote CI, host-platform and physical

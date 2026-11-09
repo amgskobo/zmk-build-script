@@ -13,6 +13,27 @@ while [ "${test_jobs#0}" != "${test_jobs}" ]; do test_jobs="${test_jobs#0}"; don
 if [ -z "${test_jobs}" ] || [ "${#test_jobs}" -gt 2 ] || [ "${test_jobs}" -gt 16 ]; then
   echo 'ZMK_TEST_JOBS must be an integer from 1 to 16.' >&2; exit 2
 fi
+cache_request="${ZMK_DOCKER_CACHE_VOLUME:-}"
+cache_prefix="${ZMK_TEST_CACHE_PREFIX:-}"
+cache_policy=fresh
+[ -z "${cache_request}" ] || cache_policy=explicit
+if [ -z "${cache_request}" ] && [ -n "${cache_prefix}" ] && [ "${mode}" != shell ]; then
+  case "${cache_prefix}" in zmk-build-script-test-*) ;; *) echo 'Invalid managed test cache prefix.' >&2; exit 2 ;; esac
+  case "${cache_prefix}" in *[!a-zA-Z0-9_.-]*) echo 'Invalid managed test cache prefix.' >&2; exit 2 ;; esac
+  [ "${#cache_prefix}" -le 128 ] || { echo 'Invalid managed test cache prefix.' >&2; exit 2; }
+  cache_digest=
+  case "${ZMK_BUILD_IMAGE:-}" in *@sha256:*) cache_digest="${ZMK_BUILD_IMAGE##*@sha256:}" ;; esac
+  case "${cache_digest}" in *[!0-9a-fA-F]*) cache_digest= ;; esac
+  if [ "${#cache_digest}" = 64 ] && [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
+    cache_key="$(printf '%s\0%s\0' "${ZMK_BUILD_IMAGE}" "${ZMK_DOCKER_PLATFORM}" | git hash-object --stdin)" || {
+      cache_status=$?; echo 'Failed to derive managed test cache identity.' >&2; exit "${cache_status}";
+    }
+    case "${cache_key}" in ''|*[!0-9a-fA-F]*) echo 'Invalid managed test cache identity.' >&2; exit 1 ;; esac
+    case "${#cache_key}" in 40|64) ;; *) echo 'Invalid managed test cache identity.' >&2; exit 1 ;; esac
+    cache_request="${cache_prefix}-${cache_key}"
+    cache_policy=managed
+  fi
+fi
 mkdir -p .build
 if [ -n "${ZMK_TEST_RESULTS:-}" ]; then
   result_dir="${ZMK_TEST_RESULTS}"
@@ -30,14 +51,14 @@ case "${result_dir}/" in
     fi ;;
 esac
 export ZMK_TEST_RESULTS="${result_dir}"
-cache_supplied="${ZMK_DOCKER_CACHE_VOLUME:-}"
+cache_supplied="${cache_request}"
 cache_owned=0
 suite_complete=0
 case_names=(); case_states=(); case_pids=(); case_exits=()
 active_cases=0; interrupted=0; closing=0; cases_recorded=0; docker_ready=0; tools_failed=0
 trap 'interrupted=130' INT
 trap 'interrupted=143' TERM
-export ZMK_DOCKER_CACHE_VOLUME="${ZMK_DOCKER_CACHE_VOLUME:-zmk-test-$(date -u +%Y%m%d%H%M%S)-$$}"
+export ZMK_DOCKER_CACHE_VOLUME="${cache_request:-zmk-test-$(date -u +%Y%m%d%H%M%S)-$$}"
 wait_case() {
   local index="$1" status
   if wait "${case_pids[$index]}"; then status=0; else status=$?; fi
@@ -164,6 +185,7 @@ fi
   uname -a
   bash --version
   printf 'Cache volume: %s\n' "${ZMK_DOCKER_CACHE_VOLUME}"
+  printf 'Cache policy: %s\n' "${cache_policy}"
   printf 'Test jobs: %s\n' "${test_jobs}"
 } > "${result_dir}/environment.txt" 2>&1
 case_worker() {

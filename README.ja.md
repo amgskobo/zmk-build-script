@@ -550,6 +550,9 @@ hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `docker` と `bui
 手動 self-hosted の `mode=validate` は `shell` と `docker`、`mode=build` は選択した各 native host で
 `all` を実行します。native Docker で firmware まで確認するときは後者を使います。
 shell または validate の成功だけでは、その確認にはなりません。
+`mode=firmware` は既存の `build` 層を選び、選択した source の他の契約を確認済みの場合に、
+firmware / 並列設定の検証を絞れます。標準・overlay・復元・独立 application の assertion は維持します。
+全層の `mode=build` と hosted 3 OS / Docker の役割は維持します。
 層をまたいで fixture を共有していても、copy・parser・workspace / overlay の復旧・中断・成果物・公開の
 対照試験は維持します。
 
@@ -623,7 +626,16 @@ byte の検査は producer を最後まで読み、終了時の失敗と report 
 case 完了前に失敗した場合も、元の非ゼロの終了 status を保持します。
 結果の置き換えが完了していない場合は、確定または clear されるまで公開を拒否します。
 
-test cache は既定で専用 volume を作り、終了時に削除します。`ZMK_DOCKER_CACHE_VOLUME` を明示した場合は
-再利用・保持します。production cache は指定しません。`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
+test cache は既定で専用 volume を作り、終了時に削除します。production cache は指定しません。
+
+| test cache の設定 | 動作 |
+| --- | --- |
+| `ZMK_DOCKER_CACHE_VOLUME` | 明示した専用 volume を再利用・保持し、managed prefix より優先します。 |
+| `ZMK_TEST_CACHE_PREFIX` | `zmk-build-script-test-` で始まる opt-in prefix。完全な image digest と明示した Docker platform があれば、その組み合わせ専用の cache を作って保持します。未指定・floating・自動選択では fresh cache を維持します。 |
+
+self-hosted workflow は repository / OS ごとの prefix を設定します。同じ OS の job は cache を保護するため
+直列化し、異なる OS の job は独立して実行します。表示するのは固定形式の Docker CPU / memory 容量の数値と、
+既存 cache override の有無だけです。host / device の識別値と実 cache 名は非公開の証跡に保持します。
+`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
 復元検証では保持します。各 build / validate の直後に、その run を明示して output check を実行します。
 local / remote CI / host platform / 実機の結果は分けて報告し、公開操作は user の明示指示がある場合だけ行います。

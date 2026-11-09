@@ -328,6 +328,7 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
         workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
                              Loader=yaml.BaseLoader)
         inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(inputs['mode']['options'], ['validate', 'build', 'firmware'])
         self.assertEqual(inputs['profile']['type'], 'boolean')
         self.assertEqual(inputs['profile']['default'], 'false')
         self.assertEqual(workflow['env']['ZMK_TEST_PROFILE'], "${{ inputs.profile && '1' || '0' }}")
@@ -352,12 +353,15 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
         for job_id, os_label in (('macos', 'macOS'), ('windows', 'Windows'), ('linux', 'Linux')):
             job = workflow['jobs'][job_id]
             self.assertEqual(job['runs-on'], ['self-hosted', os_label, 'zmk-docker', 'zmk-docker-active'])
+            scope = 'zmk-build-script-test-${{ github.repository_id }}-' + job_id
+            self.assertEqual(job['env']['ZMK_TEST_CACHE_PREFIX'], scope)
+            self.assertEqual(job['concurrency'], {'group': scope, 'cancel-in-progress': 'false'})
             shell = job['defaults']['run']['shell']
             if job_id == 'macos': self.assertTrue(shell.startswith('/bin/bash '), shell)
             if job_id == 'windows': self.assertTrue(shell.startswith('C:\\Progra~1\\Git\\bin\\bash.exe '), shell)
             step = next(s for s in job['steps'] if s.get('name') == 'Verify shell and Docker contracts')
             self.assertNotIn('${{', step['run'])
-            for mode in ('validate', 'build'):
+            for mode in ('validate', 'build', 'firmware'):
                 for supplied in ('', 'synthetic.invalid/build@sha256:' + '1' * 64,
                                  'synthetic.invalid/build:tag $(touch %s)\n"literal"' % marker):
                     with self.subTest(job=job_id, mode=mode, supplied=supplied):
@@ -374,7 +378,8 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                                                 cwd=self.root, env=env, capture_output=True)
                         self.assertEqual(result.returncode, 0, result.stderr.decode())
                         expected = []
-                        for selection in (('all',) if mode == 'build' else ('shell', 'docker')):
+                        selections = ('all',) if mode == 'build' else ('build',) if mode == 'firmware' else ('shell', 'docker')
+                        for selection in selections:
                             expected += [supplied or 'synthetic.invalid/retained:v1',
                                          platform or 'linux/arm64', jobs or '3', jobs or '4',
                                          jobs or '5', 'ci-tests', selection]
@@ -382,7 +387,7 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                         self.assertEqual(actual, expected + [''])
                         self.assertFalse(marker.exists(), 'input was executed as shell code')
                         executions += 1
-        self.assertEqual(executions, 18)
+        self.assertEqual(executions, 27)
 
     def test_self_hosted_workflow_checks_docker_before_native_suite(self):
         workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
@@ -394,39 +399,62 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
             'printf "%s\\0" "$@" >> "$WORKFLOW_CAPTURE"\n'
             'if [ "$1" = ci-tools ]; then exit "$PREFLIGHT_STATUS"; fi\n')
         calls = self.root / 'calls'
+        capacity_calls = self.root / 'capacity-calls'
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (binary / 'docker').write_text(
+            '#!/usr/bin/env bash\nset -eu\nprintf "%s\\0" "$@" > "$CAPACITY_CAPTURE"\n'
+            'printf "Capacity docker-cpus=12 memory-bytes=17179869184\\n"\n'
+            'exit "$CAPACITY_STATUS"\n')
+        (binary / 'docker').chmod(0o755)
         executions = 0
         for job_id in ('macos', 'windows', 'linux'):
             steps = workflow['jobs'][job_id]['steps']
             preflights = [s for s in steps if s.get('name') == 'Check Docker access']
             self.assertEqual(len(preflights), 1, 'native Docker preflight is missing')
             preflight = preflights[0]
+            capacity = next(s for s in steps if s.get('name') == 'Inspect Docker capacity')
             suite = next(s for s in steps if s.get('name') == 'Verify shell and Docker contracts')
             initialize = next(s for s in steps if s.get('id') == 'publication-init')
             self.assertLess(steps.index(initialize), steps.index(preflight))
             self.assertLess(steps.index(preflight), steps.index(suite))
+            self.assertLess(steps.index(preflight), steps.index(capacity))
+            self.assertLess(steps.index(capacity), steps.index(suite))
+            self.assertNotIn('if', capacity)
+            self.assertNotIn('continue-on-error', capacity)
+            self.assertNotIn('${{', capacity['run'])
             self.assertEqual(preflight['run'], 'bash .github/scripts/check-build-output.sh ci-tools')
             self.assertNotIn('if', preflight)
             self.assertNotIn('continue-on-error', preflight)
-            for mode in ('validate', 'build'):
-                for status in (0, 127):
-                    with self.subTest(job=job_id, mode=mode, status=status):
+            for mode in ('validate', 'build', 'firmware'):
+                for status, capacity_status in ((0, 0), (127, 0), (0, 23)):
+                    with self.subTest(job=job_id, mode=mode, status=status, capacity=capacity_status):
                         calls.write_bytes(b'')
+                        capacity_calls.unlink(missing_ok=True)
                         env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT='',
                                    DOCKER_PLATFORM_INPUT='', TARGET_JOBS_INPUT='', COMPILER_JOBS_INPUT='',
                                    TEST_JOBS_INPUT='',
                                    PREFLIGHT_STATUS=str(status),
+                                   CAPACITY_STATUS=str(capacity_status), CAPACITY_CAPTURE=str(capacity_calls),
+                                   PATH=str(binary) + os.pathsep + os.environ['PATH'],
                                    WORKFLOW_CAPTURE=str(calls))
                         result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
-                                                 preflight['run'] + '\n' + suite['run']],
+                                                 preflight['run'] + '\n' + capacity['run'] + '\n' + suite['run']],
                                                 cwd=self.root, env=env, capture_output=True)
-                        self.assertEqual(result.returncode, status, result.stderr.decode())
-                        expected = ['ci-tools']
+                        self.assertEqual(result.returncode, status or capacity_status, result.stderr.decode())
                         if status == 0:
-                            for selection in (('all',) if mode == 'build' else ('shell', 'docker')):
+                            self.assertEqual(capacity_calls.read_bytes().decode().split('\0'), [
+                                'info', '--format', 'Capacity docker-cpus={{.NCPU}} memory-bytes={{.MemTotal}}', ''])
+                        else:
+                            self.assertFalse(capacity_calls.exists())
+                        expected = ['ci-tools']
+                        if status == capacity_status == 0:
+                            selections = ('all',) if mode == 'build' else ('build',) if mode == 'firmware' else ('shell', 'docker')
+                            for selection in selections:
                                 expected += ['ci-tests', selection]
                         self.assertEqual(calls.read_bytes().decode().split('\0'), expected + [''])
                         executions += 1
-        self.assertEqual(executions, 12)
+        self.assertEqual(executions, 27)
 
     def make_image_selection_daemon(self):
         binary = self.root / 'bin'

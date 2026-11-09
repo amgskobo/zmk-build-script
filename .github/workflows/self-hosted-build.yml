@@ -10,10 +10,10 @@ on:
         options: [macos, windows, linux, all]
         default: macos
       mode:
-        description: Validate contracts or also build firmware
+        description: Validate contracts, run all layers, or select firmware only
         required: true
         type: choice
-        options: [validate, build]
+        options: [validate, build, firmware]
         default: validate
       pristine:
         description: Reset the dedicated test cache before the standard build
@@ -70,6 +70,11 @@ jobs:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: [self-hosted, macOS, zmk-docker, zmk-docker-active]
     timeout-minutes: 180
+    concurrency:
+      group: zmk-build-script-test-${{ github.repository_id }}-macos
+      cancel-in-progress: false
+    env:
+      ZMK_TEST_CACHE_PREFIX: zmk-build-script-test-${{ github.repository_id }}-macos
     defaults:
       run:
         shell: /bin/bash --noprofile --norc -e -o pipefail {0}
@@ -80,6 +85,10 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Check Docker access
         run: bash .github/scripts/check-build-output.sh ci-tools
+      - name: Inspect Docker capacity
+        run: |
+          docker info --format 'Capacity docker-cpus={{.NCPU}} memory-bytes={{.MemTotal}}'
+          if [ -n "${ZMK_DOCKER_CACHE_VOLUME:-}" ]; then echo 'Test cache override: present'; else echo 'Test cache override: absent'; fi
       - name: Verify shell and Docker contracts
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
@@ -89,6 +98,8 @@ jobs:
           if [ -n "${TEST_JOBS_INPUT}" ]; then export ZMK_TEST_JOBS="${TEST_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
+          elif [ "${BUILD_MODE}" = firmware ]; then
+            bash .github/scripts/check-build-output.sh ci-tests build
           else
             bash .github/scripts/check-build-output.sh ci-tests shell
             bash .github/scripts/check-build-output.sh ci-tests docker
@@ -109,6 +120,7 @@ jobs:
             .build/public/tests-shell.txt
             .build/public/tests-docker.txt
             .build/public/tests-all.txt
+            .build/public/tests-build.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
@@ -118,6 +130,11 @@ jobs:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: [self-hosted, Windows, zmk-docker, zmk-docker-active]
     timeout-minutes: 180
+    concurrency:
+      group: zmk-build-script-test-${{ github.repository_id }}-windows
+      cancel-in-progress: false
+    env:
+      ZMK_TEST_CACHE_PREFIX: zmk-build-script-test-${{ github.repository_id }}-windows
     defaults:
       run:
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
@@ -128,6 +145,10 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Check Docker access
         run: bash .github/scripts/check-build-output.sh ci-tools
+      - name: Inspect Docker capacity
+        run: |
+          docker info --format 'Capacity docker-cpus={{.NCPU}} memory-bytes={{.MemTotal}}'
+          if [ -n "${ZMK_DOCKER_CACHE_VOLUME:-}" ]; then echo 'Test cache override: present'; else echo 'Test cache override: absent'; fi
       - name: Verify shell and Docker contracts
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
@@ -137,6 +158,8 @@ jobs:
           if [ -n "${TEST_JOBS_INPUT}" ]; then export ZMK_TEST_JOBS="${TEST_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
+          elif [ "${BUILD_MODE}" = firmware ]; then
+            bash .github/scripts/check-build-output.sh ci-tests build
           else
             bash .github/scripts/check-build-output.sh ci-tests shell
             bash .github/scripts/check-build-output.sh ci-tests docker
@@ -157,6 +180,7 @@ jobs:
             .build/public/tests-shell.txt
             .build/public/tests-docker.txt
             .build/public/tests-all.txt
+            .build/public/tests-build.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
@@ -166,6 +190,11 @@ jobs:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
     runs-on: [self-hosted, Linux, zmk-docker, zmk-docker-active]
     timeout-minutes: 180
+    concurrency:
+      group: zmk-build-script-test-${{ github.repository_id }}-linux
+      cancel-in-progress: false
+    env:
+      ZMK_TEST_CACHE_PREFIX: zmk-build-script-test-${{ github.repository_id }}-linux
     defaults:
       run:
         shell: bash
@@ -176,6 +205,10 @@ jobs:
         run: bash .github/scripts/check-build-output.sh publish clear
       - name: Check Docker access
         run: bash .github/scripts/check-build-output.sh ci-tools
+      - name: Inspect Docker capacity
+        run: |
+          docker info --format 'Capacity docker-cpus={{.NCPU}} memory-bytes={{.MemTotal}}'
+          if [ -n "${ZMK_DOCKER_CACHE_VOLUME:-}" ]; then echo 'Test cache override: present'; else echo 'Test cache override: absent'; fi
       - name: Verify shell and Docker contracts
         run: |
           if [ -n "${BUILD_IMAGE_INPUT}" ]; then export ZMK_BUILD_IMAGE="${BUILD_IMAGE_INPUT}"; fi
@@ -185,6 +218,8 @@ jobs:
           if [ -n "${TEST_JOBS_INPUT}" ]; then export ZMK_TEST_JOBS="${TEST_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
+          elif [ "${BUILD_MODE}" = firmware ]; then
+            bash .github/scripts/check-build-output.sh ci-tests build
           else
             bash .github/scripts/check-build-output.sh ci-tests shell
             bash .github/scripts/check-build-output.sh ci-tests docker
@@ -205,6 +240,7 @@ jobs:
             .build/public/tests-shell.txt
             .build/public/tests-docker.txt
             .build/public/tests-all.txt
+            .build/public/tests-build.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14

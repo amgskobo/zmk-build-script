@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Synthetic coordinator fixtures choose their cache policy explicitly.
+export ZMK_TEST_CACHE_PREFIX=
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 checker="${repo_root}/.github/scripts/check-build-output.sh"
@@ -1113,6 +1115,7 @@ case "$1" in
   rev-parse) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
   status|check-ignore) ;;
   --version) printf '%s\n' 'git version synthetic' ;;
+  hash-object) "${SNAPSHOT_REAL_GIT:?}" "$@" || exit "$?"; exit "${SNAPSHOT_HASH_EXIT:-0}" ;;
   -c) [ "$#" = 4 ] && [ "$2" = core.autocrlf=false ] && [ "$3" = diff ] && [ "$4" = --check ] ;;
   *) exit 99 ;;
 esac
@@ -1411,6 +1414,60 @@ fi
 bash "${checker}" timings all "${scheduler_root}/.build/overlap/profile.tsv" > "${tmp_dir}/scheduler-timings"
 [ "$(wc -l < "${tmp_dir}/scheduler-timings" | tr -d '[:space:]')" = 19 ]
 echo '[output-contract] independent verification overlap/order control passed'
+
+real_hash_git="$(command -v git)"
+cache_image="synthetic.invalid/sdk@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+for cache_case in immutable other-image other-platform explicit floating no-platform; do
+  cache_platform=linux/amd64; cache_selected=; selected_image="${cache_image}"
+  selected_prefix=zmk-build-script-test-control
+  case "${cache_case}" in
+    other-image) selected_image=synthetic.invalid/sdk@sha256:2222222222222222222222222222222222222222222222222222222222222222 ;;
+    other-platform) cache_platform=linux/arm64 ;;
+    explicit) cache_selected=zmk-build-script-test-explicit; selected_prefix='../unused prefix' ;;
+    floating) selected_image=synthetic.invalid/sdk:stable ;;
+    no-platform) cache_platform= ;;
+  esac
+  mkdir "${scheduler_root}/trace-cache-${cache_case}"
+  (cd "${scheduler_root}"; PATH="${scheduler_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME="${cache_selected}" \
+    ZMK_TEST_CACHE_PREFIX="${selected_prefix}" ZMK_BUILD_IMAGE="${selected_image}" \
+    ZMK_DOCKER_PLATFORM="${cache_platform}" SNAPSHOT_REAL_GIT="${real_hash_git}" \
+    ZMK_TEST_JOBS=2 ZMK_TEST_PROFILE=0 SCHEDULER_CASE_MODE=plain \
+    SCHEDULER_TRACE="${scheduler_root}/trace-cache-${cache_case}" \
+    ZMK_TEST_RESULTS="${scheduler_root}/.build/cache-${cache_case}" bash .github/scripts/test.sh docker) \
+    > "${tmp_dir}/cache-${cache_case}.log" 2>&1
+  case "${cache_case}" in
+    immutable|other-image|other-platform)
+      cache_key="$(printf '%s\0%s\0' "${selected_image}" "${cache_platform}" | "${real_hash_git}" hash-object --stdin)"
+      if ! grep -qx "Cache volume: zmk-build-script-test-control-${cache_key}" \
+          "${scheduler_root}/.build/cache-${cache_case}/environment.txt" ||
+          [ -e "${scheduler_root}/trace-cache-${cache_case}/cache-cleaned" ]; then
+        echo 'immutable managed test cache was not retained' >&2; exit 1
+      fi ;;
+    explicit)
+      grep -qx "Cache volume: ${cache_selected}" "${scheduler_root}/.build/cache-${cache_case}/environment.txt"
+      [ ! -e "${scheduler_root}/trace-cache-${cache_case}/cache-cleaned" ] ;;
+    floating|no-platform)
+      test -f "${scheduler_root}/trace-cache-${cache_case}/cache-cleaned"
+      grep -q '^Cache volume: zmk-test-' "${scheduler_root}/.build/cache-${cache_case}/environment.txt" ;;
+  esac
+done
+for bad_prefix in zmk-production '../zmk-build-script-test-escape' 'zmk-build-script-test-has space' 'zmk-build-script-test-x:/host'; do
+  if (cd "${scheduler_root}"; ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_CACHE_PREFIX="${bad_prefix}" \
+      ZMK_BUILD_IMAGE="${cache_image}" ZMK_DOCKER_PLATFORM=linux/amd64 \
+      ZMK_TEST_RESULTS="${scheduler_root}/.build/cache-invalid" bash .github/scripts/test.sh docker) \
+      > "${tmp_dir}/cache-invalid.log" 2>&1; then exit 1; else snapshot_status=$?; fi
+  [ "${snapshot_status}" = 2 ]
+  grep -qx 'Invalid managed test cache prefix.' "${tmp_dir}/cache-invalid.log"
+  [ ! -e "${scheduler_root}/.build/cache-invalid" ]
+done
+if (cd "${scheduler_root}"; PATH="${scheduler_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= \
+    ZMK_TEST_CACHE_PREFIX=zmk-build-script-test-control ZMK_BUILD_IMAGE="${cache_image}" ZMK_DOCKER_PLATFORM=linux/amd64 \
+    SNAPSHOT_REAL_GIT="${real_hash_git}" SNAPSHOT_HASH_EXIT=23 ZMK_TEST_RESULTS="${scheduler_root}/.build/cache-hash-failed" \
+    bash .github/scripts/test.sh docker) > "${tmp_dir}/cache-hash-failed.log" 2>&1; then exit 1; else snapshot_status=$?; fi
+[ "${snapshot_status}" = 23 ]
+grep -qx 'Failed to derive managed test cache identity.' "${tmp_dir}/cache-hash-failed.log"
+[ ! -e "${scheduler_root}/.build/cache-hash-failed" ]
+echo '[output-contract] managed cache identity/retention/override controls passed'
 
 printf '%s\n' syntax lf whitespace lf-contract output-contract external-contract host-contract \
   host-help container-help tools docker-contract firmware > "${tmp_dir}/scheduler-expected-order"
