@@ -326,9 +326,74 @@ case "${mode}" in
     ;;
 esac
 
-summary_metadata() {
-  # Raw build output can contain text resembling any summary field.
-  awk '/^Failure excerpt$/ {exit} {print}' "$1"
+SUMMARY_KEYS=(Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed
+  'Built targets' 'Run sequence' Pristine 'Build jobs' 'Compiler jobs' 'Fallback binary'
+  'Extra snippets' 'Module inputs')
+SUMMARY_COUNTS=()
+SUMMARY_VALUES=()
+
+read_summary_metadata() {
+  local file="$1" fields item= record_count=0 index count
+  local records=()
+  SUMMARY_COUNTS=() SUMMARY_VALUES=()
+  printf -v fields '%s|' "${SUMMARY_KEYS[@]}"
+  # One header snapshot. NUL records preserve empty values and literal whitespace;
+  # the separate producer status detects failures even after complete-looking output.
+  while IFS= read -r -d '' item; do
+    records+=("${item}")
+    record_count=$((record_count + 1))
+  done < <(
+    metadata_status=0
+    LC_ALL=C awk -v fields="${fields%|}" '
+      BEGIN {
+        n = split(fields, keys, "[|]")
+        for (i = 1; i <= n; i++) positions[keys[i]] = i
+        nul = sprintf("%c", 0)
+      }
+      /^Failure excerpt$/ {exit}
+      index($0, nul) {invalid = 1; exit 2}
+      {
+        colon = index($0, ":")
+        if (colon > 0) {
+          key = substr($0, 1, colon - 1)
+          if (key in positions) {
+            i = positions[key]
+            counts[i]++
+            if (substr($0, 1, length(key) + 2) == key ": ")
+              values[i] = substr($0, length(key) + 3)
+          }
+        }
+      }
+      END {
+        if (invalid) exit 2
+        for (i = 1; i <= n; i++) printf "%d%c%s%c", counts[i] + 0, 0, values[i], 0
+      }
+    ' < "${file}" || metadata_status=$?
+    printf '%s\0' "${metadata_status}"
+  )
+  if [ -n "${item}" ] || [ "${record_count}" != "$(( ${#SUMMARY_KEYS[@]} * 2 + 1 ))" ] ||
+      [ "${records[record_count - 1]}" != 0 ]; then
+    echo 'Failed to read summary metadata.' >&2
+    return 1
+  fi
+  for ((index=0; index<${#SUMMARY_KEYS[@]}; index++)); do
+    count="${records[index * 2]}"
+    case "${count}" in ''|*[!0-9]*) echo 'Failed to read summary metadata.' >&2; return 1 ;; esac
+    SUMMARY_COUNTS+=("${count}")
+    SUMMARY_VALUES+=("${records[index * 2 + 1]}")
+  done
+}
+
+summary_field() {
+  local index
+  for ((index=0; index<${#SUMMARY_KEYS[@]}; index++)); do
+    if [ "$1" = "${SUMMARY_KEYS[index]}" ]; then
+      SUMMARY_COUNT="${SUMMARY_COUNTS[index]}"
+      SUMMARY_VALUE="${SUMMARY_VALUES[index]}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 is_run_sequence() {
@@ -386,19 +451,20 @@ require_valid_run_dir() {
 }
 
 read_run_order() {
-  local directory="$1" summary="$2" base count sequence key label fields
+  local directory="$1" summary="$2" base count sequence key label
   base="${directory##*/}"
   RUN_ORDER_KEY="${base%%.*}" RUN_ORDER_NUMBER=1
   case "${base}" in *.*) RUN_ORDER_NUMBER="${base##*.}" ;; esac
   # Excerpts can contain arbitrary build output, including lines resembling metadata.
-  fields="$(summary_metadata "${summary}" | sed -n '/^Run sequence:/p')" || return 1
-  count="$(printf '%s\n' "${fields}" | grep -c '^Run sequence:' || true)"
+  read_summary_metadata "${summary}" || return 1
+  summary_field 'Run sequence' || return 1
+  count="${SUMMARY_COUNT}"
   case "${count}" in
     0) return 0 ;;
     1) ;;
     *) echo 'duplicate summary field: Run sequence' >&2; return 1 ;;
   esac
-  sequence="$(printf '%s\n' "${fields}" | sed -n 's/^Run sequence: //p')" || return 1
+  sequence="${SUMMARY_VALUE}"
   is_run_sequence "${sequence}" || { echo 'Invalid run sequence in summary.' >&2; return 1; }
   key="${base}"
   if [ "${sequence}" != 1 ]; then
@@ -445,7 +511,7 @@ else
   build_summary=""
   latest_key="" latest_number=0
   while IFS= read -r summary; do
-    candidate_dir="$(dirname "${summary}")"
+    candidate_dir="${summary%/*}"
     require_valid_run_dir "${candidate_dir}" "build summary directory"
     read_run_order "${candidate_dir}" "${summary}"
     candidate_key="${RUN_ORDER_KEY}" candidate_number="${RUN_ORDER_NUMBER}"
@@ -466,7 +532,7 @@ if [ -z "${build_summary}" ] || [ ! -f "${build_summary}" ]; then
   exit 1
 fi
 
-run_dir="$(dirname "${build_summary}")"
+run_dir="${build_summary%/*}"
 read_run_order "${run_dir}" "${build_summary}"
 build_log="${run_dir}/build.log"
 
@@ -478,10 +544,9 @@ fi
 # A summary has one value per field. A matching SUCCESS line must not hide a
 # contradictory status or a second mode/count/fallback later in the file.
 # All fields are read before the failure excerpt; sequence has already been checked.
-for field in Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed \
-    'Built targets' Pristine 'Build jobs' 'Compiler jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
-  field_count="$(summary_metadata "${build_summary}" | grep -c "^${field}:" || true)"
-  if [ "${field_count}" -gt 1 ]; then
+for field in "${SUMMARY_KEYS[@]}"; do
+  summary_field "${field}"
+  if [ "${SUMMARY_COUNT}" -gt 1 ]; then
     echo "duplicate summary field: ${field}: ${build_summary}" >&2
     exit 1
   fi
@@ -489,23 +554,25 @@ done
 
 # Older summaries omit this field. New ones record an explicit decimal cap or
 # auto, which leaves the selected image/build tool in control.
-compiler_jobs="$(summary_metadata "${build_summary}" | sed -n 's/^Compiler jobs: //p')"
+summary_field 'Compiler jobs'
+compiler_jobs="${SUMMARY_VALUE}"
 case "${compiler_jobs}" in
   '')
-    if summary_metadata "${build_summary}" | grep '^Compiler jobs:' >/dev/null; then
+    if [ "${SUMMARY_COUNT}" != 0 ]; then
       echo 'invalid Compiler jobs in summary' >&2; exit 1
     fi ;;
   auto) ;;
   *[!0-9]*|0*) echo 'invalid Compiler jobs in summary' >&2; exit 1 ;;
 esac
 
-# Drain metadata; grep -q can terminate the producer with SIGPIPE on large summaries.
-if ! summary_metadata "${build_summary}" | grep -x 'Status: SUCCESS' >/dev/null; then
+summary_field Status
+if [ "${SUMMARY_VALUE}" != SUCCESS ]; then
   echo "build-summary.txt does not report success: ${build_summary}" >&2
   exit 1
 fi
 
-summary_mode="$(summary_metadata "${build_summary}" | sed -n 's/^Mode: //p' | tail -n 1)"
+summary_field Mode
+summary_mode="${SUMMARY_VALUE}"
 if [ "${summary_mode}" != "${mode}" ]; then
   echo "build-summary.txt mode is ${summary_mode:-<missing>}, expected ${mode}: ${build_summary}" >&2
   exit 1
@@ -515,13 +582,16 @@ echo "[output] build log: ${build_log}"
 echo "[output] build summary: ${build_summary}"
 
 if [ "${mode}" = "build" ]; then
-  built_targets="$(summary_metadata "${build_summary}" | sed -n 's/^Built targets: \([0-9][0-9]*\)$/\1/p' | tail -n 1)"
+  summary_field 'Built targets'
+  built_targets="${SUMMARY_VALUE}"
+  case "${built_targets}" in ''|*[!0-9]*) built_targets= ;; esac
   if [ -z "${built_targets}" ]; then
     echo "build-summary.txt does not include Built targets for build mode: ${build_summary}" >&2
     exit 1
   fi
 
-  fallback="$(summary_metadata "${build_summary}" | sed -n 's/^Fallback binary: //p' | tail -n 1)"
+  summary_field 'Fallback binary'
+  fallback="${SUMMARY_VALUE}"
   fallback="${fallback:-bin}"
   case "${fallback}" in
     .*|-*|*[!A-Za-z0-9._-]*) echo "Invalid fallback firmware extension in summary" >&2; exit 1 ;;
@@ -537,7 +607,10 @@ if [ "${mode}" = "build" ]; then
     exit 1
   fi
 
-  firmware_count="$(printf '%s\n' "${firmware_list}" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+  firmware_count=0
+  while IFS= read -r firmware_file; do
+    [ -z "${firmware_file}" ] || firmware_count=$((firmware_count + 1))
+  done <<< "${firmware_list}"
   if [ "${firmware_count}" -lt "${built_targets}" ]; then
     echo "Firmware artifact count (${firmware_count}) is lower than built target count (${built_targets})." >&2
     exit 1
@@ -550,7 +623,9 @@ if [ "${mode}" = "build" ]; then
 
   echo "[output] built targets: ${built_targets}"
   echo "[output] firmware artifacts: ${firmware_count}"
-  printf '%s\n' "${firmware_list}" | sed 's/^/[output] firmware artifact: /'
+  while IFS= read -r firmware_file; do
+    printf '[output] firmware artifact: %s\n' "${firmware_file}"
+  done <<< "${firmware_list}"
 fi
 
 check_expected_output() {
@@ -592,9 +667,10 @@ check_expected_output() {
       *) echo 'Invalid output expectations: unknown key.' >&2; return 1 ;;
     esac
     [ -n "${value}" ] || { echo 'Invalid output expectations: empty value.' >&2; return 1; }
-    count="$(summary_metadata "${build_summary}" | grep -c "^${field}:" || true)"
+    summary_field "${field}" || return 1
+    count="${SUMMARY_COUNT}"
     [ "${count}" = 1 ] || { echo "missing or duplicate expected summary field: ${field}" >&2; return 1; }
-    actual="$(summary_metadata "${build_summary}" | sed -n "s/^${field}: //p")" || return 1
+    actual="${SUMMARY_VALUE}"
     [ "${actual}" = "${value}" ] || { echo "expected ${field} does not match summary" >&2; return 1; }
   done < "${expected_file}"
   [ "${expected_image}" = 1 ] || { echo 'Invalid output expectations: image is required.' >&2; return 1; }

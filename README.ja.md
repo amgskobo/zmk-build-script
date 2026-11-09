@@ -549,6 +549,11 @@ bash .github/scripts/test.sh all
 単体・複数 file の実 import、件数不一致の拒否、producer を読み切る対照試験は維持し、
 同じ copy を数百回繰り返す負担を減らします。
 
+output checker は選択した run の検証ごとに summary header を1回解析し、literal な値と重複数を再利用します。
+候補の探索では各候補を個別に読みます。解析は failure excerpt の前で止め、header の NUL を拒否し、
+完全な parser 出力と producer の正常終了を両方確認します。項目ごとの再照会と単純な fixture directory の
+作成では、不要な process 起動を減らします。
+
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。

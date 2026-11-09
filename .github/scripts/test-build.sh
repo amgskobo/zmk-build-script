@@ -81,11 +81,10 @@ cp "${repo_root}/.github/fixtures/ci-zmk-config/build.yaml" "${fixture}/build.ya
 
 add_payload_dirs() {
   local root="$1" dir
+  mkdir -p "${root}"/{modules,tools,zmk,bootloader,optional,src,build,.cache,nested/build,nested/.cache}
   for dir in modules tools zmk bootloader optional; do
-    mkdir -p "${root}/${dir}"
     printf 'generated\n' > "${root}/${dir}/generated.txt"
   done
-  mkdir -p "${root}/src" "${root}/build" "${root}/.cache" "${root}/nested/build" "${root}/nested/.cache"
   printf 'keep\n' > "${root}/src/keep.txt"
   printf 'exclude root\n' > "${root}/build/root.txt"
   printf 'exclude root\n' > "${root}/.cache/root.txt"
@@ -94,10 +93,8 @@ add_payload_dirs() {
 }
 
 add_generated_git_markers() {
-  local root="$1" dir
-  for dir in modules tools zmk bootloader optional; do
-    mkdir -p "${root}/${dir}/.git"
-  done
+  local root="$1"
+  mkdir -p "${root}"/{modules,tools,zmk,bootloader,optional}/.git
 }
 
 make_target() {

@@ -626,6 +626,12 @@ per-file import checks. Single and multiple real imports, incomplete-count rejec
 and producer-drain controls remain mandatory without repeating identical copies
 hundreds of times.
 
+The output checker parses a summary header once per selected-run check and reuses
+its literal values and duplicate counts. Candidate discovery reads each candidate
+separately. Parsing stops before the failure excerpt, rejects header NUL bytes and
+requires complete parser output plus a successful producer status. Repeated field
+queries and simple fixture directory creation avoid unnecessary process launches.
+
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.

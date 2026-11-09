@@ -441,6 +441,11 @@ awk 'BEGIN { for (i=0; i<20000; i++) print "  - synthetic/module-with-a-long-and
 run_ok validate "${run_path}"
 
 # Reject contradictory/duplicate summary fields instead of accepting one matching line.
+printf 'Status: SU\0CCESS\nMode: validate\n' > "${run_path}/build-summary.txt"
+run_fail validate 'Failed to read summary metadata' "${run_path}"
+printf 'Status: SUCCESS\nMode: validate\nFailure excerpt\nraw\0output\n' > "${run_path}/build-summary.txt"
+run_ok validate "${run_path}"
+
 for field in Status Reason Mode Target 'Docker image' 'Docker cache volume' Elapsed \
     'Built targets' Pristine 'Build jobs' 'Compiler jobs' 'Fallback binary' 'Extra snippets' 'Module inputs'; do
   reset_case
@@ -489,6 +494,42 @@ strict_summary
 printf 'synthetic firmware\n' > "${run_path}/left.uf2"
 printf 'synthetic firmware\n' > "${run_path}/right.bin"
 run_ok build "${run_path}" "${expected_file}"
+# A complete explicit-run check, including expectations, needs at most one metadata parse.
+echo '[output-contract] metadata read budget'
+metadata_bin="${tmp_dir}/metadata-bin"
+mkdir "${metadata_bin}"
+cat > "${metadata_bin}/awk" <<'EOF'
+#!/usr/bin/env bash
+printf 'read\n' >> "${SUMMARY_READ_CALLS}"
+[ "${SUMMARY_AWK_EMPTY:-0}" != 1 ] || exit 0
+"${SUMMARY_REAL_AWK}" "$@" || exit "$?"
+exit "${SUMMARY_AWK_EXIT:-0}"
+EOF
+chmod +x "${metadata_bin}/awk"
+metadata_real_awk="$(command -v awk)"
+: > "${tmp_dir}/metadata-reads"
+PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" \
+  run_ok build "${run_path}" "${expected_file}"
+metadata_reads=0
+while IFS= read -r metadata_read; do metadata_reads=$((metadata_reads + 1)); done < "${tmp_dir}/metadata-reads"
+if [ "${metadata_reads}" -gt 1 ]; then
+  echo 'summary metadata was parsed repeatedly' >&2; exit 1
+fi
+echo "[output-contract] metadata parses: ${metadata_reads}"
+# Complete output from a failing producer and successful-but-empty output are both errors.
+for metadata_failure in exit empty; do
+  metadata_exit=0 metadata_empty=0
+  if [ "${metadata_failure}" = exit ]; then metadata_exit=23; else metadata_empty=1; fi
+  PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" \
+    SUMMARY_AWK_EXIT="${metadata_exit}" SUMMARY_AWK_EMPTY="${metadata_empty}" \
+    run_fail build 'Failed to read summary metadata' "${run_path}" "${expected_file}"
+done
+literal_target=$'/synthetic/path with spaces\tback\\slash $value; [x] '
+literal_cache='synthetic cache with spaces '
+strict_summary synthetic/build:stable "${literal_target}" "${literal_cache}"
+printf '%s\0' image synthetic/build:stable target "${literal_target}" cache "${literal_cache}" \
+  artifact left.uf2 artifact right.bin > "${tmp_dir}/literal.expect"
+run_ok build "${run_path}" "${tmp_dir}/literal.expect"
 strict_summary synthetic/build:wrong
 run_fail build 'expected Docker image' "${run_path}" "${expected_file}"
 strict_summary
