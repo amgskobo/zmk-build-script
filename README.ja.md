@@ -556,6 +556,11 @@ output checker は選択した run の検証ごとに summary header を1回解�
 parser には十進数の byte 列を渡し、awk 実装による binary string の NUL 保持には依存しません。
 byte producer も最後まで読み取り、終了 status を確認します。
 
+host の run 名の整形と完了 marker の解析は、それぞれ1つの `awk` process で行います。
+marker の解析は log を最後まで読み、CR と ANSI prefix を除き、同一行に複数ある場合も最後の有効な marker を使います。
+成功した build に marker がない場合は、firmware 件数を使います。host suite は失敗・中断の scenario を維持し、
+helper process の起動数の上限も検証します。実際の起動コストと tool の挙動の確認には、各 native OS での実行が必要です。
+
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。

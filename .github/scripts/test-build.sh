@@ -959,7 +959,17 @@ case "$1" in
         [ "${NEW_ATTACK:-}" != list-failure ] || exit 23 ;;
       *'tar --no-same-owner'*|*'cat > /root/zmk-config/build.sh'*) cat >/dev/null ;;
       *'./build.sh validate'*) echo 'build.yaml is valid.' ;;
-      *'./build.sh build'*) printf 'Build complete: %s target(s).\n' "${NEW_COUNT}" ;;
+      *'./build.sh build'*)
+        case "${NEW_MARKER_STYLE:-plain}" in
+          decorated)
+            printf 'old Build complete: 9 target(s).\n'
+            awk 'BEGIN {for (i=0; i<32768; i++) printf "Build complete: 7 target(s). "; print "Build complete: 8 target(s). trailing malformed Build complete: invalid target(s)."}'
+            printf '\033[?25h[worker] Build \033[36mcomplete:\033[0m 1 target(s). mid Build comp\rlete: 2 target(s). tail Build complete: invalid target(s).\r\n'
+            printf 'Build complete: 777 targets.\n' ;;
+          absent) printf 'synthetic build without a completion marker\n' ;;
+          plain) printf 'Build complete: %s target(s).\n' "${NEW_COUNT}" ;;
+          *) exit 99 ;;
+        esac ;;
       *'mkdir -p /root/zmk-config'*) ;;
       *) exit 99 ;;
     esac ;;
@@ -1011,17 +1021,19 @@ padding=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 for number in 1 2; do
   printf 'synthetic firmware\n' > "${payload}/target-${number}-${padding}.bin"
 done
-PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=2 NEW_PAYLOAD="${payload}" \
-    NEW_CALLS="${tmp_dir}/firmware-multiple.commands.log" \
-    bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-multiple.log" 2>&1
-summary="$(summary_from_log "${tmp_dir}/firmware-multiple.log")"
-grep -qx 'Status: SUCCESS' "${summary}"
-grep -qx 'Built targets: 2' "${summary}"
-[ "$(grep -c '^- target-' "${summary}")" = 2 ]
-for number in 1 2; do
-  cmp "${summary%/*}/target-${number}-${padding}.bin" <(printf 'synthetic firmware\n')
+for marker_style in decorated absent; do
+  PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=2 NEW_PAYLOAD="${payload}" \
+      NEW_MARKER_STYLE="${marker_style}" NEW_CALLS="${tmp_dir}/firmware-multiple-${marker_style}.commands.log" \
+      bash "${tool_root}/build.sh" "${fixture}" >"${tmp_dir}/firmware-multiple-${marker_style}.log" 2>&1
+  summary="$(summary_from_log "${tmp_dir}/firmware-multiple-${marker_style}.log")"
+  grep -qx 'Status: SUCCESS' "${summary}"
+  grep -qx 'Built targets: 2' "${summary}"
+  [ "$(grep -c '^- target-' "${summary}")" = 2 ]
+  for number in 1 2; do
+    cmp "${summary%/*}/target-${number}-${padding}.bin" <(printf 'synthetic firmware\n')
+  done
+  bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
 done
-bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*}"
 
 # A marker above 255 must remain an integer even when the output is incomplete.
 PATH="${fake_bin}:${PATH}" NEW_PHASE=artifacts NEW_COUNT=512 NEW_PAYLOAD="${payload}" \
@@ -1034,6 +1046,45 @@ if bash "${repo_root}/.github/scripts/check-build-output.sh" build "${summary%/*
   echo 'large build count accepted incomplete firmware output' >&2; exit 1
 fi
 grep -F 'Firmware artifact count (2) is lower than built target count (512).' "${tmp_dir}/firmware-count-check.log" >/dev/null
+
+# Named process-budget control: normalization and summary counting must not start
+# a pipeline of helpers on every invocation. Include the real source-copy filter.
+budget_bin="${tmp_dir}/helper-budget-bin"
+mkdir -p "${budget_bin}"
+for helper in awk sed tr tail; do
+  cat > "${budget_bin}/${helper}" <<'EOF'
+#!/usr/bin/env bash
+helper="${0##*/}"
+printf '%s\n' "${helper}" >> "${HOST_HELPER_CALLS}"
+case "${helper}" in
+  awk) exec "${HOST_REAL_AWK}" "$@" ;;
+  sed) exec "${HOST_REAL_SED}" "$@" ;;
+  tr) exec "${HOST_REAL_TR}" "$@" ;;
+  tail) exec "${HOST_REAL_TAIL}" "$@" ;;
+  *) exit 99 ;;
+esac
+EOF
+  chmod +x "${budget_bin}/${helper}"
+done
+helper_calls="${tmp_dir}/host-helper-budget.calls.log"
+budget_real_awk="$(command -v awk)" budget_real_sed="$(command -v sed)"
+budget_real_tr="$(command -v tr)" budget_real_tail="$(command -v tail)"
+PATH="${budget_bin}:${fake_bin}:${PATH}" HOST_HELPER_CALLS="${helper_calls}" \
+    HOST_REAL_AWK="${budget_real_awk}" HOST_REAL_SED="${budget_real_sed}" \
+    HOST_REAL_TR="${budget_real_tr}" HOST_REAL_TAIL="${budget_real_tail}" \
+    NEW_PHASE=helper-budget NEW_CALLS="${tmp_dir}/host-helper-budget.commands.log" \
+    bash "${tool_root}/build.sh" validate "${fixture}" >"${tmp_dir}/host-helper-budget.log" 2>&1
+summary="$(summary_from_log "${tmp_dir}/host-helper-budget.log")"
+bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}"
+helper_count=0
+while IFS= read -r helper; do
+  case "${helper}" in awk|sed|tr|tail) ;; *) echo 'invalid process-budget receipt' >&2; exit 1 ;; esac
+  helper_count=$((helper_count + 1))
+done < "${helper_calls}"
+if [ "${helper_count}" -eq 0 ] || [ "${helper_count}" -gt 3 ]; then
+  echo "host helper process budget exceeded: ${helper_count} (maximum 3)" >&2; exit 1
+fi
+echo '[host-contract] helper process budget passed'
 
 # Named control: a lazy consumer closes before this >1MiB NUL producer completes.
 control_done="${tmp_dir}/unsafe-list.complete"
@@ -1246,11 +1297,12 @@ grep -qx 'failed to release run directory claim' "${summary%/*}/build.log"
 rm "${fake_bin}/rm"
 
 # Names are safe display labels from the selected config root, not parsed YAML on the host.
-for naming_case in hidden numeric unicode long; do
+for naming_case in hidden numeric unicode literal long; do
   case "${naming_case}" in
     hidden) source_name='.Hidden Config.V2-10'; expected_label=hidden-config-v2-10 ;;
     numeric) source_name=numeric-10; expected_label=numeric-10 ;;
     unicode) source_name=名前; expected_label=config ;;
+    literal) source_name="--MiX--..__name-  tail='Quoted'--"; expected_label=mix---__name--tail-quoted ;;
     long)
       source_name="$(printf '%100s' '' | tr ' ' a)"
       expected_label=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;

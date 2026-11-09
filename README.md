@@ -634,6 +634,12 @@ queries and simple fixture directory creation avoid unnecessary process launches
 The parser receives decimal bytes so NUL handling does not depend on an awk
 implementation storing binary strings; the byte producer is drained and checked too.
 
+Host run-name normalization and completion-marker parsing each use one `awk` process.
+Marker parsing drains the log, strips CR and ANSI prefixes, and retains the last valid marker,
+including multiple markers on one line. Successful builds without a marker still use the firmware
+count. The host suite retains failure/cancellation scenarios and checks a helper-process budget;
+native OS runs remain necessary to verify their actual startup costs and tool behavior.
+
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.

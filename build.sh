@@ -1798,10 +1798,21 @@ failure_excerpt() {
 
 built_target_count() {
     if [ -f "${LOG_FILE}" ]; then
-        sed -E $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g' "${LOG_FILE}" |
-            tr -d '\r' |
-            sed -n 's/.*Build complete: \([0-9][0-9]*\) target(s)\..*/\1/p' |
-            tail -n 1
+        LC_ALL=C awk '
+            {
+                gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "")
+                gsub(/\r/, "")
+                if (match($0, /.*Build complete: [0-9][0-9]* target\(s\)\./)) {
+                    # Keep the prefix through the last valid marker before
+                    # stripping it; a later malformed marker cannot win.
+                    built = substr($0, RSTART, RLENGTH)
+                    sub(/.*Build complete: /, "", built)
+                    sub(/ target\(s\)\.$/, "", built)
+                    found = 1
+                }
+            }
+            END { if (found) printf "%s\n", built }
+        ' "${LOG_FILE}"
     fi
 }
 
@@ -1891,9 +1902,15 @@ create_run_directory() {
     local root="${SCRIPT_DIR}/.build" label stem candidate claim number=1
     mkdir -p "${root}" || return 1
     # Derive only a display label on the host; YAML target parsing stays in Docker.
-    label="$(printf '%s' "${TARGET_DIR##*/}" | LC_ALL=C tr -cs 'A-Za-z0-9_-' '-' | LC_ALL=C tr 'A-Z' 'a-z')" || return 1
-    label="${label:0:80}"
-    label="$(printf '%s' "${label}" | sed 's/^-*//; s/-*$//')" || return 1
+    # Environment transport preserves literal quotes, backslashes and newlines.
+    label="$(RUN_LABEL_INPUT="${TARGET_DIR##*/}" LC_ALL=C awk 'BEGIN {
+        label = ENVIRON["RUN_LABEL_INPUT"]
+        gsub(/[^A-Za-z0-9_-]+/, "-", label)
+        label = substr(tolower(label), 1, 80)
+        sub(/^-*/, "", label)
+        sub(/-*$/, "", label)
+        printf "%s", label
+    }')" || return 1
     label="${label:-config}"
     stem="${root}/run-$(date +%Y-%m-%d_%H-%M-%S)-${label}"
     candidate="${stem}"
