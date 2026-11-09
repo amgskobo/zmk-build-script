@@ -43,7 +43,15 @@ wait_case() {
   if wait "${case_pids[$index]}"; then status=0; else status=$?; fi
   # A trapped signal can interrupt wait before the worker finishes its cleanup.
   if [ "${interrupted}" != 0 ] && [ "${closing}" = 0 ] && kill -0 "${case_pids[$index]}" 2>/dev/null; then return 0; fi
-  if [ "${status}" -ge 128 ]; then kill -TERM -- "-${case_pids[$index]}" 2>/dev/null || true; fi
+  # A leader can exit while descendants are still running EXIT/signal cleanup.
+  # Drain the acquired group before accepting completion or releasing its cache.
+  kill -TERM -- "-${case_pids[$index]}" 2>/dev/null || true
+  if kill -0 -- "-${case_pids[$index]}" 2>/dev/null; then
+    if ! printf '%s\n' "$(date +%s)" > "${result_dir}/${case_names[$index]}.group-waiting"; then
+      [ "${status}" != 0 ] || status=1
+    fi
+    while kill -0 -- "-${case_pids[$index]}" 2>/dev/null; do sleep 1; done
+  fi
   case_exits[$index]="${status}"; case_states[$index]=done
   active_cases=$((active_cases - 1))
   if [ "${case_names[$index]}" = tools ] && [ "${closing}" = 0 ] && [ "${interrupted}" = 0 ]; then

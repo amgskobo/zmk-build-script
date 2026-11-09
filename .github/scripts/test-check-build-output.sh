@@ -10,10 +10,19 @@ run_name="run-2026-05-23_00-00-00-ci-zmk-config"
 run_path="${case_root}/.build/${run_name}"
 
 cleanup() {
+  for file in "${tmp_dir}"/'scheduler fixture'/trace-*/descendant.pid; do
+    [ -f "${file}" ] || continue
+    : > "${file%/*}/descendant.release"
+  done
   if [ -n "${scheduler_pid:-}" ]; then
     kill -TERM -- "-${scheduler_pid}" 2>/dev/null || true
     wait "${scheduler_pid}" 2>/dev/null || true
   fi
+  for file in "${tmp_dir}"/'scheduler fixture'/trace-*/descendant.pid; do
+    [ -f "${file}" ] || continue
+    IFS= read -r child < "${file}" || continue
+    while kill -0 "${child}" 2>/dev/null; do sleep 1; done
+  done
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
@@ -1320,6 +1329,14 @@ set -euo pipefail
 name="$1"
 trap 'printf "%s\n" "$?" > "${SCHEDULER_TRACE}/${name}.cleanup"' EXIT
 printf '%s\n' "$$" > "${SCHEDULER_TRACE}/${name}.pid"
+if [ "${SCHEDULER_CASE_MODE:-}:${name}" = signal:host-contract ]; then
+  bash scripts/cleanup-descendant.sh &
+  attempt=0
+  while [ ! -f "${SCHEDULER_TRACE}/descendant.ready" ]; do
+    attempt=$((attempt + 1)); [ "${attempt}" -lt 30 ] || exit 99
+    sleep 1
+  done
+fi
 : > "${SCHEDULER_TRACE}/${name}.started"
 case "${SCHEDULER_CASE_MODE:-overlap}:${name}" in
   overlap:host-contract) peer=docker-contract ;;
@@ -1361,6 +1378,14 @@ case "${SCHEDULER_CASE_MODE:-}:${name}" in
 esac
 : > "${SCHEDULER_TRACE}/${name}.ended"
 [ "${SCHEDULER_CASE_MODE:-}:${name}" != failure:external-contract ] || exit 23
+EOF
+cat > "${scheduler_root}/scripts/cleanup-descendant.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'trap "" TERM; : > "${SCHEDULER_TRACE}/descendant.stopping"; while [ ! -f "${SCHEDULER_TRACE}/descendant.release" ]; do sleep 1; done; : > "${SCHEDULER_TRACE}/descendant.cleanup"; exit 143' TERM
+printf '%s\n' "$$" > "${SCHEDULER_TRACE}/descendant.pid"
+: > "${SCHEDULER_TRACE}/descendant.ready"
+while :; do sleep 1; done
 EOF
 for entry in check-lf:lf test-check-lf:lf-contract test-check-build-output:output-contract \
     test-auto-build-external:external-contract check-runner-tools:tools test-build-fixtures:firmware; do
@@ -1470,8 +1495,20 @@ for signal in TERM INT; do
   scheduler_wait_marker "${scheduler_root}/trace-signal-${signal}/host-contract.started"
   scheduler_wait_marker "${scheduler_root}/trace-signal-${signal}/docker-contract.started"
   kill -"${signal}" "${scheduler_pid}"
+  scheduler_wait_marker "${scheduler_root}/trace-signal-${signal}/descendant.stopping"
+  attempt=0
+  while [ ! -e "${scheduler_root}/.build/signal-${signal}/host-contract.group-waiting" ] &&
+      [ ! -e "${scheduler_root}/trace-signal-${signal}/unsafe-cache-cleanup" ]; do
+    attempt=$((attempt + 1)); [ "${attempt}" -lt 30 ] || break
+    sleep 1
+  done
+  : > "${scheduler_root}/trace-signal-${signal}/descendant.release"
   if wait "${scheduler_pid}"; then snapshot_status=0; else snapshot_status=$?; fi
   scheduler_pid=
+  if [ -e "${scheduler_root}/trace-signal-${signal}/unsafe-cache-cleanup" ] ||
+      [ ! -f "${scheduler_root}/trace-signal-${signal}/descendant.cleanup" ]; then
+    echo 'owned descendant cleanup was not awaited' >&2; exit 1
+  fi
   [ "${snapshot_status}" = "${expected}" ]
   grep -qx "CI exit status: ${expected}" "${scheduler_root}/.build/public/tests-all.txt"
   for name in host-contract docker-contract; do
