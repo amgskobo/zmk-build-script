@@ -1083,4 +1083,69 @@ MSYS=winsymlinks:sys ln -s "${foreign}" "${ci_root}/.build/public"
 if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh publish clear) >/dev/null 2>&1; then exit 1; fi
 grep -qx preserve "${foreign}/keep.txt"
 
+# Exercise the real profiling entry with synthetic metadata/daemon dispatchers.
+# This is a timer-transport control, not evidence of Docker execution.
+snapshot_root="${tmp_dir}/snapshot capture fixture"
+mkdir -p "${snapshot_root}/.github/scripts" "${snapshot_root}/bin"
+cp "${repo_root}/.github/scripts/test.sh" "${checker}" "${snapshot_root}/.github/scripts/"
+cat > "${snapshot_root}/bin/git" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  ls-files)
+    echo 'synthetic-private-host /synthetic/private snapshot warning' >&2
+    printf '%s\0' .github/scripts/test.sh .github/scripts/check-build-output.sh .github/scripts/check-runner-tools.sh .github/scripts/test-build.sh
+    exit "${SNAPSHOT_GIT_EXIT:-0}" ;;
+  rev-parse) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  status|check-ignore) ;;
+  --version) printf '%s\n' 'git version synthetic' ;;
+  *) exit 99 ;;
+esac
+EOF
+cat > "${snapshot_root}/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  volume) case "$2" in inspect) exit 1 ;; create|rm) ;; *) exit 99 ;; esac ;;
+  --version|version) printf '%s\n' 'Docker synthetic' ;;
+  image) printf '{}\n' ;;
+  *) exit 99 ;;
+esac
+EOF
+cat > "${snapshot_root}/.github/scripts/check-runner-tools.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'snapshot tools control\n'
+EOF
+cat > "${snapshot_root}/.github/scripts/test-build.sh" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = docker ] || exit 99
+printf 'probe-docker-exec\t0\t5\t0.125\n' >> "${ZMK_TEST_RESULTS}/profile.tsv"
+printf 'snapshot Docker dispatcher control\n'
+EOF
+chmod +x "${snapshot_root}/bin/git" "${snapshot_root}/bin/docker"
+(cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=1 \
+  ZMK_TEST_RESULTS="${snapshot_root}/.build/results" bash .github/scripts/test.sh docker) \
+  > "${tmp_dir}/snapshot-capture.log" 2>&1
+if ! bash "${checker}" timings docker "${snapshot_root}/.build/results/profile.tsv" > "${tmp_dir}/snapshot-timings"; then
+  echo 'snapshot stderr contaminated timing records' >&2; exit 1
+fi
+[ "$(wc -l < "${tmp_dir}/snapshot-timings" | tr -d '[:space:]')" = 9 ]
+for side in before after; do
+  grep -qx 'synthetic-private-host /synthetic/private snapshot warning' "${snapshot_root}/.build/results/source-${side}.log"
+  if grep -Eq 'synthetic-private|/synthetic/private' "${snapshot_root}/.build/results/source-${side}.time" \
+      "${snapshot_root}/.build/results/profile.tsv" "${tmp_dir}/snapshot-timings"; then
+    echo 'snapshot warning reached numeric evidence' >&2; exit 1
+  fi
+done
+cmp "${snapshot_root}/.build/results/source-before.txt" "${snapshot_root}/.build/results/source-after.txt"
+if (cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" SNAPSHOT_GIT_EXIT=23 \
+    ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=1 ZMK_TEST_RESULTS="${snapshot_root}/.build/failed-results" \
+    bash .github/scripts/test.sh docker) > "${tmp_dir}/snapshot-failure.log" 2>&1; then
+  echo 'snapshot producer failure was accepted' >&2; exit 1
+else snapshot_status=$?; fi
+[ "${snapshot_status}" = 23 ] || { echo 'snapshot failure status changed' >&2; exit 1; }
+if ! grep -qx 'CI exit status: 23' "${snapshot_root}/.build/public/tests-docker.txt"; then
+  echo 'publication changed an early producer failure status' >&2; exit 1
+fi
+[ ! -e "${snapshot_root}/.build/failed-results/source-after.txt" ]
+echo '[output-contract] snapshot warning/failure controls passed'
+
 echo "check-build-output.sh behavior tests passed."

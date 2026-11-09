@@ -194,7 +194,7 @@ publish_report() {
         rows=$((rows + 1))
       done < "${evidence}/results.tsv"
     fi
-    [ "${rows}" -gt 0 ] || status=1
+    if [ "${rows}" = 0 ] && [ "${status}" = 0 ]; then status=1; fi
   fi
   case "${kind}" in
     tests-shell|tests-all)

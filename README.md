@@ -681,6 +681,8 @@ If post-test timing validation fails, the publication
 report records a failed CI outcome even when all behavioral cases passed. Diagnostics expose
 only a fixed rejection reason and a recognized metric name; invalid values stay private.
 Byte checks drain their producer, propagate its failures and cross-check the complete report's byte count.
+During profiling, source snapshot diagnostics have separate private logs so warnings do not become timing values.
+Failures before any case completes retain their original nonzero exit status.
 An unfinished outcome replacement blocks publication until it is finalized or cleared.
 
 Tests create and remove a dedicated cache by default. An explicitly supplied

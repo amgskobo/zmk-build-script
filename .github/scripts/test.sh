@@ -63,7 +63,7 @@ source_identity() {
   done < "${result_dir}/file-list"
 }
 if [ "${profile}" = 1 ]; then
-  { time source_identity > "${result_dir}/source-before.txt"; } 2> "${result_dir}/source-before.time"
+  { time source_identity > "${result_dir}/source-before.txt" 2> "${result_dir}/source-before.log"; } 2> "${result_dir}/source-before.time"
   record_profile source-before 0 1
 else
   source_identity > "${result_dir}/source-before.txt"
@@ -172,7 +172,7 @@ if [ "${profile}" = 1 ]; then
   profile_probe probe-file-write-read 100 files
   rm -rf "${result_dir}/file-probe"
   if [ "${mode}" != shell ]; then profile_probe probe-docker-client 5 docker; fi
-  { time source_identity > "${result_dir}/source-after.txt"; } 2> "${result_dir}/source-after.time"
+  { time source_identity > "${result_dir}/source-after.txt" 2> "${result_dir}/source-after.log"; } 2> "${result_dir}/source-after.time"
   record_profile source-after 0 1
 else
   source_identity > "${result_dir}/source-after.txt"
