@@ -631,6 +631,8 @@ its literal values and duplicate counts. Candidate discovery reads each candidat
 separately. Parsing stops before the failure excerpt, rejects header NUL bytes and
 requires complete parser output plus a successful producer status. Repeated field
 queries and simple fixture directory creation avoid unnecessary process launches.
+The parser receives decimal bytes so NUL handling does not depend on an awk
+implementation storing binary strings; the byte producer is drained and checked too.
 
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.

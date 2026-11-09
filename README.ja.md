@@ -553,6 +553,8 @@ output checker は選択した run の検証ごとに summary header を1回解�
 候補の探索では各候補を個別に読みます。解析は failure excerpt の前で止め、header の NUL を拒否し、
 完全な parser 出力と producer の正常終了を両方確認します。項目ごとの再照会と単純な fixture directory の
 作成では、不要な process 起動を減らします。
+parser には十進数の byte 列を渡し、awk 実装による binary string の NUL 保持には依存しません。
+byte producer も最後まで読み取り、終了 status を確認します。
 
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。

@@ -344,31 +344,46 @@ read_summary_metadata() {
     record_count=$((record_count + 1))
   done < <(
     metadata_status=0
+    # Decimal bytes avoid awk implementations that truncate embedded NUL strings.
+    LC_ALL=C od -An -v -t u1 < "${file}" |
     LC_ALL=C awk -v fields="${fields%|}" '
+      function header_line(text, colon, key, position) {
+        if (text == "Failure excerpt") {ended = 1; return}
+        colon = index(text, ":")
+        if (colon > 0) {
+          key = substr(text, 1, colon - 1)
+          if (key in positions) {
+            position = positions[key]
+            counts[position]++
+            if (substr(text, 1, length(key) + 2) == key ": ")
+              values[position] = substr(text, length(key) + 3)
+          }
+        }
+      }
       BEGIN {
         n = split(fields, keys, "[|]")
         for (i = 1; i <= n; i++) positions[keys[i]] = i
-        nul = sprintf("%c", 0)
       }
-      /^Failure excerpt$/ {exit}
-      index($0, nul) {invalid = 1; exit 2}
       {
-        colon = index($0, ":")
-        if (colon > 0) {
-          key = substr($0, 1, colon - 1)
-          if (key in positions) {
-            i = positions[key]
-            counts[i]++
-            if (substr($0, 1, length(key) + 2) == key ": ")
-              values[i] = substr($0, length(key) + 3)
+        # Drain the byte producer even after the header boundary or invalid data.
+        if (ended || invalid) next
+        for (byte_index = 1; byte_index <= NF; byte_index++) {
+          if (ended) break
+          if ($byte_index !~ /^[0-9]+$/) {invalid = 1; break}
+          byte_value = $byte_index + 0
+          if (byte_value > 255 || byte_value == 0) {
+            invalid = 1; break
           }
+          if (byte_value == 10) {header_line(line); line = ""}
+          else line = line sprintf("%c", byte_value)
         }
       }
       END {
         if (invalid) exit 2
+        if (!ended && line != "") header_line(line)
         for (i = 1; i <= n; i++) printf "%d%c%s%c", counts[i] + 0, 0, values[i], 0
       }
-    ' < "${file}" || metadata_status=$?
+    ' || metadata_status=$?
     printf '%s\0' "${metadata_status}"
   )
   if [ -n "${item}" ] || [ "${record_count}" != "$(( ${#SUMMARY_KEYS[@]} * 2 + 1 ))" ] ||

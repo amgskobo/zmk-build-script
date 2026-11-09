@@ -507,8 +507,16 @@ exit "${SUMMARY_AWK_EXIT:-0}"
 EOF
 chmod +x "${metadata_bin}/awk"
 metadata_real_awk="$(command -v awk)"
+metadata_real_od="$(command -v od)"
+cat > "${metadata_bin}/od" <<'EOF'
+#!/usr/bin/env bash
+"${SUMMARY_REAL_OD}" "$@" || exit "$?"
+exit "${SUMMARY_OD_EXIT:-0}"
+EOF
+chmod +x "${metadata_bin}/od"
 : > "${tmp_dir}/metadata-reads"
-PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" \
+PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_REAL_OD="${metadata_real_od}" \
+  SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" \
   run_ok build "${run_path}" "${expected_file}"
 metadata_reads=0
 while IFS= read -r metadata_read; do metadata_reads=$((metadata_reads + 1)); done < "${tmp_dir}/metadata-reads"
@@ -520,10 +528,14 @@ echo "[output-contract] metadata parses: ${metadata_reads}"
 for metadata_failure in exit empty; do
   metadata_exit=0 metadata_empty=0
   if [ "${metadata_failure}" = exit ]; then metadata_exit=23; else metadata_empty=1; fi
-  PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" \
+  PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_REAL_OD="${metadata_real_od}" \
+    SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" \
     SUMMARY_AWK_EXIT="${metadata_exit}" SUMMARY_AWK_EMPTY="${metadata_empty}" \
     run_fail build 'Failed to read summary metadata' "${run_path}" "${expected_file}"
 done
+PATH="${metadata_bin}:${PATH}" SUMMARY_REAL_AWK="${metadata_real_awk}" SUMMARY_REAL_OD="${metadata_real_od}" \
+  SUMMARY_READ_CALLS="${tmp_dir}/metadata-reads" SUMMARY_OD_EXIT=23 \
+  run_fail build 'Failed to read summary metadata' "${run_path}" "${expected_file}"
 literal_target=$'/synthetic/path with spaces\tback\\slash $value; [x] '
 literal_cache='synthetic cache with spaces '
 strict_summary synthetic/build:stable "${literal_target}" "${literal_cache}"
