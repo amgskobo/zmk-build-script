@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: ''
+      test_jobs:
+        description: Optional concurrent test case count (1-16); blank preserves runner environment or the default
+        required: false
+        type: string
+        default: ''
       profile:
         description: Record private case timings and publish fixed numeric latency aggregates
         required: true
@@ -56,6 +61,7 @@ env:
   DOCKER_PLATFORM_INPUT: ${{ inputs.docker_platform }}
   TARGET_JOBS_INPUT: ${{ inputs.target_jobs }}
   COMPILER_JOBS_INPUT: ${{ inputs.compiler_jobs }}
+  TEST_JOBS_INPUT: ${{ inputs.test_jobs }}
   ZMK_TEST_PROFILE: ${{ inputs.profile && '1' || '0' }}
 
 jobs:
@@ -80,6 +86,7 @@ jobs:
           if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
           if [ -n "${TARGET_JOBS_INPUT}" ]; then export ZMK_BUILD_JOBS="${TARGET_JOBS_INPUT}"; fi
           if [ -n "${COMPILER_JOBS_INPUT}" ]; then export CMAKE_BUILD_PARALLEL_LEVEL="${COMPILER_JOBS_INPUT}"; fi
+          if [ -n "${TEST_JOBS_INPUT}" ]; then export ZMK_TEST_JOBS="${TEST_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else
@@ -127,6 +134,7 @@ jobs:
           if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
           if [ -n "${TARGET_JOBS_INPUT}" ]; then export ZMK_BUILD_JOBS="${TARGET_JOBS_INPUT}"; fi
           if [ -n "${COMPILER_JOBS_INPUT}" ]; then export CMAKE_BUILD_PARALLEL_LEVEL="${COMPILER_JOBS_INPUT}"; fi
+          if [ -n "${TEST_JOBS_INPUT}" ]; then export ZMK_TEST_JOBS="${TEST_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else
@@ -174,6 +182,7 @@ jobs:
           if [ -n "${DOCKER_PLATFORM_INPUT}" ]; then export ZMK_DOCKER_PLATFORM="${DOCKER_PLATFORM_INPUT}"; fi
           if [ -n "${TARGET_JOBS_INPUT}" ]; then export ZMK_BUILD_JOBS="${TARGET_JOBS_INPUT}"; fi
           if [ -n "${COMPILER_JOBS_INPUT}" ]; then export CMAKE_BUILD_PARALLEL_LEVEL="${COMPILER_JOBS_INPUT}"; fi
+          if [ -n "${TEST_JOBS_INPUT}" ]; then export ZMK_TEST_JOBS="${TEST_JOBS_INPUT}"; fi
           if [ "${BUILD_MODE}" = build ]; then
             bash .github/scripts/check-build-output.sh ci-tests all
           else

@@ -139,6 +139,7 @@ Source processes, build targets and Ninja compilation have separate concurrency:
 | Sources in one local wrapper invocation | `--source-jobs N` / `ZMK_EXTERNAL_SOURCE_JOBS` | 1 source |
 | Targets in each source | `--jobs N` / `ZMK_BUILD_JOBS` | 1 target |
 | Compilation within a target | `CMAKE_BUILD_PARALLEL_LEVEL` via CMake/Ninja | Build-environment default |
+| Independent verification cases | `ZMK_TEST_JOBS` / manual workflow `test_jobs` | 4 cases; `1` selects sequential execution |
 
 For two targets with at most two compiler jobs each, run
 `CMAKE_BUILD_PARALLEL_LEVEL=2 bash build.sh path/to/zmk-config --jobs 2`.
@@ -619,7 +620,7 @@ bash .github/scripts/test.sh all
 | `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module and temporary paths with spaces/Unicode, literal option-like/shell-character/emoji filenames, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
 | `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
 | `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
-| `all` | Run the `shell`, `docker` and `build` layers in that order. |
+| `all` | Run independent shell cases alongside the ordered Docker contracts and firmware chain. |
 
 Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
 Ubuntu. Manual self-hosted `mode=validate` runs `shell` and `docker`;
@@ -673,6 +674,20 @@ source checksums before/after in a fresh `.build/test-<UTC>.XXXXXX/`.
 `ZMK_TEST_RESULTS` can select another new directory outside the repository or
 fully ignored by Git. Existing evidence is never overwritten. Use UTF-8/LF via
 `.gitattributes` and `.editorconfig`; checks preserve the working tree.
+
+`ZMK_TEST_JOBS` bounds concurrent test cases (default `4`, decimal `1` through `16`).
+Set it to `1` for the previous sequential order. The manual self-hosted workflow
+also accepts `test_jobs`; a blank input preserves the runner environment or default.
+Each case has separate logs, timing and completion records; the coordinator merges
+results in the documented case order and checks actual worker exits. Interruption
+stops and awaits owned worker groups before cache cleanup and final publication.
+
+Docker access must pass before cache preparation. Docker contracts precede firmware
+on their shared test cache; overlay and restoration builds retain their required
+order. Independent host cases can overlap that chain. Test-case slots, target jobs
+and compiler jobs are separate: include target jobs times compiler jobs, plus active
+host cases, in one CPU/memory budget. Dependency downloads, configure and link steps
+can still leave CPUs idle. Case timings overlap and must not be summed as wall time.
 
 Source snapshots checksum existing selected files in Git's NUL-delimited order.
 Relative operands start with `./` so option-like filenames remain literal. Batches

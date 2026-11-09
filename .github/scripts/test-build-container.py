@@ -331,7 +331,7 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
         self.assertEqual(inputs['profile']['type'], 'boolean')
         self.assertEqual(inputs['profile']['default'], 'false')
         self.assertEqual(workflow['env']['ZMK_TEST_PROFILE'], "${{ inputs.profile && '1' || '0' }}")
-        for name in ('build_image', 'docker_platform', 'target_jobs', 'compiler_jobs'):
+        for name in ('build_image', 'docker_platform', 'target_jobs', 'compiler_jobs', 'test_jobs'):
             self.assertIn(name, inputs)
             self.assertEqual(inputs[name]['type'], 'string')
             self.assertEqual(inputs[name]['default'], '')
@@ -339,12 +339,13 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
         self.assertEqual(workflow['env']['DOCKER_PLATFORM_INPUT'], '${{ inputs.docker_platform }}')
         self.assertEqual(workflow['env']['TARGET_JOBS_INPUT'], '${{ inputs.target_jobs }}')
         self.assertEqual(workflow['env']['COMPILER_JOBS_INPUT'], '${{ inputs.compiler_jobs }}')
+        self.assertEqual(workflow['env']['TEST_JOBS_INPUT'], '${{ inputs.test_jobs }}')
         folder = self.root / '.github/scripts'
         folder.mkdir(parents=True)
         (folder / 'check-build-output.sh').write_text(
             '#!/usr/bin/env bash\nset -eu\n'
             'printf "%s\\0" "$ZMK_BUILD_IMAGE" "$ZMK_DOCKER_PLATFORM" "$ZMK_BUILD_JOBS" '
-            '"$CMAKE_BUILD_PARALLEL_LEVEL" "$@" >> "$WORKFLOW_CAPTURE"\n')
+            '"$CMAKE_BUILD_PARALLEL_LEVEL" "$ZMK_TEST_JOBS" "$@" >> "$WORKFLOW_CAPTURE"\n')
         calls = self.root / 'calls'
         marker = self.root / 'must-not-execute'
         executions = 0
@@ -367,14 +368,16 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                                    DOCKER_PLATFORM_INPUT=platform, ZMK_BUILD_IMAGE='synthetic.invalid/retained:v1',
                                    ZMK_DOCKER_PLATFORM='linux/arm64', TARGET_JOBS_INPUT=jobs,
                                    COMPILER_JOBS_INPUT=jobs, ZMK_BUILD_JOBS='3',
-                                   CMAKE_BUILD_PARALLEL_LEVEL='4', WORKFLOW_CAPTURE=str(calls))
+                                   CMAKE_BUILD_PARALLEL_LEVEL='4', TEST_JOBS_INPUT=jobs,
+                                   ZMK_TEST_JOBS='5', WORKFLOW_CAPTURE=str(calls))
                         result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
                                                 cwd=self.root, env=env, capture_output=True)
                         self.assertEqual(result.returncode, 0, result.stderr.decode())
                         expected = []
                         for selection in (('all',) if mode == 'build' else ('shell', 'docker')):
                             expected += [supplied or 'synthetic.invalid/retained:v1',
-                                         platform or 'linux/arm64', jobs or '3', jobs or '4', 'ci-tests', selection]
+                                         platform or 'linux/arm64', jobs or '3', jobs or '4',
+                                         jobs or '5', 'ci-tests', selection]
                         actual = calls.read_bytes().decode().split('\0')
                         self.assertEqual(actual, expected + [''])
                         self.assertFalse(marker.exists(), 'input was executed as shell code')
@@ -410,6 +413,7 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                         calls.write_bytes(b'')
                         env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT='',
                                    DOCKER_PLATFORM_INPUT='', TARGET_JOBS_INPUT='', COMPILER_JOBS_INPUT='',
+                                   TEST_JOBS_INPUT='',
                                    PREFLIGHT_STATUS=str(status),
                                    WORKFLOW_CAPTURE=str(calls))
                         result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',

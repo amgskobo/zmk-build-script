@@ -131,6 +131,7 @@ source process、各sourceのtarget、Ninjaによるcompileは、それぞれ別
 | 一つのlocal wrapperから起動するsource | `--source-jobs N` / `ZMK_EXTERNAL_SOURCE_JOBS` | 1 source |
 | 各source内のtarget | `--jobs N` / `ZMK_BUILD_JOBS` | 1 target |
 | 一つのtarget内のcompile | CMake / Ninja 経由の `CMAKE_BUILD_PARALLEL_LEVEL` | build環境の既定値 |
+| 独立した検証 case | `ZMK_TEST_JOBS` / 手動 workflow の `test_jobs` | 4 case。`1` は逐次実行 |
 
 2 target を同時に、それぞれ最大 2 compiler jobs で build する場合は
 `CMAKE_BUILD_PARALLEL_LEVEL=2 bash build.sh path/to/zmk-config --jobs 2` を実行します。
@@ -543,7 +544,7 @@ bash .github/scripts/test.sh all
 | `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白・Unicode 入り target / module / 一時 path、option や shell 構文に見える文字・絵文字を含む literal file 名、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
 | `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
-| `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
+| `all` | 独立した shell case と、順序を保つ Docker 検証・firmware の処理を並行して実行します。 |
 
 hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `docker` と `build` を実行します。
 手動 self-hosted の `mode=validate` は `shell` と `docker`、`mode=build` は選択した各 native host で
@@ -589,6 +590,18 @@ upstream の動く branch に対する互換性確認は、別途明示して実
 実行前後の source checksum を保存します。`ZMK_TEST_RESULTS` で repository 外、または directory 全体を
 Git が ignore する新しい保存先を選べます。既存記録は上書きしません。
 `.gitattributes` / `.editorconfig` の UTF-8 / LF を使い、検証のために working tree を書き換えません。
+
+`ZMK_TEST_JOBS` は同時に実行する test case の上限です（既定 `4`、十進数で `1` から `16`）。
+`1` を指定すると以前の逐次順序で実行します。手動 self-hosted workflow の `test_jobs` でも指定でき、
+空欄では runner の環境変数または既定値を維持します。各 case の log・時間・完了記録を分離し、
+coordinator が worker の実際の終了 status を確認して、規定の case 順に結果をまとめます。
+中断時は所有する worker group の停止と終了を待ち、その後に cache cleanup と最終公開処理を行います。
+
+cache の準備前に Docker access の成功が必要です。同じ test cache を使う Docker 検証の後に firmware を実行し、
+overlay と復元 build の順序も維持します。独立した host case はこの処理と並行できます。
+test case の枠数・target 並列数・compiler 並列数は別です。target 数 × compiler 数と実行中の host case を合わせて、
+1つの CPU / memory 予算に収めます。依存 download・configure・link では CPU が余る場合があります。
+case の時間は重なるため、合計を wall time として扱いません。
 
 source snapshot は Git の NUL 区切りの順序を保ち、選択された既存 file の checksum を取ります。
 相対引数の先頭を `./` にして、option に見える file 名も literal に扱います。

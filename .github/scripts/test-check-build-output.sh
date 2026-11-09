@@ -4,11 +4,16 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 checker="${repo_root}/.github/scripts/check-build-output.sh"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/zmk-output-check.XXXXXX")"
+tmp_dir="$(cd "${tmp_dir}" && pwd -P)"
 case_root="${tmp_dir}/case"
 run_name="run-2026-05-23_00-00-00-ci-zmk-config"
 run_path="${case_root}/.build/${run_name}"
 
 cleanup() {
+  if [ -n "${scheduler_pid:-}" ]; then
+    kill -TERM -- "-${scheduler_pid}" 2>/dev/null || true
+    wait "${scheduler_pid}" 2>/dev/null || true
+  fi
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
@@ -1099,6 +1104,7 @@ case "$1" in
   rev-parse) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
   status|check-ignore) ;;
   --version) printf '%s\n' 'git version synthetic' ;;
+  -c) [ "$#" = 4 ] && [ "$2" = core.autocrlf=false ] && [ "$3" = diff ] && [ "$4" = --check ] ;;
   *) exit 99 ;;
 esac
 EOF
@@ -1275,5 +1281,214 @@ else snapshot_status=$?; fi
 [ "${snapshot_status}" = 23 ]
 grep -qx 'CI exit status: 23' "${snapshot_root}/.build/public/tests-docker.txt"
 echo '[output-contract] bounded checksum/content/order/failure controls passed'
+
+# Real coordinator, synthetic commands: prove independent cases overlap while the
+# Docker chain stays ordered. This does not establish real Docker acceptance.
+scheduler_root="${tmp_dir}/scheduler fixture"
+mkdir -p "${scheduler_root}/.github/scripts" "${scheduler_root}/scripts" "${scheduler_root}/bin" "${scheduler_root}/trace"
+scheduler_root="$(cd "${scheduler_root}" && pwd -P)"
+cp "${repo_root}/.github/scripts/test.sh" "${checker}" "${scheduler_root}/.github/scripts/"
+cp "${snapshot_root}/bin/git" "${scheduler_root}/bin/"
+cat > "${scheduler_root}/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  volume)
+    case "$2" in
+      inspect) exit 1 ;;
+      create) ;;
+      rm)
+        for file in "${SCHEDULER_TRACE}"/*.pid; do
+          [ -f "${file}" ] || continue
+          IFS= read -r child < "${file}" || exit 99
+          if kill -0 "${child}" 2>/dev/null; then
+            : > "${SCHEDULER_TRACE}/unsafe-cache-cleanup"; exit 99
+          fi
+        done
+        : > "${SCHEDULER_TRACE}/cache-cleaned"
+        exit "${SCHEDULER_CACHE_FAIL:-0}" ;;
+      *) exit 99 ;;
+    esac ;;
+  --version|version) printf '%s\n' 'Docker synthetic' ;;
+  image) printf '{}\n' ;;
+  *) exit 99 ;;
+esac
+EOF
+chmod +x "${scheduler_root}/bin/docker"
+cat > "${scheduler_root}/scripts/observe.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+name="$1"
+trap 'printf "%s\n" "$?" > "${SCHEDULER_TRACE}/${name}.cleanup"' EXIT
+printf '%s\n' "$$" > "${SCHEDULER_TRACE}/${name}.pid"
+: > "${SCHEDULER_TRACE}/${name}.started"
+case "${SCHEDULER_CASE_MODE:-overlap}:${name}" in
+  overlap:host-contract) peer=docker-contract ;;
+  overlap:docker-contract) peer=host-contract ;;
+  *) peer= ;;
+esac
+if [ -n "${peer}" ]; then
+  attempt=0
+  while [ ! -f "${SCHEDULER_TRACE}/${peer}.started" ]; do
+    attempt=$((attempt + 1))
+    if [ "${attempt}" -ge 30 ]; then
+      echo 'independent verification cases did not overlap' >&2; exit 1
+    fi
+    sleep 1
+  done
+fi
+if [ "${SCHEDULER_CASE_MODE:-}" = serial ]; then
+  for file in "${SCHEDULER_TRACE}"/*.started; do
+    [ "${file}" = "${SCHEDULER_TRACE}/${name}.started" ] || [ -f "${file%.started}.ended" ] || {
+      echo 'serial test budget overlapped cases' >&2; exit 1
+    }
+  done
+fi
+case "${name}" in
+  docker-contract)
+    [ -f "${SCHEDULER_TRACE}/tools.ended" ]
+    [ "${ZMK_TEST_PROFILE:-0}" != 1 ] || printf 'probe-docker-exec\t0\t5\t0.125\n' >> "${ZMK_TEST_RESULTS}/profile.tsv" ;;
+  firmware) [ -f "${SCHEDULER_TRACE}/docker-contract.ended" ] ;;
+esac
+case "${SCHEDULER_CASE_MODE:-}:${name}" in
+  cap:host-contract|cap:output-contract|cap:external-contract|signal:host-contract|signal:docker-contract)
+    attempt=0
+    while [ ! -f "${SCHEDULER_TRACE}/${name}.release" ]; do
+      attempt=$((attempt + 1)); [ "${attempt}" -lt 30 ] || exit 99
+      sleep 1
+    done ;;
+  missing:external-contract) kill -KILL "${PPID}"; exit 0 ;;
+  tools-failure:tools) exit 23 ;;
+esac
+: > "${SCHEDULER_TRACE}/${name}.ended"
+[ "${SCHEDULER_CASE_MODE:-}:${name}" != failure:external-contract ] || exit 23
+EOF
+for entry in check-lf:lf test-check-lf:lf-contract test-check-build-output:output-contract \
+    test-auto-build-external:external-contract check-runner-tools:tools test-build-fixtures:firmware; do
+  printf '#!/usr/bin/env bash\nexec bash scripts/observe.sh %s\n' "${entry#*:}" \
+    > "${scheduler_root}/.github/scripts/${entry%:*}.sh"
+done
+cat > "${scheduler_root}/.github/scripts/test-build.sh" <<'EOF'
+#!/usr/bin/env bash
+exec bash scripts/observe.sh "$1-contract"
+EOF
+cat > "${scheduler_root}/build.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${ZMK_IN_CONTAINER:-0}" in 1) name=container-help ;; *) name=host-help ;; esac
+exec bash scripts/observe.sh "${name}"
+EOF
+if ! (cd "${scheduler_root}"; PATH="${scheduler_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= \
+    ZMK_TEST_JOBS=2 ZMK_TEST_PROFILE=1 SCHEDULER_TRACE="${scheduler_root}/trace" \
+    ZMK_TEST_RESULTS="${scheduler_root}/.build/overlap" bash .github/scripts/test.sh all) \
+    > "${tmp_dir}/scheduler-overlap.log" 2>&1; then
+  cat "${tmp_dir}/scheduler-overlap.log" >&2
+  echo 'independent verification overlap control failed' >&2; exit 1
+fi
+bash "${checker}" timings all "${scheduler_root}/.build/overlap/profile.tsv" > "${tmp_dir}/scheduler-timings"
+[ "$(wc -l < "${tmp_dir}/scheduler-timings" | tr -d '[:space:]')" = 19 ]
+echo '[output-contract] independent verification overlap/order control passed'
+
+printf '%s\n' syntax lf whitespace lf-contract output-contract external-contract host-contract \
+  host-help container-help tools docker-contract firmware > "${tmp_dir}/scheduler-expected-order"
+assert_scheduler_order() {
+  awk -F '\t' 'NR>1 {print $1}' "$1/results.tsv" > "${tmp_dir}/scheduler-actual-order"
+  cmp "${tmp_dir}/scheduler-expected-order" "${tmp_dir}/scheduler-actual-order"
+}
+assert_scheduler_order "${scheduler_root}/.build/overlap"
+scheduler_run() {
+  local label="$1" budget="$2" scenario="$3" expected="$4" status
+  mkdir "${scheduler_root}/trace-${label}"
+  if (cd "${scheduler_root}" || exit "$?"
+      export PATH="${scheduler_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=0
+      export SCHEDULER_TRACE="${scheduler_root}/trace-${label}" SCHEDULER_CASE_MODE="${scenario}"
+      export ZMK_TEST_RESULTS="${scheduler_root}/.build/${label}"
+      if [ "${budget}" = default ]; then unset ZMK_TEST_JOBS; else export ZMK_TEST_JOBS="${budget}"; fi
+      bash .github/scripts/test.sh all) > "${tmp_dir}/scheduler-${label}.log" 2>&1; then status=0; else status=$?; fi
+  if [ "${status}" != "${expected}" ]; then
+    cat "${tmp_dir}/scheduler-${label}.log" >&2
+    echo 'scheduler returned an unexpected exit status' >&2; exit 1
+  fi
+  assert_scheduler_order "${scheduler_root}/.build/${label}"
+  [ ! -e "${scheduler_root}/trace-${label}/unsafe-cache-cleanup" ]
+}
+scheduler_run serial 0001 serial 0
+grep -qx 'Test jobs: 1' "${scheduler_root}/.build/serial/environment.txt"
+scheduler_run default default plain 0
+grep -qx 'Test jobs: 4' "${scheduler_root}/.build/default/environment.txt"
+scheduler_run failure 16 failure 1
+grep -q $'^external-contract\tFAIL(23)\t' "${scheduler_root}/.build/failure/results.tsv"
+scheduler_run missing 2 missing 1
+grep -q $'^external-contract\tFAIL(137)\t' "${scheduler_root}/.build/missing/results.tsv"
+grep -q 'external-contract: missing or invalid completion record' "${tmp_dir}/scheduler-missing.log"
+
+mkdir "${scheduler_root}/trace-tools-failure"
+if (cd "${scheduler_root}"; PATH="${scheduler_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= \
+    ZMK_TEST_JOBS=4 ZMK_TEST_PROFILE=0 SCHEDULER_CASE_MODE=tools-failure \
+    SCHEDULER_TRACE="${scheduler_root}/trace-tools-failure" ZMK_TEST_RESULTS="${scheduler_root}/.build/tools-failure" \
+    bash .github/scripts/test.sh all) > "${tmp_dir}/scheduler-tools-failure.log" 2>&1; then exit 1; else snapshot_status=$?; fi
+[ "${snapshot_status}" = 1 ]
+grep -q $'^tools\tFAIL(23)\t' "${scheduler_root}/.build/tools-failure/results.tsv"
+grep -qx $'docker-dependent\tBLOCKED(tools)\t0' "${scheduler_root}/.build/tools-failure/results.tsv"
+awk -F '\t' 'NR>1 && $2=="PASS" {n++} END {exit n!=9}' "${scheduler_root}/.build/tools-failure/results.tsv"
+[ ! -e "${scheduler_root}/trace-tools-failure/docker-contract.started" ]
+[ ! -e "${scheduler_root}/trace-tools-failure/firmware.started" ]
+
+scheduler_wait_marker() {
+  local attempt=0
+  while [ ! -f "$1" ]; do
+    attempt=$((attempt + 1))
+    [ "${attempt}" -lt 30 ] || { echo 'scheduler marker did not arrive' >&2; exit 1; }
+    sleep 1
+  done
+}
+scheduler_start() {
+  local label="$1" scenario="$2" cache_status="${3:-0}" monitor=0
+  mkdir "${scheduler_root}/trace-${label}"
+  case $- in *m*) monitor=1 ;; esac
+  set -m
+  (cd "${scheduler_root}" || exit "$?"
+    PATH="${scheduler_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_JOBS=2 ZMK_TEST_PROFILE=0 \
+      SCHEDULER_CASE_MODE="${scenario}" SCHEDULER_TRACE="${scheduler_root}/trace-${label}" \
+      SCHEDULER_CACHE_FAIL="${cache_status}" ZMK_TEST_RESULTS="${scheduler_root}/.build/${label}" \
+      exec bash .github/scripts/test.sh "${SCHEDULER_TEST_MODE:-all}") > "${tmp_dir}/scheduler-${label}.log" 2>&1 &
+  scheduler_pid=$!
+  [ "${monitor}" = 1 ] || set +m
+}
+SCHEDULER_TEST_MODE=shell scheduler_start cap cap
+scheduler_wait_marker "${scheduler_root}/trace-cap/host-contract.started"
+scheduler_wait_marker "${scheduler_root}/trace-cap/output-contract.started"
+[ ! -e "${scheduler_root}/trace-cap/external-contract.started" ]
+: > "${scheduler_root}/trace-cap/output-contract.release"
+scheduler_wait_marker "${scheduler_root}/trace-cap/external-contract.started"
+[ ! -e "${scheduler_root}/trace-cap/host-contract.ended" ]
+: > "${scheduler_root}/trace-cap/host-contract.release"
+: > "${scheduler_root}/trace-cap/external-contract.release"
+wait "${scheduler_pid}"; scheduler_pid=
+
+for signal in TERM INT; do
+  case "${signal}" in TERM) expected=143; cache_status=0 ;; INT) expected=130; cache_status=23 ;; esac
+  scheduler_start "signal-${signal}" signal "${cache_status}"
+  scheduler_wait_marker "${scheduler_root}/trace-signal-${signal}/host-contract.started"
+  scheduler_wait_marker "${scheduler_root}/trace-signal-${signal}/docker-contract.started"
+  kill -"${signal}" "${scheduler_pid}"
+  if wait "${scheduler_pid}"; then snapshot_status=0; else snapshot_status=$?; fi
+  scheduler_pid=
+  [ "${snapshot_status}" = "${expected}" ]
+  grep -qx "CI exit status: ${expected}" "${scheduler_root}/.build/public/tests-all.txt"
+  for name in host-contract docker-contract; do
+    test -f "${scheduler_root}/trace-signal-${signal}/${name}.cleanup"
+  done
+  test -f "${scheduler_root}/trace-signal-${signal}/cache-cleaned"
+  [ ! -e "${scheduler_root}/trace-signal-${signal}/unsafe-cache-cleanup" ]
+done
+number=0
+for budget in '' 0 00 -1 1.5 17 999999999999999 '$(exit 99)'; do
+  number=$((number + 1))
+  if (cd "${scheduler_root}"; ZMK_TEST_JOBS="${budget}" ZMK_TEST_RESULTS="${scheduler_root}/.build/invalid-${number}" \
+      bash .github/scripts/test.sh shell) > "${tmp_dir}/scheduler-invalid.log" 2>&1; then exit 1; else snapshot_status=$?; fi
+  [ "${snapshot_status}" = 2 ]
+  grep -qx 'ZMK_TEST_JOBS must be an integer from 1 to 16.' "${tmp_dir}/scheduler-invalid.log"
+  [ ! -e "${scheduler_root}/.build/invalid-${number}" ]
+done
+echo '[output-contract] scheduler budgets/refill/order/failure/interruption controls passed'
 
 echo "check-build-output.sh behavior tests passed."
