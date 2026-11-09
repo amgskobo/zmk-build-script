@@ -56,11 +56,24 @@ record_profile() {
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${duration}" >> "${result_dir}/profile.tsv"
 }
 source_identity() {
-  local file
-  git ls-files -z --cached --others --exclude-standard > "${result_dir}/file-list"
+  local file operand count=0 bytes=0
+  local LC_ALL=C
+  local batch=()
+  git ls-files -z --cached --others --exclude-standard > "${result_dir}/file-list" || return "$?"
   while IFS= read -r -d '' file; do
-    [ ! -f "${file}" ] || cksum "${file}"
+    [ -f "${file}" ] || continue
+    operand="./${file}"
+    # Keep native Windows argv small; a single long operand retains its own limit.
+    if [ "${count}" -gt 0 ] && { [ "${count}" -ge 16 ] ||
+        [ "$((bytes + ${#operand} + 1))" -gt 1024 ]; }; then
+      cksum "${batch[@]}" || return "$?"
+      batch=(); count=0; bytes=0
+    fi
+    batch+=("${operand}")
+    count=$((count + 1)); bytes=$((bytes + ${#operand} + 1))
   done < "${result_dir}/file-list"
+  if [ "${count}" -gt 0 ]; then cksum "${batch[@]}" || return "$?"; fi
+  return 0
 }
 if [ "${profile}" = 1 ]; then
   { time source_identity > "${result_dir}/source-before.txt" 2> "${result_dir}/source-before.log"; } 2> "${result_dir}/source-before.time"

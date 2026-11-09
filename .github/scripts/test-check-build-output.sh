@@ -1093,7 +1093,8 @@ cat > "${snapshot_root}/bin/git" <<'EOF'
 case "$1" in
   ls-files)
     echo 'synthetic-private-host /synthetic/private snapshot warning' >&2
-    printf '%s\0' .github/scripts/test.sh .github/scripts/check-build-output.sh .github/scripts/check-runner-tools.sh .github/scripts/test-build.sh
+    if [ -n "${SNAPSHOT_FILE_LIST:-}" ]; then cat "${SNAPSHOT_FILE_LIST}"
+    else printf '%s\0' .github/scripts/test.sh .github/scripts/check-build-output.sh .github/scripts/check-runner-tools.sh .github/scripts/test-build.sh; fi
     exit "${SNAPSHOT_GIT_EXIT:-0}" ;;
   rev-parse) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
   status|check-ignore) ;;
@@ -1112,16 +1113,27 @@ esac
 EOF
 cat > "${snapshot_root}/.github/scripts/check-runner-tools.sh" <<'EOF'
 #!/usr/bin/env bash
+[ "${SNAPSHOT_MUTATE_OPTION:-0}" != 1 ] || printf 'changed\n' > ./--help
 printf 'snapshot tools control\n'
 EOF
 cat > "${snapshot_root}/.github/scripts/test-build.sh" <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = docker ] || exit 99
-printf 'probe-docker-exec\t0\t5\t0.125\n' >> "${ZMK_TEST_RESULTS}/profile.tsv"
+[ "${ZMK_TEST_PROFILE:-0}" != 1 ] || printf 'probe-docker-exec\t0\t5\t0.125\n' >> "${ZMK_TEST_RESULTS}/profile.tsv"
 printf 'snapshot Docker dispatcher control\n'
 EOF
-chmod +x "${snapshot_root}/bin/git" "${snapshot_root}/bin/docker"
+cat > "${snapshot_root}/bin/cksum" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${SNAPSHOT_CHECKSUM_CALLS:-}" ]; then
+  { printf '%s\0' "$#"; printf '%s\0' "$@"; } >> "${SNAPSHOT_CHECKSUM_CALLS}"
+fi
+"${SNAPSHOT_REAL_CKSUM}" "$@" || exit "$?"
+exit "${SNAPSHOT_CHECKSUM_EXIT:-0}"
+EOF
+snapshot_real_cksum="$(command -v cksum)"
+chmod +x "${snapshot_root}/bin/git" "${snapshot_root}/bin/docker" "${snapshot_root}/bin/cksum"
 (cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=1 \
+  SNAPSHOT_REAL_CKSUM="${snapshot_real_cksum}" SNAPSHOT_CHECKSUM_CALLS="${tmp_dir}/snapshot-checksum.calls" \
   ZMK_TEST_RESULTS="${snapshot_root}/.build/results" bash .github/scripts/test.sh docker) \
   > "${tmp_dir}/snapshot-capture.log" 2>&1
 if ! bash "${checker}" timings docker "${snapshot_root}/.build/results/profile.tsv" > "${tmp_dir}/snapshot-timings"; then
@@ -1147,5 +1159,121 @@ if ! grep -qx 'CI exit status: 23' "${snapshot_root}/.build/public/tests-docker.
 fi
 [ ! -e "${snapshot_root}/.build/failed-results/source-after.txt" ]
 echo '[output-contract] snapshot warning/failure controls passed'
+
+# Literal option-like inputs must participate in the source drift check.
+printf '%s\0' .github/scripts/test.sh .github/scripts/check-build-output.sh .github/scripts/check-runner-tools.sh \
+  .github/scripts/test-build.sh --help > "${tmp_dir}/snapshot-option.files"
+printf 'initial\n' > "${snapshot_root}/--help"
+if (cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=0 \
+    SNAPSHOT_FILE_LIST="${tmp_dir}/snapshot-option.files" SNAPSHOT_REAL_CKSUM="${snapshot_real_cksum}" \
+    SNAPSHOT_MUTATE_OPTION=1 ZMK_TEST_RESULTS="${snapshot_root}/.build/option-results" \
+    bash .github/scripts/test.sh docker) > "${tmp_dir}/snapshot-option.log" 2>&1; then
+  if [ -n "${ZMK_TEST_ARTIFACT_DIR:-}" ]; then
+    mkdir -p "${ZMK_TEST_ARTIFACT_DIR}"
+    cp "${tmp_dir}/snapshot-checksum.calls" "${tmp_dir}/snapshot-option.log" \
+      "${snapshot_root}/.build/option-results/source-before.txt" "${snapshot_root}/.build/option-results/source-after.txt" \
+      "${ZMK_TEST_ARTIFACT_DIR}/"
+  fi
+  echo 'option-like source mutation was ignored' >&2; exit 1
+else snapshot_status=$?; fi
+[ "${snapshot_status}" = 1 ]
+grep -q 'Source changed during verification' "${tmp_dir}/snapshot-option.log"
+
+assert_checksum_calls() {
+  local receipt="$1" expected="$2" budget="$3" count= argument= number bytes calls=0
+  local LC_ALL=C
+  : > "${tmp_dir}/snapshot-observed-argv"
+  while IFS= read -r -d '' count; do
+    case "${count}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${count}" -gt 0 ] && [ "${count}" -le 16 ] || return 1
+    calls=$((calls + 1)); bytes=0
+    for ((number=0; number<count; number++)); do
+      IFS= read -r -d '' argument || return 1
+      bytes=$((bytes + ${#argument} + 1))
+      printf '%s\0' "${argument}" >> "${tmp_dir}/snapshot-observed-argv"
+    done
+    [ "${bytes}" -le 1024 ] || [ "${count}" = 1 ] || return 1
+  done < "${receipt}"
+  [ -z "${count}" ] && [ "${calls}" = "${budget}" ] || return 1
+  cmp "${expected}" "${tmp_dir}/snapshot-observed-argv"
+}
+for side in before after; do
+  printf '%s\0' ./.github/scripts/test.sh ./.github/scripts/check-build-output.sh \
+    ./.github/scripts/check-runner-tools.sh ./.github/scripts/test-build.sh
+done > "${tmp_dir}/snapshot-basic-argv"
+assert_checksum_calls "${tmp_dir}/snapshot-checksum.calls" "${tmp_dir}/snapshot-basic-argv" 2
+
+# Empty and single eligible selections also exercise Bash 3.2 array guards.
+for selection in empty single; do
+  if [ "${selection}" = empty ]; then
+    printf '%s\0' deleted-source.txt > "${tmp_dir}/snapshot-edge.files"
+    : > "${tmp_dir}/snapshot-edge-expected.txt"
+    : > "${tmp_dir}/snapshot-edge-argv"
+    snapshot_call_budget=0
+  else
+    printf '%s\0' --help > "${tmp_dir}/snapshot-edge.files"
+    checksum="$("${snapshot_real_cksum}" < "${snapshot_root}/--help")"
+    printf '%s ./--help\n' "${checksum}" > "${tmp_dir}/snapshot-edge-expected.txt"
+    printf '%s\0' ./--help ./--help > "${tmp_dir}/snapshot-edge-argv"
+    snapshot_call_budget=2
+  fi
+  : > "${tmp_dir}/snapshot-edge.calls"
+  (cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=0 \
+    SNAPSHOT_FILE_LIST="${tmp_dir}/snapshot-edge.files" SNAPSHOT_REAL_CKSUM="${snapshot_real_cksum}" \
+    SNAPSHOT_CHECKSUM_CALLS="${tmp_dir}/snapshot-edge.calls" ZMK_TEST_RESULTS="${snapshot_root}/.build/${selection}-results" \
+    bash .github/scripts/test.sh docker) > "${tmp_dir}/snapshot-${selection}.log" 2>&1
+  for side in before after; do
+    cmp "${tmp_dir}/snapshot-edge-expected.txt" "${snapshot_root}/.build/${selection}-results/source-${side}.txt"
+  done
+  assert_checksum_calls "${tmp_dir}/snapshot-edge.calls" "${tmp_dir}/snapshot-edge-argv" "${snapshot_call_budget}"
+done
+
+# Count and byte boundaries, a remainder, literal operands and a deleted selection.
+cp "${tmp_dir}/snapshot-option.files" "${tmp_dir}/snapshot-batch.files"
+for file in 'source with spaces 名前.txt' 'literal $() ; &.txt'; do
+  printf 'payload\n\r\000\032\377\n' > "${snapshot_root}/${file}"
+  printf '%s\0' "${file}" >> "${tmp_dir}/snapshot-batch.files"
+done
+for ((number=1; number<=9; number++)); do
+  file="checksum-short-${number}.txt"
+  printf 'payload %s\n' "${number}" > "${snapshot_root}/${file}"
+  printf '%s\0' "${file}" >> "${tmp_dir}/snapshot-batch.files"
+done
+printf -v snapshot_padding '%100s' ''; snapshot_padding="${snapshot_padding// /x}"
+for ((number=1; number<=12; number++)); do
+  file="checksum-long-${number}-${snapshot_padding}.txt"
+  printf 'long payload %s\n' "${number}" > "${snapshot_root}/${file}"
+  printf '%s\0' "${file}" >> "${tmp_dir}/snapshot-batch.files"
+done
+printf '%s\0' deleted-source.txt >> "${tmp_dir}/snapshot-batch.files"
+: > "${tmp_dir}/snapshot-batch.calls"
+(cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=0 \
+  SNAPSHOT_FILE_LIST="${tmp_dir}/snapshot-batch.files" SNAPSHOT_REAL_CKSUM="${snapshot_real_cksum}" \
+  SNAPSHOT_CHECKSUM_CALLS="${tmp_dir}/snapshot-batch.calls" ZMK_TEST_RESULTS="${snapshot_root}/.build/batch-results" \
+  bash .github/scripts/test.sh docker) > "${tmp_dir}/snapshot-batch.log" 2>&1
+: > "${tmp_dir}/snapshot-expected.txt"
+while IFS= read -r -d '' file; do
+  [ -f "${snapshot_root}/${file}" ] || continue
+  checksum="$("${snapshot_real_cksum}" < "${snapshot_root}/${file}")"
+  printf '%s ./%s\n' "${checksum}" "${file}" >> "${tmp_dir}/snapshot-expected.txt"
+done < "${tmp_dir}/snapshot-batch.files"
+for side in before after; do
+  cmp "${tmp_dir}/snapshot-expected.txt" "${snapshot_root}/.build/batch-results/source-${side}.txt"
+done
+for side in before after; do
+  while IFS= read -r -d '' file; do
+    [ ! -f "${snapshot_root}/${file}" ] || printf './%s\0' "${file}"
+  done < "${tmp_dir}/snapshot-batch.files"
+done > "${tmp_dir}/snapshot-batch-argv"
+assert_checksum_calls "${tmp_dir}/snapshot-batch.calls" "${tmp_dir}/snapshot-batch-argv" 6
+if (cd "${snapshot_root}"; PATH="${snapshot_root}/bin:${PATH}" ZMK_DOCKER_CACHE_VOLUME= ZMK_TEST_PROFILE=0 \
+    SNAPSHOT_FILE_LIST="${tmp_dir}/snapshot-batch.files" SNAPSHOT_REAL_CKSUM="${snapshot_real_cksum}" \
+    SNAPSHOT_CHECKSUM_EXIT=23 ZMK_TEST_RESULTS="${snapshot_root}/.build/checksum-failed-results" \
+    bash .github/scripts/test.sh docker) > "${tmp_dir}/snapshot-checksum-failure.log" 2>&1; then
+  echo 'checksum producer failure was accepted' >&2; exit 1
+else snapshot_status=$?; fi
+[ "${snapshot_status}" = 23 ]
+grep -qx 'CI exit status: 23' "${snapshot_root}/.build/public/tests-docker.txt"
+echo '[output-contract] bounded checksum/content/order/failure controls passed'
 
 echo "check-build-output.sh behavior tests passed."

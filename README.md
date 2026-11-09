@@ -621,6 +621,13 @@ bash .github/scripts/test.sh all
 | `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run the `shell`, `docker` and `build` layers in that order. |
 
+Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
+Ubuntu. Manual self-hosted `mode=validate` runs `shell` and `docker`;
+`mode=build` runs `all` on each selected native host. Use the latter for native
+Docker firmware coverage: a shell or validate result alone does not establish it.
+Retain the copy, parser, workspace/overlay recovery, cancellation, artifact and
+publication controls even when they share fixtures across layers.
+
 Artifact tests separate large-list byte pressure and large-count validation from
 per-file import checks. Single and multiple real imports, incomplete-count rejection
 and producer-drain controls remain mandatory without repeating identical copies
@@ -666,6 +673,12 @@ source checksums before/after in a fresh `.build/test-<UTC>.XXXXXX/`.
 `ZMK_TEST_RESULTS` can select another new directory outside the repository or
 fully ignored by Git. Existing evidence is never overwritten. Use UTF-8/LF via
 `.gitattributes` and `.editorconfig`; checks preserve the working tree.
+
+Source snapshots checksum existing selected files in Git's NUL-delimited order.
+Relative operands start with `./` so option-like filenames remain literal. Batches
+are bounded by argument count and bytes to reduce native process startup while
+keeping Windows command lines small. Empty/single/remainder, content/order and
+producer-failure controls retain the drift check's coverage.
 
 Set `ZMK_TEST_PROFILE=1` for optional case/source-check timings and small latency
 probes for Bash/Git launches, 100 file writes/reads and Docker client/exec calls.

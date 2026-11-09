@@ -545,6 +545,13 @@ bash .github/scripts/test.sh all
 | `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
 
+hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `docker` と `build` を実行します。
+手動 self-hosted の `mode=validate` は `shell` と `docker`、`mode=build` は選択した各 native host で
+`all` を実行します。native Docker で firmware まで確認するときは後者を使います。
+shell または validate の成功だけでは、その確認にはなりません。
+層をまたいで fixture を共有していても、copy・parser・workspace / overlay の復旧・中断・成果物・公開の
+対照試験は維持します。
+
 成果物の検証では、大量 list の byte 数・大きな件数の検証と、file ごとの import 検証を分けます。
 単体・複数 file の実 import、件数不一致の拒否、producer を読み切る対照試験は維持し、
 同じ copy を数百回繰り返す負担を減らします。
@@ -582,6 +589,11 @@ upstream の動く branch に対する互換性確認は、別途明示して実
 実行前後の source checksum を保存します。`ZMK_TEST_RESULTS` で repository 外、または directory 全体を
 Git が ignore する新しい保存先を選べます。既存記録は上書きしません。
 `.gitattributes` / `.editorconfig` の UTF-8 / LF を使い、検証のために working tree を書き換えません。
+
+source snapshot は Git の NUL 区切りの順序を保ち、選択された既存 file の checksum を取ります。
+相対引数の先頭を `./` にして、option に見える file 名も literal に扱います。
+引数の件数と byte 数で batch の上限を設け、Windows の command line を小さく保ちながら native process の
+起動を減らします。空・単体・端数、内容と順序、producer 失敗の対照試験で変更検出の範囲を維持します。
 
 `ZMK_TEST_PROFILE=1` で case / source check の時間と、Bash / Git 起動、100 file の書き込み / 読み込み、
 Docker client / exec 呼び出しの少数回の latency probe を追加できます。手動 workflow の `profile` も
