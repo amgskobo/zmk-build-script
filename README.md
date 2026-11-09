@@ -677,6 +677,12 @@ container and are included in the Docker case time. Probes are samples rather th
 complete command accounting; nested timings must not be added together. Profiled
 runs include measurement/probe overhead and are separate from normal benchmarks.
 
+If post-test timing validation fails, the publication
+report records a failed CI outcome even when all behavioral cases passed. Diagnostics expose
+only a fixed rejection reason and a recognized metric name; invalid values stay private.
+Byte checks drain their producer, propagate its failures and cross-check the complete report's byte count.
+An unfinished outcome replacement blocks publication until it is finalized or cleared.
+
 Tests create and remove a dedicated cache by default. An explicitly supplied
 `ZMK_DOCKER_CACHE_VOLUME` is reused and retained; never use a production cache.
 `ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while

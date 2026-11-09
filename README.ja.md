@@ -591,6 +591,11 @@ Docker exec probe は取得済みの validate container を再利用し、その
 probe は一部の呼び出しを測るもので、全 command の内訳ではありません。入れ子の時間を加算せず、
 計測 / probe の負担を含む実行として通常の benchmark と区別します。
 
+test 後の計測データ検査で失敗した場合は、すべての動作検証が PASS でも公開レポートの CI 結果を FAILED にします。
+診断には固定の拒否理由と既知の metric 名だけを表示し、不正な値は非公開で保持します。
+byte の検査は producer を最後まで読み、終了時の失敗と report 全体の byte 数の不一致も拒否します。
+結果の置き換えが完了していない場合は、確定または clear されるまで公開を拒否します。
+
 test cache は既定で専用 volume を作り、終了時に削除します。`ZMK_DOCKER_CACHE_VOLUME` を明示した場合は
 再利用・保持します。production cache は指定しません。`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
 復元検証では保持します。各 build / validate の直後に、その run を明示して output check を実行します。

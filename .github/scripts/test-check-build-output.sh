@@ -851,6 +851,11 @@ cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
 set -euo pipefail
 mkdir "${ZMK_TEST_RESULTS}"
 cp "${TIMING_FIXTURE}" "${ZMK_TEST_RESULTS}/profile.tsv"
+printf 'case\tstatus\tseconds\n' > "${ZMK_TEST_RESULTS}/results.tsv"
+for label in syntax lf whitespace lf-contract output-contract external-contract host-contract host-help container-help; do
+  printf '%s\tPASS\t1\n' "${label}" >> "${ZMK_TEST_RESULTS}/results.tsv"
+done
+bash .github/scripts/check-build-output.sh publish "tests-$1" "${PUBLIC_PROBE_EXIT}" "${ZMK_TEST_RESULTS}"
 echo 'synthetic-private-host /synthetic/private secret=value'
 exit "${PUBLIC_PROBE_EXIT}"
 EOF
@@ -867,6 +872,58 @@ if (cd "${ci_root}"; ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 TIMING_FIXTURE="${tmp_
   echo 'CI accepted invalid timing publication' >&2; exit 1
 fi
 if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+if ! grep -qx 'Outcome: FAILED' "${ci_root}/.build/public/tests-shell.txt" ||
+    ! grep -qx 'CI exit status: 1' "${ci_root}/.build/public/tests-shell.txt"; then
+  echo 'timing validation failure left a successful publication report' >&2; exit 1
+fi
+(cd "${ci_root}"; bash .github/scripts/check-build-output.sh publish verify)
+
+# Rejection diagnostics identify a fixed reason and a recognized metric only.
+awk 'BEGIN {FS=OFS="\t"} NR==2 {$4="synthetic-private-host /synthetic/private secret=value"} {print}' \
+  "${timing_fixture}" > "${tmp_dir}/timing-private-duration.tsv"
+if (cd "${ci_root}"; ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 TIMING_FIXTURE="${tmp_dir}/timing-private-duration.tsv" \
+    PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/profile-ci-console" 2>&1; then
+  echo 'CI accepted an invalid duration' >&2; exit 1
+fi
+grep -qx 'Profile report validation failed (reason=duration metric=source-before); detailed evidence remains private.' \
+  "${tmp_dir}/profile-ci-console"
+if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+grep -qx 'Outcome: FAILED' "${ci_root}/.build/public/tests-shell.txt"
+
+# A failed replacement must block publication of the producer's earlier SUCCESS.
+publication_bin="${tmp_dir}/publication-bin"
+mkdir "${publication_bin}"
+cat > "${publication_bin}/mv" <<'EOF'
+#!/usr/bin/env bash
+for argument do destination="${argument}"; done
+if [ "${destination}" = .build/public/tests-shell.txt ]; then
+  if [ -e "${PROFILE_PUBLICATION_MOVED}" ]; then
+    echo 'synthetic-private-host /synthetic/private secret=value' >&2
+    exit 23
+  fi
+  : > "${PROFILE_PUBLICATION_MOVED}"
+fi
+exec "${PROFILE_REAL_MV}" "$@"
+EOF
+chmod +x "${publication_bin}/mv"
+publication_real_mv="$(command -v mv)"
+if (cd "${ci_root}"; PATH="${publication_bin}:${PATH}" PROFILE_REAL_MV="${publication_real_mv}" \
+    PROFILE_PUBLICATION_MOVED="${tmp_dir}/publication-moved" ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 \
+    TIMING_FIXTURE="${tmp_dir}/timing-private-duration.tsv" PUBLIC_PROBE_EXIT=0 \
+    bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/profile-ci-console" 2>&1; then
+  echo 'CI accepted a failed outcome replacement' >&2; exit 1
+fi
+grep -qx 'Outcome: SUCCESS' "${ci_root}/.build/public/tests-shell.txt"
+if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh publish verify) > "${tmp_dir}/publication-guard.log" 2>&1; then
+  echo 'publication accepted an unfinalized profiling outcome' >&2; exit 1
+fi
+grep -qx 'Publication status was not finalized.' "${tmp_dir}/publication-guard.log"
+if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+IFS= read -r saved_source_status < "${ci_root}/.build/ci-source.status"
+IFS= read -r saved_source_record < "${ci_root}/.build/ci-source.record"
+(cd "${ci_root}"; bash .github/scripts/check-build-output.sh publish clear)
+printf '%s\n' "${saved_source_status}" > "${ci_root}/.build/ci-source.status"
+printf '%s\n' "${saved_source_record}" > "${ci_root}/.build/ci-source.record"
 
 # A rejected existing result directory cannot turn old measurements into a fresh run.
 mkdir "${ci_root}/.build/old-profile"
@@ -879,12 +936,12 @@ fi
 if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
 profile_bin="${tmp_dir}/profile-bin"
 mkdir "${profile_bin}"
-cat > "${profile_bin}/tr" <<'EOF'
+cat > "${profile_bin}/od" <<'EOF'
 #!/usr/bin/env bash
 echo 'synthetic-private-host /synthetic/private secret=value' >&2
 exit 23
 EOF
-chmod +x "${profile_bin}/tr"
+chmod +x "${profile_bin}/od"
 if (cd "${ci_root}"; PATH="${profile_bin}:${PATH}" ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 \
     TIMING_FIXTURE="${timing_fixture}" PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-tests shell) \
     > "${tmp_dir}/profile-ci-console" 2>&1; then
@@ -893,6 +950,35 @@ fi
 if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
 grep -l 'synthetic-private-host' "${ci_root}"/.build/ci-execution.*/timing-validation.log > "${tmp_dir}/private-validation-log"
 [ -s "${tmp_dir}/private-validation-log" ]
+
+# A byte producer can fail after complete-looking output; its exit still matters.
+profile_real_byte_tool="$(command -v od)"
+cat > "${profile_bin}/od" <<'EOF'
+#!/usr/bin/env bash
+"${PROFILE_REAL_BYTE_TOOL}" "$@" || exit "$?"
+echo 'synthetic-private-host /synthetic/private secret=value' >&2
+exit 23
+EOF
+if (cd "${ci_root}"; PATH="${profile_bin}:${PATH}" PROFILE_REAL_BYTE_TOOL="${profile_real_byte_tool}" \
+    ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 TIMING_FIXTURE="${timing_fixture}" PUBLIC_PROBE_EXIT=0 \
+    bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/profile-ci-console" 2>&1; then
+  echo 'CI accepted a byte producer failure after full output' >&2; exit 1
+fi
+if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+for byte_output in empty truncated; do
+  cat > "${profile_bin}/od" <<'EOF'
+#!/usr/bin/env bash
+[ "${PROFILE_BYTE_OUTPUT}" != truncated ] || printf ' 109\n'
+exit 0
+EOF
+  if (cd "${ci_root}"; PATH="${profile_bin}:${PATH}" PROFILE_BYTE_OUTPUT="${byte_output}" \
+      ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 TIMING_FIXTURE="${timing_fixture}" PUBLIC_PROBE_EXIT=0 \
+      bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/profile-ci-console" 2>&1; then
+    echo 'CI accepted incomplete byte validation' >&2; exit 1
+  fi
+  if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+  grep -qx 'Outcome: FAILED' "${ci_root}/.build/public/tests-shell.txt"
+done
 
 # The runner may print every configured env value. Only numeric indices cross that boundary.
 cp "${repo_root}/scripts/auto-build-external.sh" "${repo_root}/scripts/source-common.sh" "${ci_root}/scripts/"

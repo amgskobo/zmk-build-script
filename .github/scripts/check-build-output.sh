@@ -37,8 +37,11 @@ public_source_line() {
 
 test_timing_report() {
   local suite="$1" file="$2" line metric status samples seconds whole fraction milliseconds expected_samples candidate found seen='|' rows=0
+  local LC_ALL=C checked_bytes actual_bytes
   local expected=(source-before source-after probe-shell-spawn probe-git-version probe-file-write-read)
   local output=()
+  TIMING_FAILURE_CODE=mode
+  TIMING_FAILURE_METRIC=
   case "${suite}" in shell|docker|build|all) ;; *) return 1 ;; esac
   case "${suite}" in shell|all)
     expected+=(syntax lf whitespace lf-contract output-contract external-contract host-contract host-help container-help) ;;
@@ -46,20 +49,40 @@ test_timing_report() {
   case "${suite}" in docker|build|all) expected+=(tools probe-docker-client) ;; esac
   case "${suite}" in docker|all) expected+=(docker-contract probe-docker-exec) ;; esac
   case "${suite}" in build|all) expected+=(firmware) ;; esac
+  TIMING_FAILURE_CODE=file
   [ -f "${file}" ] && [ ! -L "${file}" ] || return 1
   # Read the complete file before publishing anything, including NUL/CR rejection.
-  cmp -s "${file}" <(LC_ALL=C tr -d '\000\r' < "${file}") || return 1
+  TIMING_FAILURE_CODE=bytes
+  checked_bytes="$(od -An -v -t u1 < "${file}" | awk '
+    {
+      for (i=1; i<=NF; i++) {
+        bytes++
+        if ($i !~ /^[0-9]+$/ || $i == 0 || $i == 13 || $i > 255) invalid=1
+      }
+    }
+    END {if (invalid || !bytes) exit 1; printf "%.0f\n", bytes}
+  ')" || return 1
+  case "${checked_bytes}" in ''|0|*[!0-9]*) return 1 ;; esac
   {
+    TIMING_FAILURE_CODE=header
     IFS= read -r line || return 1
     [ "${line}" = $'metric\tstatus\tsamples\tseconds' ] || return 1
+    actual_bytes=$(( ${#line} + 1 ))
     while IFS= read -r line; do
+      actual_bytes=$(( actual_bytes + ${#line} + 1 ))
+      TIMING_FAILURE_CODE=columns
+      TIMING_FAILURE_METRIC=
       IFS=$'\t' read -r metric status samples seconds <<< "${line}"
       [ "${line}" = "${metric}"$'\t'"${status}"$'\t'"${samples}"$'\t'"${seconds}" ] || return 1
       found=0
+      TIMING_FAILURE_CODE=metric
       for candidate in "${expected[@]}"; do [ "${metric}" != "${candidate}" ] || found=1; done
       [ "${found}" = 1 ] || return 1
+      TIMING_FAILURE_METRIC="${metric}"
+      TIMING_FAILURE_CODE=duplicate
       case "${seen}" in *"|${metric}|"*) return 1 ;; esac
       seen="${seen}${metric}|"
+      TIMING_FAILURE_CODE=status
       case "${status}" in ''|*[!0-9]*) return 1 ;; esac
       case "${status}" in 0) ;; 0*) return 1 ;; esac
       [ "${#status}" -le 3 ] && [ "${status}" -le 255 ] || return 1
@@ -69,19 +92,33 @@ test_timing_report() {
         probe-file-write-read) expected_samples=100 ;;
         probe-docker-client|probe-docker-exec) expected_samples=5 ;;
       esac
+      TIMING_FAILURE_CODE=samples
       [ "${samples}" = "${expected_samples}" ] || return 1
+      TIMING_FAILURE_CODE=duration
       seconds="${seconds/,/.}"
+      case "${seconds}" in -*) TIMING_FAILURE_CODE=negative-duration; return 1 ;; esac
       case "${seconds}" in ''|*[!0-9.]*|*.*.*) return 1 ;; esac
       whole="${seconds%.*}"; fraction="${seconds#*.}"
-      [ "${whole}.${fraction}" = "${seconds}" ] && [ -n "${whole}" ] &&
-        [ "${#whole}" -le 8 ] && [ "${#fraction}" = 3 ] || return 1
+      TIMING_FAILURE_CODE=duration-format
+      [ "${whole}.${fraction}" = "${seconds}" ] && [ -n "${whole}" ] || return 1
+      TIMING_FAILURE_CODE=duration-range
+      [ "${#whole}" -le 8 ] || return 1
+      TIMING_FAILURE_CODE=duration-precision
+      [ "${#fraction}" = 3 ] || return 1
       milliseconds=$((10#${whole} * 1000 + 10#${fraction}))
       output+=("Timing ${suite} ${metric}: samples=${samples} milliseconds=${milliseconds} status=${status}")
       rows=$((rows + 1))
     done
+    TIMING_FAILURE_CODE=incomplete
+    TIMING_FAILURE_METRIC=
     [ -z "${line}" ] && [ "${rows}" = "${#expected[@]}" ] || return 1
+    TIMING_FAILURE_CODE=byte-count
+    [ "${actual_bytes}" = "${checked_bytes}" ] || return 1
   } < "${file}"
-  printf '%s\n' "${output[@]}"
+  TIMING_FAILURE_CODE=output
+  TIMING_FAILURE_METRIC=
+  printf '%s\n' "${output[@]}" || return 1
+  TIMING_FAILURE_CODE=
 }
 
 publish_report() {
@@ -93,10 +130,14 @@ publish_report() {
     for file in "${PUBLIC_REPORT_KINDS[@]}"; do
       rm -f "${public_dir}/${file}.txt" || return 1
     done
-    rm -f .build/ci-source.status .build/ci-source.record || return 1
+    rm -f .build/ci-source.status .build/ci-source.record .build/ci-publication-invalid || return 1
     return 0
   fi
   if [ "${kind}" = verify ]; then
+    if [ -e .build/ci-publication-invalid ] || [ -L .build/ci-publication-invalid ]; then
+      echo 'Publication status was not finalized.' >&2
+      return 1
+    fi
     local reports=0 header modes outcomes codes notices locations line report_status report_outcome has_failure
     for label in "${PUBLIC_REPORT_KINDS[@]}"; do
       file="${public_dir}/${label}.txt"
@@ -279,8 +320,26 @@ case "${mode}" in
                 2> "${ci_execution}/timing-validation.log" > "${ci_execution}/timing-report.txt"; then
               cat "${ci_execution}/timing-report.txt" 2>> "${ci_execution}/timing-validation.log" || status=1
             else
-              echo 'Profile report validation failed; detailed evidence remains private.' >&2
+              # Both fields are assigned only from constants/recognized metric names.
+              printf 'Profile report validation failed (reason=%s metric=%s); detailed evidence remains private.\n' \
+                "${TIMING_FAILURE_CODE}" "${TIMING_FAILURE_METRIC:-none}" >&2
               status=1
+            fi
+            if [ "${status}" != 0 ]; then
+              # The test producer already published its outcome. Invalidate it
+              # before replacing SUCCESS after a later profiling/publication error.
+              if (set -C; : > .build/ci-publication-invalid) 2>> "${ci_execution}/timing-validation.log"; then
+                if publish_report "tests-$2" "${status}" "${profile_results}" \
+                    2>> "${ci_execution}/timing-validation.log"; then
+                  rm -f .build/ci-publication-invalid || status=1
+                else
+                  echo 'Failed to finalize profiling failure status.' >&2
+                  status=1
+                fi
+              else
+                echo 'Failed to invalidate profiling publication status.' >&2
+                status=1
+              fi
             fi
           fi
         else
