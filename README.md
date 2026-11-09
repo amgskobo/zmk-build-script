@@ -653,6 +653,16 @@ source checksums before/after in a fresh `.build/test-<UTC>.XXXXXX/`.
 fully ignored by Git. Existing evidence is never overwritten. Use UTF-8/LF via
 `.gitattributes` and `.editorconfig`; checks preserve the working tree.
 
+Set `ZMK_TEST_PROFILE=1` for optional case/source-check timings and small latency
+probes for Bash/Git launches, 100 file writes/reads and Docker client/exec calls.
+The manual workflow exposes the same `profile` switch, disabled by default.
+Raw output and `profile.tsv` stay private. After a successful invocation, `ci-tests` prints only validated fixed
+metric names, sample counts, milliseconds and exit statuses; `timings MODE FILE`
+checks that format independently. Docker exec probes reuse an acquired validation
+container and are included in the Docker case time. Probes are samples rather than
+complete command accounting; nested timings must not be added together. Profiled
+runs include measurement/probe overhead and are separate from normal benchmarks.
+
 Tests create and remove a dedicated cache by default. An explicitly supplied
 `ZMK_DOCKER_CACHE_VOLUME` is reused and retained; never use a production cache.
 `ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while

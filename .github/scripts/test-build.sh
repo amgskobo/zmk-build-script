@@ -1557,4 +1557,21 @@ grep -q 'volume is in use' "${summary%/*}/build.log"
 [ "$(docker inspect -f '{{.State.Running}}' "${last_container}")" = true ]
 docker volume inspect "${ZMK_DOCKER_CACHE_VOLUME}" >/dev/null
 
+if [ "${ZMK_TEST_PROFILE:-0}" = 1 ]; then
+  : "${ZMK_TEST_RESULTS:?Profiling requires the canonical test entry point}"
+  profile_docker_exec() {
+    local number
+    for ((number=0; number<5; number++)); do
+      docker exec "${last_container}" true || return "$?"
+    done
+  }
+  TIMEFORMAT='%3R'
+  profile_status=0
+  { time profile_docker_exec > "${ZMK_TEST_RESULTS}/probe-docker-exec.log" 2>&1; } \
+    2> "${ZMK_TEST_RESULTS}/probe-docker-exec.time" || profile_status=$?
+  IFS= read -r profile_duration < "${ZMK_TEST_RESULTS}/probe-docker-exec.time"
+  printf 'probe-docker-exec\t%s\t5\t%s\n' "${profile_status}" "${profile_duration}" >> "${ZMK_TEST_RESULTS}/profile.tsv"
+  [ "${profile_status}" = 0 ] || exit "${profile_status}"
+fi
+
 echo "build host/copy contracts passed."

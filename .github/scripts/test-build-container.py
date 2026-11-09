@@ -328,6 +328,9 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
         workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
                              Loader=yaml.BaseLoader)
         inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(inputs['profile']['type'], 'boolean')
+        self.assertEqual(inputs['profile']['default'], 'false')
+        self.assertEqual(workflow['env']['ZMK_TEST_PROFILE'], "${{ inputs.profile && '1' || '0' }}")
         for name in ('build_image', 'docker_platform', 'target_jobs', 'compiler_jobs'):
             self.assertIn(name, inputs)
             self.assertEqual(inputs[name]['type'], 'string')

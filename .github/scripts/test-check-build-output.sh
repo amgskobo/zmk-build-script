@@ -595,6 +595,86 @@ fi
 (cd "${case_root}" && bash "${checker}" publish clear)
 [ "$(find "${case_root}/.build/public" -type f | wc -l | tr -d '[:space:]')" = 0 ]
 
+# Timing publication has its own complete numeric-only contract; raw traces stay private.
+echo '[output-contract] fixed timing aggregates'
+timing_fixture="${tmp_dir}/timing.tsv"
+cat > "${timing_fixture}" <<'EOF'
+metric	status	samples	seconds
+source-before	0	1	0.125
+syntax	0	1	0.125
+lf	0	1	0.125
+whitespace	0	1	0.125
+lf-contract	0	1	0.125
+output-contract	0	1	0.125
+external-contract	0	1	0.125
+host-contract	0	1	0.125
+host-help	0	1	0.125
+container-help	0	1	0.125
+probe-shell-spawn	0	20	0.125
+probe-git-version	0	20	0.125
+probe-file-write-read	0	100	0.125
+source-after	0	1	0.125
+EOF
+bash "${checker}" timings shell "${timing_fixture}" > "${tmp_dir}/timing-public"
+[ "$(wc -l < "${tmp_dir}/timing-public" | tr -d '[:space:]')" = 14 ]
+grep -qx 'Timing shell probe-file-write-read: samples=100 milliseconds=125 status=0' "${tmp_dir}/timing-public"
+sed 's/0\.125/0,000/g' "${timing_fixture}" > "${tmp_dir}/timing-comma.tsv"
+bash "${checker}" timings shell "${tmp_dir}/timing-comma.tsv" > "${tmp_dir}/timing-public"
+grep -qx 'Timing shell syntax: samples=1 milliseconds=0 status=0' "${tmp_dir}/timing-public"
+cat > "${tmp_dir}/timing-docker.tsv" <<'EOF'
+metric	status	samples	seconds
+source-before	0	1	0.125
+tools	0	1	0.125
+probe-docker-exec	0	5	0.125
+docker-contract	0	1	0.125
+probe-shell-spawn	0	20	0.125
+probe-git-version	0	20	0.125
+probe-file-write-read	0	100	0.125
+probe-docker-client	0	5	0.125
+source-after	0	1	0.125
+EOF
+bash "${checker}" timings docker "${tmp_dir}/timing-docker.tsv" > "${tmp_dir}/timing-public"
+[ "$(wc -l < "${tmp_dir}/timing-public" | tr -d '[:space:]')" = 9 ]
+grep -qx 'Timing docker probe-docker-exec: samples=5 milliseconds=125 status=0' "${tmp_dir}/timing-public"
+sed '/^probe-docker-exec/d; /^docker-contract/d' "${tmp_dir}/timing-docker.tsv" > "${tmp_dir}/timing-build.tsv"
+printf 'firmware\t0\t1\t0.125\n' >> "${tmp_dir}/timing-build.tsv"
+bash "${checker}" timings build "${tmp_dir}/timing-build.tsv" > "${tmp_dir}/timing-public"
+[ "$(wc -l < "${tmp_dir}/timing-public" | tr -d '[:space:]')" = 8 ]
+cp "${timing_fixture}" "${tmp_dir}/timing-all.tsv"
+for metric in tools docker-contract firmware probe-docker-client probe-docker-exec; do
+  samples=1
+  case "${metric}" in probe-*) samples=5 ;; esac
+  printf '%s\t0\t%s\t0.125\n' "${metric}" "${samples}" >> "${tmp_dir}/timing-all.tsv"
+done
+bash "${checker}" timings all "${tmp_dir}/timing-all.tsv" > "${tmp_dir}/timing-public"
+[ "$(wc -l < "${tmp_dir}/timing-public" | tr -d '[:space:]')" = 19 ]
+for invalid in private duplicate missing truncated nul cr negative samples status leading-zero; do
+  cp "${timing_fixture}" "${tmp_dir}/timing-invalid.tsv"
+  case "${invalid}" in
+    private) printf 'synthetic-private-host /synthetic/private secret=value\n' >> "${tmp_dir}/timing-invalid.tsv" ;;
+    duplicate) printf 'syntax\t0\t1\t0.125\n' >> "${tmp_dir}/timing-invalid.tsv" ;;
+    missing) sed '/^source-after/d' "${timing_fixture}" > "${tmp_dir}/timing-invalid.tsv" ;;
+    truncated) printf 'syntax\t0\t1\t0.125' >> "${tmp_dir}/timing-invalid.tsv" ;;
+    nul) printf '\0' >> "${tmp_dir}/timing-invalid.tsv" ;;
+    cr) printf '\r' >> "${tmp_dir}/timing-invalid.tsv" ;;
+    negative) sed 's/0\.125/-0.125/g' "${timing_fixture}" > "${tmp_dir}/timing-invalid.tsv" ;;
+    samples) sed $'s/\t100\t/\t99\t/' "${timing_fixture}" > "${tmp_dir}/timing-invalid.tsv" ;;
+    status) sed $'s/\t0\t/\t256\t/' "${timing_fixture}" > "${tmp_dir}/timing-invalid.tsv" ;;
+    leading-zero) sed $'s/\t0\t/\t00\t/' "${timing_fixture}" > "${tmp_dir}/timing-invalid.tsv" ;;
+  esac
+  if bash "${checker}" timings shell "${tmp_dir}/timing-invalid.tsv" > "${tmp_dir}/timing-public" 2>&1; then
+    echo 'timing publication accepted invalid data' >&2; exit 1
+  fi
+  [ ! -s "${tmp_dir}/timing-public" ]
+done
+# Named unsafe control discloses the sentinel; the numeric renderer rejects it before output.
+printf 'synthetic-private-host /synthetic/private secret=value\n' >> "${tmp_dir}/timing-invalid.tsv"
+cat "${tmp_dir}/timing-invalid.tsv" > "${tmp_dir}/unsafe-timing-public"
+grep -q 'secret=value' "${tmp_dir}/unsafe-timing-public"
+if bash "${checker}" timings shell "${tmp_dir}/timing-invalid.tsv" > "${tmp_dir}/timing-public" 2>&1; then exit 1; fi
+[ ! -s "${tmp_dir}/timing-public" ]
+echo '[output-contract] control raw timing disclosure rejected'
+
 # Unexpected host assertions expose only a numeric source line in public reports.
 diagnostic_bin="${tmp_dir}/diagnostic-bin"
 diagnostic_evidence="${case_root}/diagnostic evidence"
@@ -712,6 +792,54 @@ for expected in 23 0; do
   if grep -Eq 'synthetic-private-host|/synthetic/private|private-device|secret=' "${ci_root}/.build/public/build.txt"; then exit 1; fi
 done
 [ "$(find "${ci_root}/.build" -name command.log -type f | wc -l | tr -d '[:space:]')" = 4 ]
+
+cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir "${ZMK_TEST_RESULTS}"
+cp "${TIMING_FIXTURE}" "${ZMK_TEST_RESULTS}/profile.tsv"
+echo 'synthetic-private-host /synthetic/private secret=value'
+exit "${PUBLIC_PROBE_EXIT}"
+EOF
+for expected in 23 0; do
+  if (cd "${ci_root}"; ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 TIMING_FIXTURE="${timing_fixture}" PUBLIC_PROBE_EXIT="${expected}" \
+      bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/profile-ci-console" 2>&1; then status=0; else status=$?; fi
+  [ "${status}" = "${expected}" ]
+  timing_rows="$(grep -c '^Timing shell ' "${tmp_dir}/profile-ci-console" || true)"
+  if [ "${expected}" = 0 ]; then [ "${timing_rows}" = 14 ]; else [ "${timing_rows}" = 0 ]; fi
+  if grep -Eq 'synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+done
+if (cd "${ci_root}"; ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 TIMING_FIXTURE="${tmp_dir}/timing-invalid.tsv" PUBLIC_PROBE_EXIT=0 \
+    bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/profile-ci-console" 2>&1; then
+  echo 'CI accepted invalid timing publication' >&2; exit 1
+fi
+if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+
+# A rejected existing result directory cannot turn old measurements into a fresh run.
+mkdir "${ci_root}/.build/old-profile"
+cp "${timing_fixture}" "${ci_root}/.build/old-profile/profile.tsv"
+if (cd "${ci_root}"; ZMK_TEST_RESULTS="${ci_root}/.build/old-profile" ZMK_TEST_PROFILE=1 \
+    TIMING_FIXTURE="${timing_fixture}" PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-tests shell) \
+    > "${tmp_dir}/profile-ci-console" 2>&1; then
+  echo 'CI accepted stale profile results' >&2; exit 1
+fi
+if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+profile_bin="${tmp_dir}/profile-bin"
+mkdir "${profile_bin}"
+cat > "${profile_bin}/tr" <<'EOF'
+#!/usr/bin/env bash
+echo 'synthetic-private-host /synthetic/private secret=value' >&2
+exit 23
+EOF
+chmod +x "${profile_bin}/tr"
+if (cd "${ci_root}"; PATH="${profile_bin}:${PATH}" ZMK_TEST_RESULTS= ZMK_TEST_PROFILE=1 \
+    TIMING_FIXTURE="${timing_fixture}" PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-tests shell) \
+    > "${tmp_dir}/profile-ci-console" 2>&1; then
+  echo 'CI accepted failed timing validation' >&2; exit 1
+fi
+if grep -Eq '^Timing |synthetic-private|secret=' "${tmp_dir}/profile-ci-console"; then exit 1; fi
+grep -l 'synthetic-private-host' "${ci_root}"/.build/ci-execution.*/timing-validation.log > "${tmp_dir}/private-validation-log"
+[ -s "${tmp_dir}/private-validation-log" ]
 
 # The runner may print every configured env value. Only numeric indices cross that boundary.
 cp "${repo_root}/scripts/auto-build-external.sh" "${repo_root}/scripts/source-common.sh" "${ci_root}/scripts/"

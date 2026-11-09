@@ -35,6 +35,55 @@ public_source_line() {
   [ "${#1}" -le 6 ]
 }
 
+test_timing_report() {
+  local suite="$1" file="$2" line metric status samples seconds whole fraction milliseconds expected_samples candidate found seen='|' rows=0
+  local expected=(source-before source-after probe-shell-spawn probe-git-version probe-file-write-read)
+  local output=()
+  case "${suite}" in shell|docker|build|all) ;; *) return 1 ;; esac
+  case "${suite}" in shell|all)
+    expected+=(syntax lf whitespace lf-contract output-contract external-contract host-contract host-help container-help) ;;
+  esac
+  case "${suite}" in docker|build|all) expected+=(tools probe-docker-client) ;; esac
+  case "${suite}" in docker|all) expected+=(docker-contract probe-docker-exec) ;; esac
+  case "${suite}" in build|all) expected+=(firmware) ;; esac
+  [ -f "${file}" ] && [ ! -L "${file}" ] || return 1
+  # Read the complete file before publishing anything, including NUL/CR rejection.
+  cmp -s "${file}" <(LC_ALL=C tr -d '\000\r' < "${file}") || return 1
+  {
+    IFS= read -r line || return 1
+    [ "${line}" = $'metric\tstatus\tsamples\tseconds' ] || return 1
+    while IFS= read -r line; do
+      IFS=$'\t' read -r metric status samples seconds <<< "${line}"
+      [ "${line}" = "${metric}"$'\t'"${status}"$'\t'"${samples}"$'\t'"${seconds}" ] || return 1
+      found=0
+      for candidate in "${expected[@]}"; do [ "${metric}" != "${candidate}" ] || found=1; done
+      [ "${found}" = 1 ] || return 1
+      case "${seen}" in *"|${metric}|"*) return 1 ;; esac
+      seen="${seen}${metric}|"
+      case "${status}" in ''|*[!0-9]*) return 1 ;; esac
+      case "${status}" in 0) ;; 0*) return 1 ;; esac
+      [ "${#status}" -le 3 ] && [ "${status}" -le 255 ] || return 1
+      expected_samples=1
+      case "${metric}" in
+        probe-shell-spawn|probe-git-version) expected_samples=20 ;;
+        probe-file-write-read) expected_samples=100 ;;
+        probe-docker-client|probe-docker-exec) expected_samples=5 ;;
+      esac
+      [ "${samples}" = "${expected_samples}" ] || return 1
+      seconds="${seconds/,/.}"
+      case "${seconds}" in ''|*[!0-9.]*|*.*.*) return 1 ;; esac
+      whole="${seconds%.*}"; fraction="${seconds#*.}"
+      [ "${whole}.${fraction}" = "${seconds}" ] && [ -n "${whole}" ] &&
+        [ "${#whole}" -le 8 ] && [ "${#fraction}" = 3 ] || return 1
+      milliseconds=$((10#${whole} * 1000 + 10#${fraction}))
+      output+=("Timing ${suite} ${metric}: samples=${samples} milliseconds=${milliseconds} status=${status}")
+      rows=$((rows + 1))
+    done
+    [ -z "${line}" ] && [ "${rows}" = "${#expected[@]}" ] || return 1
+  } < "${file}"
+  printf '%s\n' "${output[@]}"
+}
+
 publish_report() {
   local kind="$1" status="${2:-}" evidence="${3:-}" public_dir=.build/public file temporary label value rest number rows=0 outcome
   local host_failed=0 receipt
@@ -183,6 +232,11 @@ if [ "${mode}" = publish ]; then
   exit "$?"
 fi
 
+if [ "${mode}" = timings ]; then
+  test_timing_report "${2:-}" "${3:-}"
+  exit "$?"
+fi
+
 run_indexed_source() {
   local index="$1" source_file
   local args=()
@@ -216,7 +270,22 @@ case "${mode}" in
         ) > "${ci_execution}/command.log" 2>&1 || status=$? ;;
       ci-tests)
         case "${2:-}" in shell|docker|build|all) ;; *) echo 'Invalid test mode.' >&2; exit 2 ;; esac
-        bash "${repo_root}/.github/scripts/test.sh" "$2" > "${ci_execution}/command.log" 2>&1 || status=$? ;;
+        if [ "${ZMK_TEST_PROFILE:-0}" = 1 ]; then
+          profile_results="${ZMK_TEST_RESULTS:-${ci_execution}/tests}"
+          ZMK_TEST_RESULTS="${profile_results}" bash "${repo_root}/.github/scripts/test.sh" "$2" \
+            > "${ci_execution}/command.log" 2>&1 || status=$?
+          if [ "${status}" = 0 ]; then
+            if test_timing_report "$2" "${profile_results}/profile.tsv" \
+                2> "${ci_execution}/timing-validation.log" > "${ci_execution}/timing-report.txt"; then
+              cat "${ci_execution}/timing-report.txt" 2>> "${ci_execution}/timing-validation.log" || status=1
+            else
+              echo 'Profile report validation failed; detailed evidence remains private.' >&2
+              status=1
+            fi
+          fi
+        else
+          bash "${repo_root}/.github/scripts/test.sh" "$2" > "${ci_execution}/command.log" 2>&1 || status=$?
+        fi ;;
       ci-tools)
         bash "${repo_root}/.github/scripts/check-runner-tools.sh" > "${ci_execution}/command.log" 2>&1 || status=$? ;;
       ci-lf)

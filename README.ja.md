@@ -571,6 +571,14 @@ upstream の動く branch に対する互換性確認は、別途明示して実
 Git が ignore する新しい保存先を選べます。既存記録は上書きしません。
 `.gitattributes` / `.editorconfig` の UTF-8 / LF を使い、検証のために working tree を書き換えません。
 
+`ZMK_TEST_PROFILE=1` で case / source check の時間と、Bash / Git 起動、100 file の書き込み / 読み込み、
+Docker client / exec 呼び出しの少数回の latency probe を追加できます。手動 workflow の `profile` も
+同じ設定で、既定は無効です。raw 出力と `profile.tsv` は非公開で保持します。`ci-tests` は実行成功後に検証済みの
+固定 metric 名・sample 数・ミリ秒・終了 status だけを表示し、`timings MODE FILE` で形式を単独検証できます。
+Docker exec probe は取得済みの validate container を再利用し、その時間は Docker case に含まれます。
+probe は一部の呼び出しを測るもので、全 command の内訳ではありません。入れ子の時間を加算せず、
+計測 / probe の負担を含む実行として通常の benchmark と区別します。
+
 test cache は既定で専用 volume を作り、終了時に削除します。`ZMK_DOCKER_CACHE_VOLUME` を明示した場合は
 再利用・保持します。production cache は指定しません。`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
 復元検証では保持します。各 build / validate の直後に、その run を明示して output check を実行します。

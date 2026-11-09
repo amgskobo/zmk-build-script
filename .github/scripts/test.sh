@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "${repo_root}"
 mode="${1:-shell}"
 case "${mode}" in shell|docker|build|all) ;; *) echo "usage: $0 shell|docker|build|all" >&2; exit 2 ;; esac
+profile="${ZMK_TEST_PROFILE:-0}"
+case "${profile}" in 0|1) ;; *) echo 'ZMK_TEST_PROFILE must be 0 or 1.' >&2; exit 2 ;; esac
 mkdir -p .build
 if [ -n "${ZMK_TEST_RESULTS:-}" ]; then
   result_dir="${ZMK_TEST_RESULTS}"
@@ -44,6 +46,15 @@ cleanup_cache() {
 trap cleanup_cache EXIT
 failed=0
 printf 'case\tstatus\tseconds\n' > "${result_dir}/results.tsv"
+if [ "${profile}" = 1 ]; then
+  TIMEFORMAT='%3R'
+  printf 'metric\tstatus\tsamples\tseconds\n' > "${result_dir}/profile.tsv"
+fi
+record_profile() {
+  local duration
+  IFS= read -r duration < "${result_dir}/$1.time" || return 1
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${duration}" >> "${result_dir}/profile.tsv"
+}
 source_identity() {
   local file
   git ls-files -z --cached --others --exclude-standard > "${result_dir}/file-list"
@@ -51,7 +62,12 @@ source_identity() {
     [ ! -f "${file}" ] || cksum "${file}"
   done < "${result_dir}/file-list"
 }
-source_identity > "${result_dir}/source-before.txt"
+if [ "${profile}" = 1 ]; then
+  { time source_identity > "${result_dir}/source-before.txt"; } 2> "${result_dir}/source-before.time"
+  record_profile source-before 0 1
+else
+  source_identity > "${result_dir}/source-before.txt"
+fi
 {
   git rev-parse HEAD
   git status --short
@@ -68,8 +84,14 @@ run_case() {
   printf '\n' >> "${result_dir}/${name}.command"
   # Execute normally, outside an if/function errexit exception, then capture its status.
   set +e
-  "$@" > "${result_dir}/${name}.log" 2>&1
-  status=$?
+  if [ "${profile}" = 1 ]; then
+    { time "$@" > "${result_dir}/${name}.log" 2>&1; } 2> "${result_dir}/${name}.time"
+    status=$?
+    if ! record_profile "${name}" "${status}" 1; then [ "${status}" != 0 ] || status=1; fi
+  else
+    "$@" > "${result_dir}/${name}.log" 2>&1
+    status=$?
+  fi
   last_status="${status}"
   set -e
   if [ "${status}" = 0 ]; then
@@ -79,6 +101,35 @@ run_case() {
     tail -n 80 "${result_dir}/${name}.log" >&2
     failed=1
   fi
+}
+profile_work() {
+  local operation="$1" number value
+  case "${operation}" in
+    shell|git)
+      for ((number=0; number<20; number++)); do
+        if [ "${operation}" = shell ]; then bash -c ':' || return "$?"
+        else git --version || return "$?"; fi
+      done ;;
+    files)
+      for ((number=0; number<100; number++)); do
+        printf 'synthetic probe\n' > "${result_dir}/file-probe/${number}" || return "$?"
+        IFS= read -r value < "${result_dir}/file-probe/${number}" || return "$?"
+        [ "${value}" = 'synthetic probe' ] || return 1
+      done ;;
+    docker)
+      for ((number=0; number<5; number++)); do docker --version || return "$?"; done ;;
+    *) return 1 ;;
+  esac
+}
+profile_probe() {
+  local name="$1" samples="$2" status
+  shift 2
+  set +e
+  { time profile_work "$@" > "${result_dir}/${name}.log" 2>&1; } 2> "${result_dir}/${name}.time"
+  status=$?
+  if ! record_profile "${name}" "${status}" "${samples}"; then [ "${status}" != 0 ] || status=1; fi
+  set -e
+  [ "${status}" = 0 ] || failed=1
 }
 if [ "${mode}" = shell ] || [ "${mode}" = all ]; then
   run_case syntax bash -c 'set -e; for file in build.sh scripts/*.sh .github/scripts/*.sh; do bash -n "$file"; done'
@@ -114,7 +165,18 @@ if [ "${mode}" != shell ]; then
     printf 'docker-dependent\tBLOCKED(tools)\t0\n' | tee -a "${result_dir}/results.tsv"
   fi
 fi
-source_identity > "${result_dir}/source-after.txt"
+if [ "${profile}" = 1 ]; then
+  profile_probe probe-shell-spawn 20 shell
+  profile_probe probe-git-version 20 git
+  mkdir "${result_dir}/file-probe"
+  profile_probe probe-file-write-read 100 files
+  rm -rf "${result_dir}/file-probe"
+  if [ "${mode}" != shell ]; then profile_probe probe-docker-client 5 docker; fi
+  { time source_identity > "${result_dir}/source-after.txt"; } 2> "${result_dir}/source-after.time"
+  record_profile source-after 0 1
+else
+  source_identity > "${result_dir}/source-after.txt"
+fi
 if ! cmp -s "${result_dir}/source-before.txt" "${result_dir}/source-after.txt"; then
   echo 'Source changed during verification; results do not describe one source tree.' >&2
   failed=1
