@@ -428,6 +428,15 @@ wait "${cancel_timer}" 2>/dev/null || true
 
 # A broken reader and a failed writer are distinct exit paths. Reuse the same
 # worker fixture; retain exact status and child completion without another build.
+# Noninteractive Bash cannot reset SIGPIPE ignored at entry. Probe that inherited
+# signal state independently; a broken builtin writer then exits 1 instead of 141.
+if bash -c 'trap "exit 141" PIPE; kill -PIPE "$$" || exit 2; exit 1' \
+    > "${tmp_dir}/pipe-disposition.out" 2>&1; then
+  fail 'SIGPIPE disposition control unexpectedly succeeded'
+else
+  pipe_failure_status=$?
+fi
+case "${pipe_failure_status}" in 1|141) ;; *) fail 'SIGPIPE disposition control failed' ;; esac
 for output_failure in pipe write; do
   output_root="${tmp_dir}/queue-output-${output_failure}"
   mkdir "${output_root}"
@@ -478,7 +487,7 @@ EOF
   done
   [ -f "${output_root}/status" ] || fail 'queue output failure did not complete'
   IFS= read -r output_status < "${output_root}/status"
-  expected=23; [ "${output_failure}" != pipe ] || expected=141
+  expected=23; [ "${output_failure}" != pipe ] || expected="${pipe_failure_status}"
   [ "${output_status}" = "${expected}" ] || fail 'queue output failure lost its exit status'
   [ -f "${output_root}/slow.stopped" ] || \
     fail "queue ${output_failure} failure left a source worker running: $(cat "${output_root}/stderr" 2>/dev/null || cat "${output_root}/console")"
