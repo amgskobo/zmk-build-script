@@ -890,7 +890,7 @@ def merged_target(mapping, board, shield):
 
     artifact_template = scalar(raw_with_default(mapping, "artifact-name"), "artifact-name", allow_empty=True)
     artifact = safe_name(format_artifact(artifact_template, board, shield, snippet))
-    exclude_artifact = safe_name(format_artifact(artifact_template, board, shield, yaml_snippet))
+    exclude_artifact = format_artifact(artifact_template, board, shield, yaml_snippet)
     return {
         "board": board,
         "shield": shield,
@@ -899,6 +899,7 @@ def merged_target(mapping, board, shield):
         "artifact-name": artifact,
         "_exclude-snippet": yaml_snippet,
         "_exclude-artifact-name": exclude_artifact,
+        "_exclude-artifact-normalized": safe_name(exclude_artifact),
     }
 
 def add_matrix_targets(source, require_board):
@@ -943,22 +944,40 @@ for exclusion in exclusions:
         print("ERROR: each exclude entry must be a map.", file=sys.stderr)
         sys.exit(2)
 
-def exclusion_matches(exclusion, target):
-    compared = False
+def compile_exclusion(exclusion):
+    options = {}
     for key in ("board", "shield", "snippet", "artifact-name"):
         value = raw(exclusion, key)
-        if value is None:
-            continue
-        compared = True
-        options = scalar_list(value, key, allow_empty=True)
-        target_value = target.get(f"_exclude-{key}", target[key])
-        if target_value not in options:
-            return False
-    return compared
+        if value is not None:
+            options[key] = scalar_list(value, key, allow_empty=True)
+    # Preserve normalized-name aliases for existing matrices, but an exact YAML
+    # name within this exclusion's other selectors takes precedence over aliases.
+    artifact_values = set(options.get("artifact-name", []))
+    raw_artifacts = {
+        target["_exclude-artifact-name"] for target in targets
+        if target["_exclude-artifact-name"] in artifact_values
+        and all(target.get(f"_exclude-{key}", target[key]) in values
+               for key, values in options.items() if key != "artifact-name")
+    } if "artifact-name" in options else set()
+    return options, raw_artifacts
 
+def exclusion_matches(rule, target):
+    options, raw_artifacts = rule
+    for key, values in options.items():
+        target_value = target.get(f"_exclude-{key}", target[key])
+        if key == "artifact-name":
+            if not any(target_value == value or
+                       (value not in raw_artifacts and target["_exclude-artifact-normalized"] == value)
+                       for value in values):
+                return False
+        elif target_value not in values:
+            return False
+    return bool(options)
+
+exclusion_rules = [compile_exclusion(exclusion) for exclusion in exclusions]
 targets = [
     target for target in targets
-    if not any(exclusion_matches(exclusion, target) for exclusion in exclusions)
+    if not any(exclusion_matches(rule, target) for rule in exclusion_rules)
 ]
 
 if settings_reset == "1":
@@ -1473,8 +1492,10 @@ container_name=""
 container_created=0
 container_id=""
 container_create_output=""
+container_create_status=0
 image_probe_output=""
 active_phase_pid=""
+active_phase_starting=0
 run_claim=""
 run_signal_status=0
 run_phase=""
@@ -1488,28 +1509,52 @@ handle_run_signal() {
     # A signal can arrive before the EXIT handler's first body command.
     case " ${FUNCNAME[*]} " in *" finish_run "*) return 0 ;; esac
     # Acquire ownership and finish cleanup before honoring a pending interruption.
+    [ "${active_phase_starting}" = 0 ] || return 0
     case "${run_phase}" in reserve|create|cleanup|finish) return 0 ;; esac
+    if [ "${run_phase}" = create-log ] && [ "${container_create_status}" != 0 ] &&
+        [ "${container_create_status}" != "${run_signal_status}" ]; then
+        RUN_FAILURE_REASON="container creation failed"
+        exit "${container_create_status}"
+    fi
     exit "${run_signal_status}"
 }
 
 run_logged_command() {
-    local capture="$1" status=0
+    local capture="$1" status=0 phase_monitor=0
     shift
+    active_phase_starting=1
+    case $- in *m*) phase_monitor=1 ;; esac
+    # Own the whole phase, including pipeline and function descendants, without
+    # requiring setsid on Bash 3.2 hosts. Publish its ID before honoring signals.
+    set -m
     (
         trap - EXIT
+        set +m
+        # This internal background group still streams a foreground build's
+        # output; terminal TOSTOP must not suspend its writer.
+        trap '' TTOU
         if [ "${run_phase}" = create ]; then
             # The entire receipt pipeline must survive a terminal/process-group signal.
             trap '' INT TERM
         else
             trap - INT TERM
         fi
-        if [ -n "${capture}" ]; then
+        if [ -n "${capture}" ] && [ "${run_phase}" = create ]; then
+            # Acquire the daemon result without a log writer in its status path.
+            # Ownership must be established before tee can fail or be interrupted.
+            "$@" > "${capture}" 2>&1
+        elif [ -n "${capture}" ]; then
             "$@" 2>&1 | tee -a "${LOG_FILE}" "${capture}"
         else
             "$@" 2>&1 | tee -a "${LOG_FILE}"
         fi
     ) <&0 &
     active_phase_pid=$!
+    [ "${phase_monitor}" = 1 ] || set +m
+    active_phase_starting=0
+    if [ "${run_signal_status}" != 0 ] && [ "${run_phase}" != create ]; then
+        handle_run_signal '' "${run_signal_status}"
+    fi
     if wait "${active_phase_pid}"; then status=0; else status=$?; fi
     if [ "${run_phase}" = create ] && [ "${run_signal_status}" != 0 ]; then
         if [ "${status}" -ge 128 ]; then
@@ -1518,8 +1563,19 @@ run_logged_command() {
             status="${run_signal_status}"
         fi
     fi
-    active_phase_pid=""
+    if [ "${status}" = 0 ]; then
+        drain_active_phase
+    fi
     return "${status}"
+}
+
+drain_active_phase() {
+    local pid="${active_phase_pid}"
+    [ -n "${pid}" ] || return 0
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    while kill -0 -- "-${pid}" 2>/dev/null; do sleep 1; done
+    active_phase_pid=""
 }
 
 release_run_claim() {
@@ -1558,6 +1614,9 @@ finish_run() {
         fi
     fi
     # A signal here records cancellation without recursively exiting the EXIT handler.
+    if [ -n "${active_phase_pid}" ]; then
+        kill -TERM -- "-${active_phase_pid}" 2>/dev/null || true
+    fi
     if ! cleanup_container; then
         if [ "${status}" = 0 ]; then
             status=1
@@ -1567,15 +1626,15 @@ finish_run() {
     # Cleanup has completed. Freeze the outcome before publishing the final summary;
     # late signals cannot turn a committed SUCCESS into a nonzero command exit.
     trap '' INT TERM
-    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] && [ "${phase}" != created ]; then
+    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] &&
+        [ "${phase}" != created ] && [ "${phase}" != create-log ]; then
         if ! docker stop -t 1 "${container_id}" >>"${LOG_FILE}" 2>&1; then
             echo 'ERROR: failed to stop interrupted build container' >>"${LOG_FILE}"
             [ "${status}" != 0 ] || { status=1; reason="container stop failed"; }
         fi
     fi
     if [ -n "${active_phase_pid}" ]; then
-        kill -TERM "${active_phase_pid}" 2>/dev/null || true
-        wait "${active_phase_pid}" 2>/dev/null || true
+        drain_active_phase
     fi
     if [ "${original_status}" = 0 ] && [ "${run_signal_status}" != 0 ]; then
         status="${run_signal_status}"
@@ -2000,9 +2059,10 @@ if [ "${PRISTINE}" = 1 ]; then
 fi
 
 start_build_container() {
-    local receipt_line
+    local receipt_line logging_status=0
     container_id=""
     container_created=0
+    container_create_status=0
     RUN_FAILURE_REASON="container creation failed"
     run_phase=create
     docker_create_args=(create --name "${container_name}")
@@ -2014,7 +2074,7 @@ start_build_container() {
     fi
     # Keep platform and default paths on one set of volume/environment arguments.
     container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"
-    run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
+    if run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
         -v "${zmk_cache_volume}:/workspaces" \
         -e ZMK_IN_CONTAINER=1 \
         -e PRISTINE="${PRISTINE}" \
@@ -2025,20 +2085,37 @@ start_build_container() {
         -e CCACHE_DIR="${zmk_ccache_dir}" \
         -e CCACHE_IGNOREOPTIONS='-specs=*' \
         -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'
+        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'; then
+        container_create_status=0
+    else
+        container_create_status=$?
+    fi
     # Keep receipt parsing in this shell: a group signal must not kill an external
     # filter after create succeeded but before ownership was recorded.
-    while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
-        receipt_line="${receipt_line%$'\r'}"
-        if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
-            container_id="${receipt_line}"
-            container_created=1
-            break
-        fi
-    done < "${container_create_output}"
+    if [ "${container_create_status}" = 0 ]; then
+        while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
+            receipt_line="${receipt_line%$'\r'}"
+            if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
+                container_id="${receipt_line}"
+                container_created=1
+                break
+            fi
+        done < "${container_create_output}"
+    fi
+    run_phase=create-log
+    [ "${run_signal_status}" = 0 ] || handle_run_signal '' "${run_signal_status}"
+    # A failed create phase still owns its host group; drain it before replacing
+    # the active PID with the separately cancellable receipt logger.
+    drain_active_phase
+    if run_logged_command '' cat "${container_create_output}"; then :; else logging_status=$?; fi
+    [ "${container_create_status}" = 0 ] || return "${container_create_status}"
     [ -n "${container_id}" ] || die "Docker create did not return a container ID"
     run_phase=created
     [ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
+    if [ "${logging_status}" != 0 ]; then
+        RUN_FAILURE_REASON="container creation logging failed"
+        return "${logging_status}"
+    fi
     rm -f "${container_create_output}"
     container_create_output=""
     RUN_FAILURE_REASON="container start failed"

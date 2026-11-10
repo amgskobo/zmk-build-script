@@ -461,18 +461,35 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
         binary.mkdir()
         docker = binary / 'docker'
         docker.write_text('''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import json, os, pathlib, signal, subprocess, sys, time
 args = sys.argv[1:]
 calls = pathlib.Path(os.environ["IMAGE_CALLS"])
 with calls.open("a") as out: out.write(json.dumps(args) + "\\n")
 if args[0] == "create":
     count = sum(json.loads(row)[0] == "create" for row in calls.read_text().splitlines())
     print(chr(96 + count) * 64)
+    sys.exit(int(os.environ.get('IMAGE_CREATE_EXIT', '0')))
 elif args[0] == "exec":
     if "python3" in args:
         sys.exit(subprocess.call(args[args.index("python3"):]))
-    if any("./build.sh validate" in arg for arg in args): print("build.yaml is valid.")
+    if "find" in args and "/root/zmk-config/.build" in args:
+        sys.stdout.buffer.write(b'/root/zmk-config/.build/held.bin\\0')
+    elif any("./build.sh build" in arg for arg in args): print("Build complete: 1 target(s).")
+    elif any("./build.sh validate" in arg for arg in args): print("build.yaml is valid.")
     else: sys.stdin.buffer.read()
+elif args[0] == "cp":
+    folder = pathlib.Path(os.environ['PHASE_PROBE_ROOT'])
+    (folder / 'phase-group').write_text(str(os.getpgrp()))
+    def stop(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        (folder / 'stopping').touch()
+        while not (folder / 'release').exists(): time.sleep(.01)
+        (folder / 'child-cleanup').touch()
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, stop)
+    (folder / 'copy-ready').touch()
+    while not (folder / 'release').exists(): time.sleep(.01)
+    pathlib.Path('firmware').write_bytes(b'controlled firmware\\n')
 elif args[0] == "rm":
     if os.environ.get("IMAGE_REMOVE_FAIL"): sys.exit(23)
     if os.environ.get("IMAGE_REMOVE_GATE"):
@@ -482,6 +499,163 @@ elif args[0] != "start": sys.exit(99)
 ''')
         docker.chmod(0o755)
         return binary
+
+    def test_parent_only_artifact_interruption_awaits_phase_descendants(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'mv').write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+folder = pathlib.Path(os.environ['PHASE_PROBE_ROOT'])
+if sys.argv[-1].endswith('/build-summary.txt') and not (folder / 'child-cleanup').exists():
+    (folder / 'summary-before-child-cleanup').touch()
+os.execv(os.environ['PHASE_REAL_MV'], ['mv'] + sys.argv[1:])
+''')
+        (binary / 'mv').chmod(0o755)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signum):
+                folder = self.root / ('copy-' + str(signum))
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                           ZMK_BUILD_IMAGE='synthetic.invalid/phase:fixed',
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           IMAGE_CALLS=str(folder / 'calls'), PHASE_PROBE_ROOT=str(folder),
+                           PHASE_REAL_MV=shutil.which('mv'))
+                process = subprocess.Popen(['bash', str(BUILD), str(self.root)], env=env,
+                                           start_new_session=True, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not (folder / 'copy-ready').exists() and time.monotonic() < deadline:
+                        if process.poll() is not None:
+                            output, _ = process.communicate()
+                            self.fail('builder exited before artifact-copy control: ' + output)
+                        time.sleep(.01)
+                    self.assertTrue((folder / 'copy-ready').exists())
+                    process.send_signal(signum)
+                    deadline = time.monotonic() + 5
+                    while (not (folder / 'stopping').exists() and process.poll() is None
+                           and time.monotonic() < deadline):
+                        time.sleep(.01)
+                    self.assertTrue((folder / 'stopping').exists(), 'copy descendant did not receive cancellation')
+                    self.assertIsNone(process.poll(), 'builder completed before phase cleanup')
+                    (folder / 'release').touch()
+                    output, _ = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 128 + signum, output)
+                    self.assertTrue((folder / 'child-cleanup').exists())
+                    self.assertFalse((folder / 'summary-before-child-cleanup').exists())
+                    run = self.run_directory(output)
+                    self.assertIn('Status: FAILED', (run / 'build-summary.txt').read_text())
+                    self.assertFalse((run / 'held.bin').exists())
+                finally:
+                    (folder / 'release').touch()
+                    if (folder / 'phase-group').exists():
+                        try: os.killpg(int((folder / 'phase-group').read_text()), signal.SIGTERM)
+                        except ProcessLookupError: pass
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGTERM)
+                    try: process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
+
+    def make_create_logging_daemon(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'tee').write_text('''#!/usr/bin/env python3
+import os, pathlib, signal, subprocess, sys, time
+data = sys.stdin.buffer.read()
+status = subprocess.run([os.environ['CREATE_REAL_TEE']] + sys.argv[1:], input=data).returncode
+if status: sys.exit(status)
+if any(line == b'a' * 64 for line in data.splitlines()):
+    pathlib.Path(os.environ['CREATE_RECEIPT_OBSERVED']).touch()
+    if os.environ.get('CREATE_LOG_HOLD'):
+        folder = pathlib.Path(os.environ['CREATE_LOG_HOLD'])
+        (folder / 'logger-group').write_text(str(os.getpgrp()))
+        if os.environ.get('CREATE_LOG_TTOU'): os.kill(os.getpid(), signal.SIGTTOU)
+        (folder / 'logger-ready').touch()
+        while not (folder / 'release').exists(): time.sleep(.01)
+    sys.exit(int(os.environ['CREATE_LOG_EXIT']))
+''')
+        (binary / 'tee').chmod(0o755)
+        return binary
+
+    def test_create_receipt_ownership_survives_logging_failure(self):
+        binary = self.make_create_logging_daemon()
+        for create_status, log_status in ((0, 23), (23, 0), (23, 31)):
+            with self.subTest(create=create_status, logger=log_status):
+                folder = self.root / ('create-%s-%s' % (create_status, log_status))
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_BUILD_IMAGE='synthetic.invalid/create:fixed',
+                           IMAGE_CALLS=str(folder / 'calls'), IMAGE_CREATE_EXIT=str(create_status),
+                           CREATE_REAL_TEE=shutil.which('tee'), CREATE_LOG_EXIT=str(log_status),
+                           CREATE_RECEIPT_OBSERVED=str(folder / 'receipt-observed'))
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)],
+                                           env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(completed.returncode, 23, completed.stdout + completed.stderr)
+                self.assertTrue((folder / 'receipt-observed').exists(), 'control did not receive a complete create ID')
+                calls = [json.loads(row) for row in (folder / 'calls').read_text().splitlines()]
+                self.assertEqual(sum(call[0] == 'create' for call in calls), 1)
+                self.assertFalse(any(call[0] == 'start' for call in calls))
+                self.assertEqual(['rm', '-f', 'a' * 64] in calls, create_status == 0,
+                                 'successful create ownership must survive logging failure; failed create owns nothing')
+                summary = (self.run_directory(completed.stdout) / 'build-summary.txt').read_text()
+                self.assertIn('Status: FAILED', summary)
+                reason = 'container creation failed' if create_status else 'container creation logging failed'
+                self.assertIn('Reason: ' + reason, summary)
+
+    def test_parent_only_cancellation_stops_post_create_logger(self):
+        binary = self.make_create_logging_daemon()
+        for create_status, keep, tty_stop in ((0, 0, False), (0, 1, False), (23, 0, False),
+                                              (23, 1, False), (0, 0, True)):
+            with self.subTest(create=create_status, keep=keep, tty_stop=tty_stop):
+                folder = self.root / ('logger-%s-%s-%s' % (create_status, keep, tty_stop))
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER=str(keep),
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_BUILD_IMAGE='synthetic.invalid/logger:fixed',
+                           IMAGE_CALLS=str(folder / 'calls'), IMAGE_CREATE_EXIT=str(create_status),
+                           CREATE_REAL_TEE=shutil.which('tee'), CREATE_LOG_EXIT='0',
+                           CREATE_LOG_HOLD=str(folder), CREATE_RECEIPT_OBSERVED=str(folder / 'receipt'),
+                           CREATE_LOG_TTOU='1' if tty_stop else '')
+                process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)],
+                                           env=env, start_new_session=True, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not (folder / 'logger-ready').exists() and time.monotonic() < deadline:
+                        if process.poll() is not None:
+                            output, _ = process.communicate()
+                            self.fail('logger control was not reached: ' + output)
+                        time.sleep(.01)
+                    self.assertTrue((folder / 'logger-ready').exists(),
+                                    'owned console writer stopped on terminal job-control signal')
+                    process.send_signal(signal.SIGTERM)
+                    try:
+                        output, _ = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.fail('post-create logger did not stop on parent-only cancellation')
+                    self.assertEqual(process.returncode, create_status or 143, output)
+                    calls = [json.loads(row) for row in (folder / 'calls').read_text().splitlines()]
+                    self.assertFalse(any(call[0] in ('start', 'stop') for call in calls), calls)
+                    self.assertEqual(['rm', '-f', 'a' * 64] in calls, create_status == keep == 0, calls)
+                    summary = (self.run_directory(output) / 'build-summary.txt').read_text()
+                    reason = 'container creation failed' if create_status else 'interrupted by SIGTERM'
+                    self.assertIn('Status: FAILED', summary)
+                    self.assertIn('Reason: ' + reason, summary)
+                finally:
+                    (folder / 'release').touch()
+                    if (folder / 'logger-group').exists():
+                        try:
+                            os.killpg(int((folder / 'logger-group').read_text()), signal.SIGCONT)
+                            os.killpg(int((folder / 'logger-group').read_text()), signal.SIGTERM)
+                        except ProcessLookupError: pass
+                    if process.poll() is None: process.send_signal(signal.SIGTERM)
+                    try: process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
     def test_auto_image_selection_uses_west_manifest_structure(self):
         binary = self.make_image_selection_daemon()
@@ -809,6 +983,30 @@ elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
         self.expect_targets({'include': [{'board': 'A', 'snippet': 'old',
                                           'artifact-name': 'name-{snippet}'}],
                              'exclude': [{'artifact-name': 'name-old'}]}, [], snippets='new')
+
+    def test_exclude_uses_raw_artifact_names_before_normalization(self):
+        for key in ('artifact-name', 'artifact_name'):
+            for remaining in ('retained', 'name_with_space'):
+                with self.subTest(key=key, remaining=remaining):
+                    self.expect_targets({'include': [
+                        {'board': 'A', key: 'name with space'},
+                        {'board': 'B', key: remaining}],
+                        'exclude': [{key: 'name with space'}]}, [target(remaining, board='B')])
+            with self.subTest(key=key, template=True):
+                self.expect_targets({'include': [{'board': 'A', 'snippet': 'old',
+                                                  key: 'name {board} {snippet}'}],
+                                     'exclude': [{key: 'name A old'}]}, [], snippets='cli')
+            with self.subTest(key=key, exact_safe_name=True):
+                self.expect_targets({'include': [
+                    {'board': 'A', key: 'name with space'},
+                    {'board': 'B', key: 'name_with_space'}],
+                    'exclude': [{key: 'name_with_space'}]}, [target('name_with_space')])
+            with self.subTest(key=key, legacy_alias_scope=True):
+                self.expect_targets({'include': [
+                    {'board': 'A', key: 'name with space'},
+                    {'board': 'B', key: 'name_with_space'}],
+                    'exclude': [{'board': 'A', key: 'name_with_space'}]},
+                    [target('name_with_space', board='B')])
 
     def test_current_target_shapes_fixture_exact_trace(self):
         nice = 'nice_nano/nrf52840/zmk'
@@ -1266,6 +1464,10 @@ elif sys.argv[1] != 'rm': sys.exit(99)
 ''')
         docker.chmod(0o755)
         (self.root / 'build.yaml').write_text('board: A\n')
+        ownership_hook = self.root / 'observe-create-ownership.sh'
+        ownership_hook.write_text('''set -T
+trap 'if [ "${FUNCNAME[0]:-}" = finish_run ]; then trap - DEBUG; printf "%s\\t%s\\n" "${container_id:-}" "${container_created:-}" > "$SIGNAL_OWNED"; fi' DEBUG
+''')
         for mode in ('build', 'validate'):
             for keep in (0, 1):
                 for signum in (signal.SIGINT, signal.SIGTERM):
@@ -1275,7 +1477,8 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                         env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
                                    ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER=str(keep),
                                    SIGNAL_CALLS=str(case / 'calls'), SIGNAL_REACHED=str(case / 'reached'),
-                                   SIGNAL_RELEASE=str(case / 'release'))
+                                   SIGNAL_RELEASE=str(case / 'release'), BASH_ENV=str(ownership_hook),
+                                   SIGNAL_OWNED=str(case / 'owned'))
                         args = ['bash', str(BUILD)]
                         if mode == 'validate': args.append('validate')
                         args.append(str(self.root))
@@ -1293,7 +1496,8 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             (case / 'release').touch()
                             output, _ = process.communicate(timeout=5)
                             self.assertEqual(process.returncode, 128 + signum, output)
-                            self.assertIn('a' * 64, output)
+                            self.assertEqual((case / 'owned').read_text(), 'a' * 64 + '\t1\n',
+                                             'create ID must be owned before interrupted cleanup')
                             calls = [json.loads(line) for line in (case / 'calls').read_text().splitlines()]
                             self.assertFalse(any(call[0] == 'start' for call in calls), calls)
                             self.assertEqual(['rm', '-f', 'a' * 64] in calls, keep == 0, calls)

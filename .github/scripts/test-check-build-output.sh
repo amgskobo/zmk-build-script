@@ -85,6 +85,26 @@ Mode: validate
 EOF
 run_ok validate
 
+# Partial enumeration is unavailable evidence, never an older successful run.
+# Drain each real producer before injecting its final failure, independently of
+# metadata parsing; an explicit run must remain usable without discovery.
+discovery_bin="${tmp_dir}/discovery-bin"
+mkdir "${discovery_bin}"
+for discovery_command in find sort; do
+  discovery_real="$(command -v "${discovery_command}")"
+  cat > "${discovery_bin}/${discovery_command}" <<'EOF'
+#!/usr/bin/env bash
+"${DISCOVERY_REAL}" "$@" || exit "$?"
+exit 23
+EOF
+  chmod +x "${discovery_bin}/${discovery_command}"
+  PATH="${discovery_bin}:${PATH}" DISCOVERY_REAL="${discovery_real}" \
+    run_fail validate 'Failed to enumerate build summaries'
+  PATH="${discovery_bin}:${PATH}" DISCOVERY_REAL="${discovery_real}" \
+    run_ok validate "${run_path}"
+  rm "${discovery_bin}/${discovery_command}"
+done
+
 # The config label follows the timestamp; collision suffixes use hyphens.
 for suffix in -2 -10; do
   renamed="${run_path}${suffix}"

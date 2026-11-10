@@ -170,6 +170,8 @@ The wrapper assigns unique slugs and separates each source's clone, cache,
 container and artifacts. Its rolling queue starts the next source when a slot
 opens; a source failure does not stop the other sources. Keep separate wrapper
 invocations from sharing clone slugs/directories.
+If the coordinator is interrupted or its output fails, it stops and waits for
+its acquired worker groups before returning the original failure status.
 
 ### Independent invocations and shared caches
 
@@ -229,6 +231,9 @@ appended. Alias spellings `cmake_args`, `extra_cmake_args` and `artifact_name` a
 also accepted. Artifact names are normalized to safe filenames; Windows device
 names, including names with extensions, and case-insensitive duplicates are
 rejected.
+Artifact exclusions first match the YAML-derived name before filename normalization.
+A normalized name remains a compatibility alias when no literal name matches the
+same board/shield/snippet selectors.
 
 ### Standalone applications
 
@@ -318,7 +323,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 
 | Wrapper option | Meaning |
 | --- | --- |
-| `--repo URL`, `--path DIR` | Select an explicit source type. |
+| `--repo URL`, `--path DIR` | Select an explicit source type. An explicit `--repo` requires a nonempty URL. |
 | `--revision SHA` | Fetch and verify an exact full commit SHA. In `auto-build-external.sh`, place it after the corresponding `--repo URL`; local paths cannot have a revision. |
 | `--source-slug NAME`, `--repo-slug NAME` | Set a source's slug; in the multi-source wrapper, place it after `--repo` / `--path`. |
 | `--mode build\|validate` | Select build or validation. |
@@ -471,6 +476,9 @@ are normalized to `0644` on Unix; executable and special permission bits are rem
 Started runs retain a failure summary and error excerpt even when setup, source
 copy, artifact recovery or container cleanup fails. Build output also goes to the
 container log stream; inspect a retained container with `docker logs <container>`.
+Interruption waits for owned host copy/log processes and container cleanup before
+the final summary. Log-write failures retain a failure outcome and the configured
+container cleanup policy.
 Check a specific run with:
 
 ```bash
@@ -485,6 +493,8 @@ when no expectations file is supplied.
 Relative run paths resolve from the caller's directory. Without a run path, the
 checker searches that directory's `.build/`. Pass the run path when checking from
 elsewhere.
+Incomplete or failed discovery is an error; it cannot select an older successful
+run as a substitute for unavailable evidence.
 Run names follow the displayed convention with an optional `-N` collision suffix
 from 2. Automatic selection orders timestamps and config labels, then collision
 sequences recorded in summaries numerically for matching labels; pass an explicit run path to identify
@@ -517,7 +527,7 @@ without an additional host parser dependency.
 | Workflow | Purpose |
 | --- | --- |
 | [Compatibility](.github/workflows/compatibility.yml) | Hosted shell checks on Windows/macOS/Linux; Docker and firmware checks on Ubuntu. |
-| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | Manual `platform: macos\|windows\|linux\|all`, `mode: validate\|build`. Validate runs shell and Docker contracts; build also compiles fixtures. |
+| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | Manual `platform: macos\|windows\|linux\|all`, `mode: validate\|build\|firmware`. Validate runs shell and Docker contracts; build runs all layers; firmware selects the existing firmware layer. |
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Resolve the list on Ubuntu, then route each source to an eligible self-hosted runner. |
 | [Heartbeat](.github/workflows/heartbeat.yml) | Update the tracked heartbeat record; this workflow commits and pushes. |
 

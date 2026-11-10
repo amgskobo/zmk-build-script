@@ -584,7 +584,12 @@ else
 
   build_summary=""
   latest_key="" latest_number=0
+  if ! candidate_summaries="$(find .build -mindepth 2 -maxdepth 2 -type f -name build-summary.txt -print | sort)"; then
+    echo 'Failed to enumerate build summaries.' >&2
+    exit 1
+  fi
   while IFS= read -r summary; do
+    [ -n "${summary}" ] || continue
     candidate_dir="${summary%/*}"
     require_valid_run_dir "${candidate_dir}" "build summary directory"
     read_run_order "${candidate_dir}" "${summary}"
@@ -598,7 +603,7 @@ else
       build_summary="${summary}"
       latest_key="${candidate_key}" latest_number="${candidate_number}"
     fi
-  done < <(find .build -mindepth 2 -maxdepth 2 -type f -name build-summary.txt -print | sort)
+  done <<< "${candidate_summaries}"
 fi
 
 if [ -z "${build_summary}" ] || [ ! -f "${build_summary}" ]; then

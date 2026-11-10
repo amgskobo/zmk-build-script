@@ -161,6 +161,7 @@ bash scripts/auto-build-external.sh --sources-file repos.txt --source-jobs 2 --j
 wrapperがslugを一意化し、sourceごとのclone、cache、container、成果物を分離します。
 空き枠には次のsourceを投入し、一つのsourceが失敗しても他のsourceは継続します。
 別々のwrapper実行で、同じclone用slug・directoryを共有しないでください。
+coordinator の中断や出力失敗では、取得済み worker group を停止・回収してから、元の失敗 status を返します。
 
 ### 独立した実行とcacheの共有
 
@@ -216,6 +217,8 @@ include:
 board / shield 配列は top-level と `include:` の両方で matrix に展開します。
 `defaults:` は不足値を補い、`exclude:` は CLI snippet を合成する前の YAML 値で照合します。
 `cmake_args` / `extra_cmake_args` / `artifact_name` の alias も扱います。
+artifact の除外は、ファイル名へ正規化する前の YAML 由来の名前を優先します。
+同じ board / shield / snippet の条件に一致する名前がなければ、正規化済みの名前も互換 alias として照合します。
 artifact 名は安全な file 名へ正規化し、拡張子つきも含む Windows 予約名と、大小文字を無視した重複を拒否します。
 
 ### 独立application
@@ -294,7 +297,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 
 | wrapper option | 意味 |
 | --- | --- |
-| `--repo URL`, `--path DIR` | source の種類を明示します。 |
+| `--repo URL`, `--path DIR` | source の種類を明示します。明示した `--repo` には空でない URL が必要です。 |
 | `--revision SHA` | 完全なコミットSHAを取得し、一致を確認します。`auto-build-external.sh` では対応する `--repo URL` の後ろに置きます。local path には指定できません。 |
 | `--source-slug NAME`, `--repo-slug NAME` | source の slug を指定します。複数 source wrapper では `--repo` / `--path` の後ろに置きます。 |
 | `--mode build\|validate` | build / validate を選びます。 |
@@ -421,6 +424,8 @@ Unix では回収した firmware の権限を `0644` に揃え、実行権限・
 
 開始済み run は setup、source copy、成果物回収、container 削除の失敗にも FAILED summary と error excerpt を残します。
 build 出力は container の log stream にも流れ、保持した container は `docker logs <container>` で確認できます。
+中断時は、所有する host 側の copy / log process と container の後始末を待ってから最終 summary を確定します。
+log 書込みが失敗した場合も失敗状態を保持し、指定された container cleanup 方針を適用します。
 特定 run の成果物確認は次のように実行します。
 
 ```bash
@@ -432,6 +437,7 @@ validate の結果は `build` を `validate` に置き換えます。両 mode �
 既知の metadata field は重複を拒否し、期待値 file がない場合も target・image・cache の field を検証します。
 相対run pathは呼び出し元のdirectoryを基準に解決し、省略時はそのdirectoryの `.build/` を探します。
 別の directory から確認するときは run path を指定します。
+探索の失敗・不完全な列挙はエラーとし、取得不能な証跡の代わりに古い成功 run を選びません。
 run 名は上記の規則に従い、衝突時だけ 2 から始まる `-N` を付けます。自動選択では日時と config 表示名を並べ、
 同じ表示名の summary に記録した連番を数値として扱います。実行を特定する場合は run path を明示します。
 日時のみ、旧 `-N`、旧 `-pid-PID`、連番 metadata のない旧 dot 区切りの directory も検証できます。
@@ -457,7 +463,7 @@ local pathを含む期待値fileは非公開で保持します。Bashと標準to
 | workflow | 用途 |
 | --- | --- |
 | [Compatibility](.github/workflows/compatibility.yml) | Windows / macOS / Linux の hosted shell、Ubuntu の Docker / firmware 検証。 |
-| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | 手動の `platform: macos\|windows\|linux\|all`、`mode: validate\|build`。validate は shell / Docker、build は firmware も確認します。 |
+| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | 手動の `platform: macos\|windows\|linux\|all`、`mode: validate\|build\|firmware`。validate は shell / Docker、build は全層、firmware は既存の firmware 層を選びます。 |
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Ubuntu で list を解決し、source ごとに利用可能な self-hosted runner へ割り当てます。 |
 | [Heartbeat](.github/workflows/heartbeat.yml) | 追跡中の heartbeat 記録を更新します。commit / push を含む workflow です。 |
 
