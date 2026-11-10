@@ -45,10 +45,12 @@ cleanup() {
 }
 trap cleanup EXIT
 build_case() {
-  local name="$1" run expectations expected_image expected_tag expected_target artifact
+  local name="$1" run expectations expected_image expected_tag expected_target expected_compiler artifact key value
   shift
   expectations="${ZMK_TEST_RESULTS}/${name}.expect"
   expected_target="$(cd "$1" && pwd -P)"
+  expected_compiler="${CMAKE_BUILD_PARALLEL_LEVEL:-auto}"
+  while [ "${expected_compiler#0}" != "${expected_compiler}" ]; do expected_compiler="${expected_compiler#0}"; done
   expected_image="${ZMK_BUILD_IMAGE:-}"
   if [ -z "${expected_image}" ]; then
     # These fixtures pin a mainline commit; their auto toolchain is stable.
@@ -58,6 +60,7 @@ build_case() {
   fi
   {
     printf '%s\0' image "${expected_image}" target "${expected_target}" cache "${ZMK_DOCKER_CACHE_VOLUME}"
+    printf '%s\0' jobs "${ZMK_BUILD_JOBS:-1}" compiler-jobs "${expected_compiler}"
     case "${name}" in
       standard)
         for artifact in ci_extra_nice_nano_corne_left_nice_view_adapter ci_split_nice_nano_corne_right_nice_view_adapter \
@@ -71,13 +74,22 @@ build_case() {
       *) echo 'Missing fixture output expectations.' >&2; return 1 ;;
     esac
   } > "${expectations}"
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    [ "${key}" != artifact ] || printf '%s\n' "${value%.*}"
+  done < "${expectations}" > "${ZMK_TEST_RESULTS}/${name}.expected-order"
   container_logs+=("${ZMK_TEST_RESULTS}/${name}.log")
   bash build.sh "$@" | tee "${ZMK_TEST_RESULTS}/${name}.log"
   run="$(sed $'s/\033\[[0-9;]*m//g' "${ZMK_TEST_RESULTS}/${name}.log" | tail -n 1 | tr -d '\r')"
   bash .github/scripts/check-build-output.sh build "${run}" --expect "${expectations}"
+  sed $'s/\033\[[0-9;]*m//g' "${run}/build.log" | tr -d '\r' |
+    sed -n 's/^>>> Building: //p' > "${ZMK_TEST_RESULTS}/${name}.actual-order"
+  cmp "${ZMK_TEST_RESULTS}/${name}.expected-order" "${ZMK_TEST_RESULTS}/${name}.actual-order"
   case "${name}" in
     standard)
       grep -qx 'Built targets: 8' "${run}/build-summary.txt"
+      if [ "${ZMK_BUILD_JOBS:-1}" -gt 1 ]; then
+        grep -F "Building targets in parallel (jobs=${ZMK_BUILD_JOBS})" "${run}/build.log"
+      fi
       [ "$(find "${run}" -maxdepth 1 -name '*.uf2' | wc -l | tr -d '[:space:]')" = 8 ] ;;
     overlay|restore)
       grep -qx 'Built targets: 2' "${run}/build-summary.txt"
@@ -101,28 +113,30 @@ cache_reader_id="$(docker create --name "${cache_reader}" -v "${ZMK_DOCKER_CACHE
 containers+=("${cache_reader_id}")
 # Use the same native host-path conversion as external clone.
 source scripts/build-external-source.sh
-host_scratch="$(docker_host_path "${scratch}")"
+module_parent="${scratch}/.module inputs 名前"
+mkdir -p "${module_parent}"
+host_scratch="$(docker_host_path "${module_parent}")"
 docker cp "${cache_reader_id}:/workspaces/zmk-config/modules/msgs/zmk-studio-messages" "${host_scratch}/"
 docker cp "${cache_reader_id}:/workspaces/zmk-config/modules/lib/zcbor" "${host_scratch}/"
-touch "${scratch}/zmk-studio-messages/.ci-local-override" "${scratch}/zcbor/.ci-local-override"
-extra="${scratch}/zmk-feature-ci-extra"
+touch "${module_parent}/zmk-studio-messages/.ci-local-override" "${module_parent}/zcbor/.ci-local-override"
+extra="${module_parent}/zmk-feature ci-extra 名前"
 mkdir -p "${extra}/zephyr" "${extra}/boards/shields/ci-extra" "${extra}/snippets/ci-extra"
 printf 'name: zmk-feature-ci-extra\nbuild: {settings: {board_root: ., snippet_root: .}}\n' > "${extra}/zephyr/module.yml"
 printf 'name: ci-extra\n' > "${extra}/snippets/ci-extra/snippet.yml"
-hidden="${scratch}/.ci-hidden-extra"
+hidden="${module_parent}/.ci hidden extra 名前"
 mkdir -p "${hidden}/zephyr"
 printf 'name: ci-hidden-extra\nbuild: {cmake: .}\n' > "${hidden}/zephyr/module.yml"
 printf 'message(STATUS "Hidden module input reached CMake")\n' > "${hidden}/CMakeLists.txt"
 overlay="zmk-test-overlay-$$"
 ZMK_KEEP_CONTAINER=1 ZMK_CONTAINER_NAME="${overlay}" build_case overlay .github/fixtures/module-override-zmk-config \
-  -m "${scratch}/zmk-studio-messages" -m "${scratch}/zcbor" -m "${extra}" -m "${hidden}"
+  -m "${module_parent}/zmk-studio-messages" -m "${module_parent}/zcbor" -m "${extra}" -m "${hidden}"
 for pair in zmk-studio-messages:msgs zcbor:lib; do
   project="${pair%:*}"; parent="${pair#*:}"
   grep -F "Overlaying module input west project: ${project} -> modules/${parent}/${project}" "${ZMK_TEST_RESULTS}/overlay.log"
   docker exec "${last_container}" test -f "/workspaces/zmk-config/modules/${parent}/${project}/.ci-local-override"
 done
-grep -F 'Adding module input as extra module: zmk-feature-ci-extra' "${ZMK_TEST_RESULTS}/overlay.log"
-grep -F 'Adding module input as extra module: .ci-hidden-extra' "${ZMK_TEST_RESULTS}/overlay.log"
+grep -F 'Adding module input as extra module: zmk-feature ci-extra 名前' "${ZMK_TEST_RESULTS}/overlay.log"
+grep -F 'Adding module input as extra module: .ci hidden extra 名前' "${ZMK_TEST_RESULTS}/overlay.log"
 [ "$(grep -c '^-- Hidden module input reached CMake$' "${ZMK_TEST_RESULTS}/overlay.log")" = 2 ]
 restore="zmk-test-restore-$$"
 # Never pass --pristine: the previous workspace is the subject of this assertion.
@@ -156,7 +170,7 @@ PY
 capture_container_build_stream "${last_container}" "${ZMK_TEST_RESULTS}/container-build-stream.log" 'Build complete: 2 target(s).'
 # Reuse the resolved manifest, but compile a root application with module search roots.
 # Its CMakeLists.txt must remain the application entry point, not a module build file.
-standalone="${scratch}/standalone"
+standalone="${scratch}/.application inputs 名前/standalone app"
 mkdir -p "${standalone}/config" "${standalone}/src" "${standalone}/boards" \
   "${standalone}/dts" "${standalone}/snippets/ci-standalone"
 cp .github/fixtures/ci-zmk-config/config/west.yml "${standalone}/config/west.yml"

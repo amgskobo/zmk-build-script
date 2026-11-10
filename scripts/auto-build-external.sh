@@ -322,7 +322,9 @@ builder_args_for_source() {
 
 run_source_processes() {
     local failed=0 completed=0 active=0 next_index=0 i stop_status=0 monitor_was_set=0
-    local pids=()
+    # EXIT after errexit can run after this function's locals have unwound.
+    # Keep only the acquired group registry alive for that cleanup path.
+    SOURCE_WORKER_PIDS=()
     local pid_indexes=()
     local statuses=()
     local args=()
@@ -337,16 +339,24 @@ run_source_processes() {
     trap 'stop_status=143' TERM
 
     stop_source_processes() {
-        local pid
-        trap '' INT TERM
-        echo "External build interrupted; waiting for source workers." >&2
-        for pid in ${pids[@]+"${pids[@]}"}; do
+        local status="${1:-${stop_status}}" pid
+        trap - EXIT
+        trap '' INT TERM PIPE
+        echo "External build interrupted; waiting for source workers." >&2 || true
+        for pid in ${SOURCE_WORKER_PIDS[@]+"${SOURCE_WORKER_PIDS[@]}"}; do
             # Each worker has its own process group, including clone/build children.
             kill -TERM -- "-${pid}" 2>/dev/null || true
         done
-        for pid in ${pids[@]+"${pids[@]}"}; do wait "${pid}" 2>/dev/null || true; done
-        exit "${stop_status}"
+        for pid in ${SOURCE_WORKER_PIDS[@]+"${SOURCE_WORKER_PIDS[@]}"}; do wait "${pid}" 2>/dev/null || true; done
+        for pid in ${SOURCE_WORKER_PIDS[@]+"${SOURCE_WORKER_PIDS[@]}"}; do
+            while kill -0 -- "-${pid}" 2>/dev/null; do sleep 1; done
+        done
+        exit "${status}"
     }
+    # A closed log reader or another unexpected shell failure still owns every
+    # started worker group. Preserve that failure after their cleanup completes.
+    trap 'stop_source_processes "$?"' EXIT
+    trap 'exit 141' PIPE
 
     for i in "${!source_values[@]}"; do
         statuses[$i]="pending"
@@ -363,7 +373,7 @@ run_source_processes() {
         # Bash 3.2 job control supplies a group without a host setsid dependency.
         set -m
         bash "${SOURCE_BUILDER}" "${args[@]}" <&0 &
-        pids+=("$!")
+        SOURCE_WORKER_PIDS+=("$!")
         [ "${monitor_was_set}" = 1 ] || set +m
         pid_indexes+=("${source_index}")
         statuses[$source_index]="running"
@@ -375,9 +385,9 @@ run_source_processes() {
         while :; do
             [ "${stop_status}" = 0 ] || return 0
             found=0
-            if [ ${#pids[@]} -gt 0 ]; then
-                for j in "${!pids[@]}"; do
-                    pid="${pids[$j]}"
+            if [ ${#SOURCE_WORKER_PIDS[@]} -gt 0 ]; then
+                for j in "${!SOURCE_WORKER_PIDS[@]}"; do
+                    pid="${SOURCE_WORKER_PIDS[$j]}"
                     if kill -0 "${pid}" 2>/dev/null; then
                         continue
                     fi
@@ -395,7 +405,7 @@ run_source_processes() {
                         failed=$((failed + 1))
                     fi
                     echo "Finished ${slugs[$source_index]}: ${statuses[$source_index]}"
-                    unset "pids[$j]"
+                    unset "SOURCE_WORKER_PIDS[$j]"
                     unset "pid_indexes[$j]"
                     completed=$((completed + 1))
                     active=$((active - 1))
@@ -421,14 +431,14 @@ run_source_processes() {
         collect_finished_sources 0
     done
 
-    trap - INT TERM
-
     echo ""
     echo "External build summary:"
     for i in "${!source_values[@]}"; do
         printf '  - %s: %s (%s)\n' "${slugs[$i]}" "${statuses[$i]}" "${source_values[$i]}"
     done
     echo "=== Done: ${failed} failure(s) ==="
+    [ "${stop_status}" = 0 ] || stop_source_processes
+    trap - EXIT INT TERM PIPE
     [ "${failed}" = "0" ]
 }
 
@@ -454,6 +464,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --repo)
             [ "$#" -ge 2 ] || { echo "ERROR: --repo requires a value" >&2; exit 1; }
+            [ -n "$2" ] || { echo 'ERROR: --repo requires a nonempty URL' >&2; exit 1; }
             add_source "repo" "$2"
             last_source_index="$((${#source_values[@]} - 1))"
             shift

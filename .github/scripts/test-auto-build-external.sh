@@ -8,6 +8,22 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/zmk-external-test.XXXXXX")"
 tmp_dir="$(cd "${tmp_dir}" && pwd -P)"
 
 cleanup() {
+  local file pid
+  for file in "${tmp_dir}"/queue-output-*/coordinator-pid; do
+    [ -f "${file}" ] || continue
+    IFS= read -r pid < "${file}" || continue
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  for file in "${tmp_dir}"/queue-output-*/*.worker-pid; do
+    [ -f "${file}" ] || continue
+    IFS= read -r pid < "${file}" || continue
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+  done
+  for file in "${tmp_dir}"/queue-output-*/*.worker-pid; do
+    [ -f "${file}" ] || continue
+    IFS= read -r pid < "${file}" || continue
+    while kill -0 -- "-${pid}" 2>/dev/null; do sleep 1; done
+  done
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
@@ -49,6 +65,26 @@ mkdir -p "${local_one}/config" "${local_two}/config" "${local_three}/config"
 touch "${local_one}/config/west.yml" "${local_one}/build.yaml"
 touch "${local_two}/config/west.yml" "${local_two}/build.yaml"
 touch "${local_three}/config/west.yml" "${local_three}/build.yaml"
+
+# Explicit empty input must not expand into the default source list, even for
+# list-only output or after another valid selection. No worker may be started.
+empty_repo_probe="${tmp_dir}/empty-repo-probe.sh"
+printf '#!/usr/bin/env bash\nprintf "worker started\\n" >> "$EMPTY_REPO_WORKERS"\n' > "${empty_repo_probe}"
+for empty_case in run indices after-selection; do
+  empty_args=(--repo '')
+  case "${empty_case}" in
+    run) empty_args+=(--pristine --source-jobs 8) ;;
+    indices) empty_args+=(--list-indices-json) ;;
+    after-selection) empty_args=(--list --repo https://example.invalid/control.git --repo '') ;;
+  esac
+  if EMPTY_REPO_WORKERS="${tmp_dir}/empty-repo-workers" ZMK_EXTERNAL_SOURCE_BUILDER="${empty_repo_probe}" \
+      bash "${builder}" "${empty_args[@]}" > "${tmp_dir}/empty-repo-${empty_case}.out" 2>&1; then
+    fail 'empty explicit repository was accepted or expanded to default sources'
+  fi
+  assert_file_contains "${tmp_dir}/empty-repo-${empty_case}.out" '--repo requires a nonempty URL' \
+    'empty repository rejection did not reach its CLI guard'
+  [ ! -e "${tmp_dir}/empty-repo-workers" ] || fail 'empty repository started a source worker'
+done
 
 repos_file="${tmp_dir}/repos.txt"
 cat > "${repos_file}" <<'EOF'
@@ -132,11 +168,31 @@ assert_file_contains "${tmp_dir}/bad-pin.out" '--revision must follow --repo' 'l
 
 pin_probe="${tmp_dir}/pin-probe.sh"
 printf '#!/usr/bin/env bash\nprintf '\''%%s\\0'\'' "$@" > "$PIN_ARGV"\n' > "${pin_probe}"
-PIN_ARGV="${tmp_dir}/pinned.argv" ZMK_EXTERNAL_SOURCE_BUILDER="${pin_probe}" \
-  bash "${builder}" --sources-file "${pinned_file}" --source-index 2 --mode validate > "${tmp_dir}/pin-probe.out"
-printf '%s\0' --repo https://example.invalid/config.git --revision "${revision_two}" \
-  --source-slug config-2 --mode validate --jobs 1 > "${tmp_dir}/expected-pinned.argv"
-cmp "${tmp_dir}/expected-pinned.argv" "${tmp_dir}/pinned.argv" || fail 'worker did not receive the selected revision'
+# Define each budget independently of the invoking runner. Keep exact argv checks
+# for the selected pin while covering defaults, environment and CLI precedence.
+for budget in default environment leading-zero cli-override; do
+  case "${budget}" in
+    default) expected_jobs=1 ;;
+    environment) expected_jobs=2 ;;
+    leading-zero) expected_jobs=0002 ;;
+    cli-override) expected_jobs=3 ;;
+  esac
+  (
+    unset ZMK_BUILD_JOBS
+    jobs_args=()
+    case "${budget}" in
+      environment|cli-override) export ZMK_BUILD_JOBS=2 ;;
+      leading-zero) export ZMK_BUILD_JOBS=0002 ;;
+    esac
+    [ "${budget}" != cli-override ] || jobs_args+=(--jobs 3)
+    PIN_ARGV="${tmp_dir}/pinned.argv" ZMK_EXTERNAL_SOURCE_BUILDER="${pin_probe}" \
+      bash "${builder}" --sources-file "${pinned_file}" --source-index 2 --mode validate \
+      ${jobs_args[@]+"${jobs_args[@]}"} > "${tmp_dir}/pin-probe.out"
+  )
+  printf '%s\0' --repo https://example.invalid/config.git --revision "${revision_two}" \
+    --source-slug config-2 --mode validate --jobs "${expected_jobs}" > "${tmp_dir}/expected-pinned.argv"
+  cmp "${tmp_dir}/expected-pinned.argv" "${tmp_dir}/pinned.argv" || fail "worker pin/budget argv mismatch: ${budget}"
+done
 
 # Every repository in the maintained default list needs a pin, independent of its size.
 default_list="$(bash "${builder}" --list "${repo_root}/repos.txt")"
@@ -338,8 +394,15 @@ stop() {
   exit 143
 }
 trap stop TERM
+printf '%s\n' "$$" > "${CANCEL_ROOT}/${slug}.worker-pid"
+if [ "${slug}" = fast ]; then
+  : > "${CANCEL_ROOT}/${slug}.started"
+  while [ ! -f "${CANCEL_ROOT}/release-fast" ]; do sleep .05; done
+  exit 0
+fi
 sleep 30 &
 child=$!
+printf '%s\n' "${child}" > "${CANCEL_ROOT}/${slug}.child-pid"
 : > "${CANCEL_ROOT}/${slug}.started"
 wait "$child"
 EOF
@@ -362,6 +425,78 @@ wait "${cancel_timer}" 2>/dev/null || true
 [ -f "${cancel_root}/first.stopped" ] && [ -f "${cancel_root}/second.stopped" ] || \
   fail 'coordinator returned before active workers stopped'
 [ ! -f "${cancel_root}/pending.started" ] || fail 'cancellation started a pending source'
+
+# A broken reader and a failed writer are distinct exit paths. Reuse the same
+# worker fixture; retain exact status and child completion without another build.
+# Noninteractive Bash cannot reset SIGPIPE ignored at entry. Probe that inherited
+# signal state independently; a broken builtin writer then exits 1 instead of 141.
+if bash -c 'trap "exit 141" PIPE; kill -PIPE "$$" || exit 2; exit 1' \
+    > "${tmp_dir}/pipe-disposition.out" 2>&1; then
+  fail 'SIGPIPE disposition control unexpectedly succeeded'
+else
+  pipe_failure_status=$?
+fi
+case "${pipe_failure_status}" in 1|141) ;; *) fail 'SIGPIPE disposition control failed' ;; esac
+for output_failure in pipe write; do
+  output_root="${tmp_dir}/queue-output-${output_failure}"
+  mkdir "${output_root}"
+  cat > "${output_root}/bash-env" <<'EOF'
+if [ ! -e "${CANCEL_ROOT}/coordinator-pid" ]; then
+  printf '%s\n' "$$" > "${CANCEL_ROOT}/coordinator-pid"
+fi
+if [ "${OUTPUT_FAILURE}" = write ]; then
+  echo() {
+    case "${1:-}" in Finished*) return 23 ;; esac
+    builtin echo "$@"
+  }
+fi
+EOF
+  if [ "${output_failure}" = pipe ]; then
+    exec 9< <(
+      set +e
+      CANCEL_ROOT="${output_root}" OUTPUT_FAILURE=pipe BASH_ENV="${output_root}/bash-env" \
+        ZMK_EXTERNAL_SOURCE_BUILDER="${cancel_root}/worker.sh" \
+        bash "${builder}" --path "${local_one}" --source-slug fast \
+          --path "${local_two}" --source-slug slow --path "${local_three}" --source-slug pending \
+          --source-jobs 2 2>"${output_root}/stderr"
+      printf '%s\n' "$?" > "${output_root}/status"
+    )
+    output_launcher=$!
+    for line in 1 2 3; do IFS= read -r ignored <&9 || fail 'queue output ended before workers started'; done
+  else
+    (
+      set +e
+      CANCEL_ROOT="${output_root}" OUTPUT_FAILURE=write ZMK_EXTERNAL_SOURCE_BUILDER="${cancel_root}/worker.sh" \
+        BASH_ENV="${output_root}/bash-env" bash "${builder}" \
+          --path "${local_one}" --source-slug fast --path "${local_two}" --source-slug slow \
+          --path "${local_three}" --source-slug pending --source-jobs 2 >"${output_root}/console" 2>&1
+      printf '%s\n' "$?" > "${output_root}/status"
+    ) &
+    output_launcher=$!
+  fi
+  for attempt in $(seq 1 200); do
+    [ ! -f "${output_root}/fast.started" ] || [ ! -f "${output_root}/slow.started" ] || break
+    sleep .05
+  done
+  [ -f "${output_root}/fast.started" ] && [ -f "${output_root}/slow.started" ] || fail 'queue output control did not start both workers'
+  [ "${output_failure}" != pipe ] || exec 9<&-
+  : > "${output_root}/release-fast"
+  for attempt in $(seq 1 200); do
+    [ ! -f "${output_root}/status" ] || break
+    sleep .05
+  done
+  [ -f "${output_root}/status" ] || fail 'queue output failure did not complete'
+  IFS= read -r output_status < "${output_root}/status"
+  expected=23; [ "${output_failure}" != pipe ] || expected="${pipe_failure_status}"
+  [ "${output_status}" = "${expected}" ] || fail 'queue output failure lost its exit status'
+  [ -f "${output_root}/slow.stopped" ] || \
+    fail "queue ${output_failure} failure left a source worker running: $(cat "${output_root}/stderr" 2>/dev/null || cat "${output_root}/console")"
+  IFS= read -r child < "${output_root}/slow.child-pid"
+  if kill -0 "${child}" 2>/dev/null; then fail 'queue output failure left the worker child running'; fi
+  [ ! -f "${output_root}/pending.started" ] || fail 'queue output failure started a pending source'
+  wait "${output_launcher}" 2>/dev/null || true
+  rm "${output_root}"/*.worker-pid "${output_root}/coordinator-pid"
+done
 
 # Clone setup must never remove a pre-existing name after create fails. Later failures
 # must remove only containers created by this process, including each failed retry.

@@ -51,6 +51,7 @@ Environment:
   ZMK_DOCKER_CACHE_VOLUME    Docker volume mounted at /workspaces (default: zmk-cache).
   ZMK_CCACHE_DIR             ccache directory inside the container (default: /workspaces/.ccache, on the cache volume).
   ZMK_BUILD_JOBS             Number of build.yaml targets to build in parallel (default: 1).
+  CMAKE_BUILD_PARALLEL_LEVEL Compiler jobs per target (default: build-image/tool default).
   ZMK_WEST_UPDATE_ATTEMPTS   Number of west update attempts before failing (default: 3).
   ZMK_FALLBACK_BINARY        Fallback firmware extension after uf2 (default: bin).
   ZMK_COPY_IGNORED           Set to 1 to copy files that Git ignores too (default: skipped in a Git working tree).
@@ -64,6 +65,16 @@ validate_positive_int() {
         *[1-9]*) return 0 ;;
     esac
     die "${label} must be a positive integer: ${value}"
+}
+
+configure_compiler_jobs() {
+    [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ] || return 0
+    validate_positive_int "CMAKE_BUILD_PARALLEL_LEVEL" "${CMAKE_BUILD_PARALLEL_LEVEL}"
+    # CMake expects decimal; avoid octal interpretation and shell integer overflow.
+    while [ "${CMAKE_BUILD_PARALLEL_LEVEL#0}" != "${CMAKE_BUILD_PARALLEL_LEVEL}" ]; do
+        CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL#0}"
+    done
+    export CMAKE_BUILD_PARALLEL_LEVEL
 }
 
 validate_firmware_extension() {
@@ -879,7 +890,7 @@ def merged_target(mapping, board, shield):
 
     artifact_template = scalar(raw_with_default(mapping, "artifact-name"), "artifact-name", allow_empty=True)
     artifact = safe_name(format_artifact(artifact_template, board, shield, snippet))
-    exclude_artifact = safe_name(format_artifact(artifact_template, board, shield, yaml_snippet))
+    exclude_artifact = format_artifact(artifact_template, board, shield, yaml_snippet)
     return {
         "board": board,
         "shield": shield,
@@ -888,6 +899,7 @@ def merged_target(mapping, board, shield):
         "artifact-name": artifact,
         "_exclude-snippet": yaml_snippet,
         "_exclude-artifact-name": exclude_artifact,
+        "_exclude-artifact-normalized": safe_name(exclude_artifact),
     }
 
 def add_matrix_targets(source, require_board):
@@ -932,22 +944,40 @@ for exclusion in exclusions:
         print("ERROR: each exclude entry must be a map.", file=sys.stderr)
         sys.exit(2)
 
-def exclusion_matches(exclusion, target):
-    compared = False
+def compile_exclusion(exclusion):
+    options = {}
     for key in ("board", "shield", "snippet", "artifact-name"):
         value = raw(exclusion, key)
-        if value is None:
-            continue
-        compared = True
-        options = scalar_list(value, key, allow_empty=True)
-        target_value = target.get(f"_exclude-{key}", target[key])
-        if target_value not in options:
-            return False
-    return compared
+        if value is not None:
+            options[key] = scalar_list(value, key, allow_empty=True)
+    # Preserve normalized-name aliases for existing matrices, but an exact YAML
+    # name within this exclusion's other selectors takes precedence over aliases.
+    artifact_values = set(options.get("artifact-name", []))
+    raw_artifacts = {
+        target["_exclude-artifact-name"] for target in targets
+        if target["_exclude-artifact-name"] in artifact_values
+        and all(target.get(f"_exclude-{key}", target[key]) in values
+               for key, values in options.items() if key != "artifact-name")
+    } if "artifact-name" in options else set()
+    return options, raw_artifacts
 
+def exclusion_matches(rule, target):
+    options, raw_artifacts = rule
+    for key, values in options.items():
+        target_value = target.get(f"_exclude-{key}", target[key])
+        if key == "artifact-name":
+            if not any(target_value == value or
+                       (value not in raw_artifacts and target["_exclude-artifact-normalized"] == value)
+                       for value in values):
+                return False
+        elif target_value not in values:
+            return False
+    return bool(options)
+
+exclusion_rules = [compile_exclusion(exclusion) for exclusion in exclusions]
 targets = [
     target for target in targets
-    if not any(exclusion_matches(exclusion, target) for exclusion in exclusions)
+    if not any(exclusion_matches(rule, target) for rule in exclusion_rules)
 ]
 
 if settings_reset == "1":
@@ -1250,6 +1280,7 @@ PY
         echo -e "\n${GREEN}Build complete: ${built} target(s).${NC}"
     }
 
+    configure_compiler_jobs
     case "${1:-}" in
         validate)
             shift
@@ -1456,14 +1487,16 @@ resolve_docker_image() {
     fi
 }
 
-run_id="run-$(date +%Y-%m-%d_%H-%M-%S)-pid-$$"
-container_name="zmk-build-${run_id}"
-container_name="${ZMK_CONTAINER_NAME:-${container_name}}"
+run_id=""
+container_name=""
 container_created=0
 container_id=""
 container_create_output=""
+container_create_status=0
 image_probe_output=""
 active_phase_pid=""
+active_phase_starting=0
+run_claim=""
 run_signal_status=0
 run_phase=""
 
@@ -1476,28 +1509,52 @@ handle_run_signal() {
     # A signal can arrive before the EXIT handler's first body command.
     case " ${FUNCNAME[*]} " in *" finish_run "*) return 0 ;; esac
     # Acquire ownership and finish cleanup before honoring a pending interruption.
-    case "${run_phase}" in create|cleanup|finish) return 0 ;; esac
+    [ "${active_phase_starting}" = 0 ] || return 0
+    case "${run_phase}" in reserve|create|cleanup|finish) return 0 ;; esac
+    if [ "${run_phase}" = create-log ] && [ "${container_create_status}" != 0 ] &&
+        [ "${container_create_status}" != "${run_signal_status}" ]; then
+        RUN_FAILURE_REASON="container creation failed"
+        exit "${container_create_status}"
+    fi
     exit "${run_signal_status}"
 }
 
 run_logged_command() {
-    local capture="$1" status=0
+    local capture="$1" status=0 phase_monitor=0
     shift
+    active_phase_starting=1
+    case $- in *m*) phase_monitor=1 ;; esac
+    # Own the whole phase, including pipeline and function descendants, without
+    # requiring setsid on Bash 3.2 hosts. Publish its ID before honoring signals.
+    set -m
     (
         trap - EXIT
+        set +m
+        # This internal background group still streams a foreground build's
+        # output; terminal TOSTOP must not suspend its writer.
+        trap '' TTOU
         if [ "${run_phase}" = create ]; then
             # The entire receipt pipeline must survive a terminal/process-group signal.
             trap '' INT TERM
         else
             trap - INT TERM
         fi
-        if [ -n "${capture}" ]; then
+        if [ -n "${capture}" ] && [ "${run_phase}" = create ]; then
+            # Acquire the daemon result without a log writer in its status path.
+            # Ownership must be established before tee can fail or be interrupted.
+            "$@" > "${capture}" 2>&1
+        elif [ -n "${capture}" ]; then
             "$@" 2>&1 | tee -a "${LOG_FILE}" "${capture}"
         else
             "$@" 2>&1 | tee -a "${LOG_FILE}"
         fi
     ) <&0 &
     active_phase_pid=$!
+    [ "${phase_monitor}" = 1 ] || set +m
+    active_phase_starting=0
+    if [ "${run_signal_status}" != 0 ] && [ "${run_phase}" != create ]; then
+        handle_run_signal '' "${run_signal_status}"
+    fi
     if wait "${active_phase_pid}"; then status=0; else status=$?; fi
     if [ "${run_phase}" = create ] && [ "${run_signal_status}" != 0 ]; then
         if [ "${status}" -ge 128 ]; then
@@ -1506,8 +1563,33 @@ run_logged_command() {
             status="${run_signal_status}"
         fi
     fi
-    active_phase_pid=""
+    if [ "${status}" = 0 ]; then
+        drain_active_phase
+    fi
     return "${status}"
+}
+
+drain_active_phase() {
+    local pid="${active_phase_pid}"
+    [ -n "${pid}" ] || return 0
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    while kill -0 -- "-${pid}" 2>/dev/null; do sleep 1; done
+    active_phase_pid=""
+}
+
+release_run_claim() {
+    local claim="${run_claim}"
+    [ -n "${claim}" ] || return 0
+    # Release once: an unsuccessful unlink may already have removed the claim.
+    run_claim=""
+    if ! (trap '' INT TERM; rm -f "${claim}"); then
+        echo 'failed to release run directory claim' >&2
+        if [ -n "${LOG_FILE:-}" ]; then
+            echo 'failed to release run directory claim' >> "${LOG_FILE}"
+        fi
+        return 1
+    fi
 }
 
 cleanup_container() {
@@ -1525,7 +1607,16 @@ finish_run() {
     original_status="${status}"
     run_phase=finish
     trap - EXIT
+    if ! release_run_claim; then
+        if [ "${status}" = 0 ]; then
+            status=1
+            reason="run directory reservation cleanup failed"
+        fi
+    fi
     # A signal here records cancellation without recursively exiting the EXIT handler.
+    if [ -n "${active_phase_pid}" ]; then
+        kill -TERM -- "-${active_phase_pid}" 2>/dev/null || true
+    fi
     if ! cleanup_container; then
         if [ "${status}" = 0 ]; then
             status=1
@@ -1535,15 +1626,15 @@ finish_run() {
     # Cleanup has completed. Freeze the outcome before publishing the final summary;
     # late signals cannot turn a committed SUCCESS into a nonzero command exit.
     trap '' INT TERM
-    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] && [ "${phase}" != created ]; then
+    if [ "${run_signal_status}" != 0 ] && [ "${container_created}" = 1 ] && [ "${ZMK_KEEP_CONTAINER:-0}" = 1 ] &&
+        [ "${phase}" != created ] && [ "${phase}" != create-log ]; then
         if ! docker stop -t 1 "${container_id}" >>"${LOG_FILE}" 2>&1; then
             echo 'ERROR: failed to stop interrupted build container' >>"${LOG_FILE}"
             [ "${status}" != 0 ] || { status=1; reason="container stop failed"; }
         fi
     fi
     if [ -n "${active_phase_pid}" ]; then
-        kill -TERM "${active_phase_pid}" 2>/dev/null || true
-        wait "${active_phase_pid}" 2>/dev/null || true
+        drain_active_phase
     fi
     if [ "${original_status}" = 0 ] && [ "${run_signal_status}" != 0 ]; then
         status="${run_signal_status}"
@@ -1681,19 +1772,82 @@ copy_target_to_container() {
     done
 }
 
-copy_artifacts_from_container() {
-    local artifact_dir="$1"
-    mkdir -p "${artifact_dir}"
-    if ! docker exec "${container_id}" tar -C /root/zmk-config/.build -cf - . |
-        (cd "${artifact_dir}" && tar xf -); then
-        echo "failed to copy build output from the container" >&2
+copy_artifacts_from_container() (
+    local artifact_dir="$1" temporary path name lower stem copy_status
+    local LC_ALL=C
+    local names=() folded_names=()
+    temporary="$(mktemp -d "${artifact_dir}/artifact-tmp-XXXXXX")" || return 1
+    trap 'copy_status=$?; trap "" INT TERM; if ! rm -rf "${temporary}"; then
+        echo "failed to remove artifact staging directory" >&2
+        [ "${copy_status}" != 0 ] || copy_status=1
+    fi; exit "${copy_status}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Container tools and output are untrusted. Never extract their tar stream into
+    # the host run: it already owns the log and will receive the final summary.
+    if ! docker exec "${container_id}" find /root/zmk-config/.build \
+        -mindepth 1 -maxdepth 1 -print0 > "${temporary}/list"; then
+        echo "failed to list build output from the container" >&2
         return 1
     fi
-    if ! firmware_files "${artifact_dir}" | grep . >/dev/null; then
+    while :; do
+        path=""
+        if ! IFS= read -r -d '' path; then
+            [ -z "${path}" ] || { echo "unterminated artifact path from the container" >&2; return 1; }
+            break
+        fi
+        case "${path}" in
+            /root/zmk-config/.build/*) name="${path#/root/zmk-config/.build/}" ;;
+            *) echo "artifact path is outside the container output directory" >&2; return 1 ;;
+        esac
+        case "${name}" in
+            ''|[._-]*|*[!A-Za-z0-9._-]*) echo "unsafe artifact filename from the container" >&2; return 1 ;;
+        esac
+        lower="$(printf '%s' "${name}" | LC_ALL=C tr 'A-Z' 'a-z')" || return 1
+        stem="${lower%%.*}"
+        case "${stem}" in
+            con|prn|aux|nul|com[1-9]|lpt[1-9]) echo "reserved artifact filename from the container" >&2; return 1 ;;
+        esac
+        case "${lower}" in
+            build.log|build-summary.txt) echo "artifact filename collides with host evidence" >&2; return 1 ;;
+        esac
+        case "${name}" in
+            *.uf2|*.hex|*.bin|*."${ZMK_FALLBACK_BINARY:-bin}") ;;
+            *) echo "unexpected artifact extension from the container" >&2; return 1 ;;
+        esac
+        if name_in "${lower}" ${folded_names[@]+"${folded_names[@]}"}; then
+            echo "duplicate artifact filename from the container" >&2
+            return 1
+        fi
+        names+=("${name}") folded_names+=("${lower}")
+    done < "${temporary}/list"
+    if [ "${#names[@]}" = 0 ]; then
         echo "no firmware artifact was copied from the container" >&2
         return 1
     fi
-}
+    for name in ${names[@]+"${names[@]}"}; do
+        # An existing regular destination prevents recursive directory imports.
+        # Relative Docker paths avoid passing MSYS host paths to native Docker.
+        : > "${temporary}/firmware" || return 1
+        if ! (cd "${temporary}" && docker cp "${container_id}:/root/zmk-config/.build/${name}" ./firmware); then
+            echo "failed to copy build output from the container" >&2
+            return 1
+        fi
+        if [ -L "${temporary}/firmware" ] || [ ! -f "${temporary}/firmware" ]; then
+            echo "artifact is not a regular file" >&2
+            return 1
+        fi
+        if ! chmod 0644 "${temporary}/firmware"; then
+            echo "failed to normalize artifact permissions" >&2
+            return 1
+        fi
+        if [ -e "${artifact_dir}/${name}" ] || [ -L "${artifact_dir}/${name}" ]; then
+            echo "artifact destination already exists" >&2
+            return 1
+        fi
+        mv "${temporary}/firmware" "${artifact_dir}/${name}" || return 1
+    done
+)
 
 failure_excerpt() {
     if [ -f "${LOG_FILE}" ]; then
@@ -1703,10 +1857,21 @@ failure_excerpt() {
 
 built_target_count() {
     if [ -f "${LOG_FILE}" ]; then
-        sed -E $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g' "${LOG_FILE}" |
-            tr -d '\r' |
-            sed -n 's/.*Build complete: \([0-9][0-9]*\) target(s)\..*/\1/p' |
-            tail -n 1
+        LC_ALL=C awk '
+            {
+                gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "")
+                gsub(/\r/, "")
+                if (match($0, /.*Build complete: [0-9][0-9]* target\(s\)\./)) {
+                    # Keep the prefix through the last valid marker before
+                    # stripping it; a later malformed marker cannot win.
+                    built = substr($0, RSTART, RLENGTH)
+                    sub(/.*Build complete: /, "", built)
+                    sub(/ target\(s\)\.$/, "", built)
+                    found = 1
+                }
+            }
+            END { if (found) printf "%s\n", built }
+        ' "${LOG_FILE}"
     fi
 }
 
@@ -1735,6 +1900,7 @@ write_summary() (
         echo "Status: ${status}"
         [ -z "${reason}" ] || echo "Reason: ${reason}"
         echo "Mode: ${MODE}"
+        echo "Run sequence: ${RUN_SEQUENCE}"
         echo "Target: ${TARGET_DIR}"
         echo "Docker image: ${zmk_build_image}"
         echo "Docker cache volume: ${zmk_cache_volume}"
@@ -1744,6 +1910,7 @@ write_summary() (
         fi
         echo "Pristine: ${PRISTINE}"
         echo "Build jobs: ${BUILD_JOBS}"
+        echo "Compiler jobs: ${CMAKE_BUILD_PARALLEL_LEVEL:-auto}"
         echo "Fallback binary: ${ZMK_FALLBACK_BINARY:-bin}"
         echo "Extra snippets: ${HOST_SNIPPETS:-<none>}"
         if [ ${#MODULES[@]} -gt 0 ]; then
@@ -1790,9 +1957,68 @@ reset_cache_volume() {
     msg "Cache volume is not present; starting fresh: ${zmk_cache_volume}" | tee -a "${LOG_FILE}"
 }
 
+create_run_directory() {
+    local root="${SCRIPT_DIR}/.build" label stem candidate claim number=1
+    mkdir -p "${root}" || return 1
+    # Derive only a display label on the host; YAML target parsing stays in Docker.
+    # Environment transport preserves literal quotes, backslashes and newlines.
+    label="$(RUN_LABEL_INPUT="${TARGET_DIR##*/}" LC_ALL=C awk 'BEGIN {
+        label = ENVIRON["RUN_LABEL_INPUT"]
+        gsub(/[^A-Za-z0-9_-]+/, "-", label)
+        label = substr(tolower(label), 1, 80)
+        sub(/^-*/, "", label)
+        sub(/-*$/, "", label)
+        printf "%s", label
+    }')" || return 1
+    label="${label:-config}"
+    stem="${root}/run-$(date +%Y-%m-%d_%H-%M-%S)-${label}"
+    candidate="${stem}"
+    # Commit directory ownership and an initialized log before honoring cancellation.
+    # A group signal must not kill mkdir after it created an otherwise unrecorded run.
+    run_phase=reserve
+    while :; do
+        claim="${candidate}.reserve"
+        if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ] &&
+            [ ! -e "${claim}" ] && [ ! -L "${claim}" ]; then
+            # Some mkdir commands accept a directory created by another process.
+            # Shell noclobber claims ownership before any mkdir or log writes.
+            if (trap - EXIT; trap '' INT TERM; umask 077; set -C; : > "${claim}") 2>/dev/null; then
+                run_claim="${claim}"
+                if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                    if (trap - EXIT; trap '' INT TERM; mkdir "${candidate}") 2>/dev/null &&
+                        [ -d "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                        break
+                    fi
+                    if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                        release_run_claim || return 1
+                        [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+                        echo "Cannot create run directory: ${candidate}" >&2
+                        return 1
+                    fi
+                fi
+                release_run_claim || return 1
+            elif [ ! -e "${claim}" ] && [ ! -L "${claim}" ] &&
+                [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+                [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+                echo "Cannot reserve run directory: ${candidate}" >&2
+                return 1
+            fi
+        fi
+        [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+        number=$((number + 1))
+        candidate="${stem}-${number}"
+    done
+    # Keep the actual sequence in the summary; a config name may itself end in digits.
+    RUN_SEQUENCE="${number}" artifact_dir="${candidate}" LOG_FILE="${candidate}/build.log"
+    : > "${LOG_FILE}"
+    msg "Run directory: ${artifact_dir}" | tee -a "${LOG_FILE}"
+    release_run_claim
+}
+
 validate_host_layout
 validate_module_inputs
 validate_positive_int "build jobs" "${BUILD_JOBS}"
+configure_compiler_jobs
 validate_positive_int "ZMK_WEST_UPDATE_ATTEMPTS" "${ZMK_WEST_UPDATE_ATTEMPTS:-3}"
 validate_firmware_extension "${ZMK_FALLBACK_BINARY:-bin}"
 require_host_commands docker tar
@@ -1811,10 +2037,10 @@ zmk_cache_volume="${ZMK_DOCKER_CACHE_VOLUME:-zmk-cache}"
 # ccache lives on the cache volume so that it survives the throw-away build container (see README.md).
 zmk_ccache_dir="${ZMK_CCACHE_DIR:-/workspaces/.ccache}"
 RUN_STARTED_AT="$(date +%s)"
-artifact_dir="${SCRIPT_DIR}/.build/${run_id}"
-LOG_FILE="${artifact_dir}/build.log"
-mkdir -p "${artifact_dir}"
-touch "${LOG_FILE}"
+RUN_FAILURE_REASON="run directory reservation failed"
+create_run_directory
+run_id="${artifact_dir##*/}"
+container_name="${ZMK_CONTAINER_NAME:-zmk-build-${run_id}-pid-$$}"
 touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 
 echo -e "${CYAN}Starting ZMK ${MODE}...${NC}"
@@ -1822,7 +2048,10 @@ msg "Target: ${TARGET_DIR}"
 msg "Docker image: ${zmk_build_image}"
 msg "Docker cache volume: ${zmk_cache_volume}"
 msg "Build jobs: ${BUILD_JOBS}"
+msg "Compiler jobs: ${CMAKE_BUILD_PARALLEL_LEVEL:-auto}"
 msg "Container: ${container_name}"
+run_phase=reserved
+[ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
 
 if [ "${PRISTINE}" = 1 ]; then
     RUN_FAILURE_REASON="cache reset failed"
@@ -1830,18 +2059,22 @@ if [ "${PRISTINE}" = 1 ]; then
 fi
 
 start_build_container() {
-    local receipt_line
+    local receipt_line logging_status=0
     container_id=""
     container_created=0
+    container_create_status=0
     RUN_FAILURE_REASON="container creation failed"
     run_phase=create
     docker_create_args=(create --name "${container_name}")
     if [ -n "${ZMK_DOCKER_PLATFORM:-}" ]; then
         docker_create_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
     fi
+    if [ -n "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
+        docker_create_args+=(-e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}")
+    fi
     # Keep platform and default paths on one set of volume/environment arguments.
     container_create_output="$(mktemp "${TMPDIR:-/tmp}/zmk-container-create.XXXXXX")"
-    run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
+    if run_logged_command "${container_create_output}" docker "${docker_create_args[@]}" \
         -v "${zmk_cache_volume}:/workspaces" \
         -e ZMK_IN_CONTAINER=1 \
         -e PRISTINE="${PRISTINE}" \
@@ -1852,20 +2085,37 @@ start_build_container() {
         -e CCACHE_DIR="${zmk_ccache_dir}" \
         -e CCACHE_IGNOREOPTIONS='-specs=*' \
         -e USER_ZMK_EXTRA_MODULES="${ZMK_EXTRA_MODULES:-}" \
-        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'
+        "${zmk_build_image}" /bin/sh -lc ': > /tmp/zmk-build-stream.log; tail -n +1 -f /tmp/zmk-build-stream.log'; then
+        container_create_status=0
+    else
+        container_create_status=$?
+    fi
     # Keep receipt parsing in this shell: a group signal must not kill an external
     # filter after create succeeded but before ownership was recorded.
-    while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
-        receipt_line="${receipt_line%$'\r'}"
-        if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
-            container_id="${receipt_line}"
-            container_created=1
-            break
-        fi
-    done < "${container_create_output}"
+    if [ "${container_create_status}" = 0 ]; then
+        while IFS= read -r receipt_line || [ -n "${receipt_line}" ]; do
+            receipt_line="${receipt_line%$'\r'}"
+            if [ "${#receipt_line}" = 64 ] && [[ "${receipt_line}" != *[!0-9a-f]* ]]; then
+                container_id="${receipt_line}"
+                container_created=1
+                break
+            fi
+        done < "${container_create_output}"
+    fi
+    run_phase=create-log
+    [ "${run_signal_status}" = 0 ] || handle_run_signal '' "${run_signal_status}"
+    # A failed create phase still owns its host group; drain it before replacing
+    # the active PID with the separately cancellable receipt logger.
+    drain_active_phase
+    if run_logged_command '' cat "${container_create_output}"; then :; else logging_status=$?; fi
+    [ "${container_create_status}" = 0 ] || return "${container_create_status}"
     [ -n "${container_id}" ] || die "Docker create did not return a container ID"
     run_phase=created
     [ "${run_signal_status}" = 0 ] || exit "${run_signal_status}"
+    if [ "${logging_status}" != 0 ]; then
+        RUN_FAILURE_REASON="container creation logging failed"
+        return "${logging_status}"
+    fi
     rm -f "${container_create_output}"
     container_create_output=""
     RUN_FAILURE_REASON="container start failed"

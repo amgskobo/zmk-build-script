@@ -28,6 +28,14 @@ def target(artifact, board='A', shield='', snippet='', cmake=''):
 
 
 class ContainerContracts(unittest.TestCase):
+    def run_directory(self, output):
+        paths = [line[len('Run directory: '):] for line in ANSI.sub('', output).splitlines()
+                 if line.startswith('Run directory: ')]
+        self.assertEqual(len(paths), 1, output)
+        path = pathlib.Path(paths[0])
+        self.assertRegex(path.name, r'^run-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[a-z0-9_-]+$')
+        return path
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='zmk-contract-')
         self.root = pathlib.Path(self.temp.name)
@@ -316,23 +324,172 @@ if os.environ['LOG_MODE'] == 'delayed' and count >= 3: print('Build complete: 2 
                         self.assertIn('publication-check', step['if'])
         self.assertEqual(uploads, 6)
 
+    def test_self_hosted_workflow_preserves_and_quotes_build_inputs(self):
+        workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(inputs['mode']['options'], ['validate', 'build', 'firmware'])
+        self.assertEqual(inputs['profile']['type'], 'boolean')
+        self.assertEqual(inputs['profile']['default'], 'false')
+        self.assertEqual(workflow['env']['ZMK_TEST_PROFILE'], "${{ inputs.profile && '1' || '0' }}")
+        for name in ('build_image', 'docker_platform', 'target_jobs', 'compiler_jobs', 'test_jobs'):
+            self.assertIn(name, inputs)
+            self.assertEqual(inputs[name]['type'], 'string')
+            self.assertEqual(inputs[name]['default'], '')
+        self.assertEqual(workflow['env']['BUILD_IMAGE_INPUT'], '${{ inputs.build_image }}')
+        self.assertEqual(workflow['env']['DOCKER_PLATFORM_INPUT'], '${{ inputs.docker_platform }}')
+        self.assertEqual(workflow['env']['TARGET_JOBS_INPUT'], '${{ inputs.target_jobs }}')
+        self.assertEqual(workflow['env']['COMPILER_JOBS_INPUT'], '${{ inputs.compiler_jobs }}')
+        self.assertEqual(workflow['env']['TEST_JOBS_INPUT'], '${{ inputs.test_jobs }}')
+        folder = self.root / '.github/scripts'
+        folder.mkdir(parents=True)
+        (folder / 'check-build-output.sh').write_text(
+            '#!/usr/bin/env bash\nset -eu\n'
+            'printf "%s\\0" "$ZMK_BUILD_IMAGE" "$ZMK_DOCKER_PLATFORM" "$ZMK_BUILD_JOBS" '
+            '"$CMAKE_BUILD_PARALLEL_LEVEL" "$ZMK_TEST_JOBS" "$@" >> "$WORKFLOW_CAPTURE"\n')
+        calls = self.root / 'calls'
+        marker = self.root / 'must-not-execute'
+        executions = 0
+        for job_id, os_label in (('macos', 'macOS'), ('windows', 'Windows'), ('linux', 'Linux')):
+            job = workflow['jobs'][job_id]
+            self.assertEqual(job['runs-on'], ['self-hosted', os_label, 'zmk-docker', 'zmk-docker-active'])
+            scope = 'zmk-build-script-test-${{ github.repository_id }}-' + job_id
+            self.assertEqual(job['env']['ZMK_TEST_CACHE_PREFIX'], scope)
+            self.assertEqual(job['concurrency'], {'group': scope, 'cancel-in-progress': 'false'})
+            shell = job['defaults']['run']['shell']
+            if job_id == 'macos': self.assertTrue(shell.startswith('/bin/bash '), shell)
+            if job_id == 'windows': self.assertTrue(shell.startswith('C:\\Progra~1\\Git\\bin\\bash.exe '), shell)
+            step = next(s for s in job['steps'] if s.get('name') == 'Verify shell and Docker contracts')
+            self.assertNotIn('${{', step['run'])
+            for mode in ('validate', 'build', 'firmware'):
+                for supplied in ('', 'synthetic.invalid/build@sha256:' + '1' * 64,
+                                 'synthetic.invalid/build:tag $(touch %s)\n"literal"' % marker):
+                    with self.subTest(job=job_id, mode=mode, supplied=supplied):
+                        calls.write_bytes(b'')
+                        platform = 'linux/amd64' if supplied else ''
+                        jobs = '2' if supplied and supplied.endswith('1' * 64) else supplied
+                        env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT=supplied,
+                                   DOCKER_PLATFORM_INPUT=platform, ZMK_BUILD_IMAGE='synthetic.invalid/retained:v1',
+                                   ZMK_DOCKER_PLATFORM='linux/arm64', TARGET_JOBS_INPUT=jobs,
+                                   COMPILER_JOBS_INPUT=jobs, ZMK_BUILD_JOBS='3',
+                                   CMAKE_BUILD_PARALLEL_LEVEL='4', TEST_JOBS_INPUT=jobs,
+                                   ZMK_TEST_JOBS='5', WORKFLOW_CAPTURE=str(calls))
+                        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']],
+                                                cwd=self.root, env=env, capture_output=True)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode())
+                        expected = []
+                        selections = ('all',) if mode == 'build' else ('build',) if mode == 'firmware' else ('shell', 'docker')
+                        for selection in selections:
+                            expected += [supplied or 'synthetic.invalid/retained:v1',
+                                         platform or 'linux/arm64', jobs or '3', jobs or '4',
+                                         jobs or '5', 'ci-tests', selection]
+                        actual = calls.read_bytes().decode().split('\0')
+                        self.assertEqual(actual, expected + [''])
+                        self.assertFalse(marker.exists(), 'input was executed as shell code')
+                        executions += 1
+        self.assertEqual(executions, 27)
+
+    def test_self_hosted_workflow_checks_docker_before_native_suite(self):
+        workflow = yaml.load(pathlib.Path('/tmp/workflows/self-hosted-build.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        folder = self.root / '.github/scripts'
+        folder.mkdir(parents=True)
+        (folder / 'check-build-output.sh').write_text(
+            '#!/usr/bin/env bash\nset -eu\n'
+            'printf "%s\\0" "$@" >> "$WORKFLOW_CAPTURE"\n'
+            'if [ "$1" = ci-tools ]; then exit "$PREFLIGHT_STATUS"; fi\n')
+        calls = self.root / 'calls'
+        capacity_calls = self.root / 'capacity-calls'
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (binary / 'docker').write_text(
+            '#!/usr/bin/env bash\nset -eu\nprintf "%s\\0" "$@" > "$CAPACITY_CAPTURE"\n'
+            'printf "Capacity docker-cpus=12 memory-bytes=17179869184\\n"\n'
+            'exit "$CAPACITY_STATUS"\n')
+        (binary / 'docker').chmod(0o755)
+        executions = 0
+        for job_id in ('macos', 'windows', 'linux'):
+            steps = workflow['jobs'][job_id]['steps']
+            preflights = [s for s in steps if s.get('name') == 'Check Docker access']
+            self.assertEqual(len(preflights), 1, 'native Docker preflight is missing')
+            preflight = preflights[0]
+            capacity = next(s for s in steps if s.get('name') == 'Inspect Docker capacity')
+            suite = next(s for s in steps if s.get('name') == 'Verify shell and Docker contracts')
+            initialize = next(s for s in steps if s.get('id') == 'publication-init')
+            self.assertLess(steps.index(initialize), steps.index(preflight))
+            self.assertLess(steps.index(preflight), steps.index(suite))
+            self.assertLess(steps.index(preflight), steps.index(capacity))
+            self.assertLess(steps.index(capacity), steps.index(suite))
+            self.assertNotIn('if', capacity)
+            self.assertNotIn('continue-on-error', capacity)
+            self.assertNotIn('${{', capacity['run'])
+            self.assertEqual(preflight['run'], 'bash .github/scripts/check-build-output.sh ci-tools')
+            self.assertNotIn('if', preflight)
+            self.assertNotIn('continue-on-error', preflight)
+            for mode in ('validate', 'build', 'firmware'):
+                for status, capacity_status in ((0, 0), (127, 0), (0, 23)):
+                    with self.subTest(job=job_id, mode=mode, status=status, capacity=capacity_status):
+                        calls.write_bytes(b'')
+                        capacity_calls.unlink(missing_ok=True)
+                        env = dict(os.environ, BUILD_MODE=mode, BUILD_IMAGE_INPUT='',
+                                   DOCKER_PLATFORM_INPUT='', TARGET_JOBS_INPUT='', COMPILER_JOBS_INPUT='',
+                                   TEST_JOBS_INPUT='',
+                                   PREFLIGHT_STATUS=str(status),
+                                   CAPACITY_STATUS=str(capacity_status), CAPACITY_CAPTURE=str(capacity_calls),
+                                   PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                                   WORKFLOW_CAPTURE=str(calls))
+                        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
+                                                 preflight['run'] + '\n' + capacity['run'] + '\n' + suite['run']],
+                                                cwd=self.root, env=env, capture_output=True)
+                        self.assertEqual(result.returncode, status or capacity_status, result.stderr.decode())
+                        if status == 0:
+                            self.assertEqual(capacity_calls.read_bytes().decode().split('\0'), [
+                                'info', '--format', 'Capacity docker-cpus={{.NCPU}} memory-bytes={{.MemTotal}}', ''])
+                        else:
+                            self.assertFalse(capacity_calls.exists())
+                        expected = ['ci-tools']
+                        if status == capacity_status == 0:
+                            selections = ('all',) if mode == 'build' else ('build',) if mode == 'firmware' else ('shell', 'docker')
+                            for selection in selections:
+                                expected += ['ci-tests', selection]
+                        self.assertEqual(calls.read_bytes().decode().split('\0'), expected + [''])
+                        executions += 1
+        self.assertEqual(executions, 27)
+
     def make_image_selection_daemon(self):
         binary = self.root / 'bin'
         binary.mkdir()
         docker = binary / 'docker'
         docker.write_text('''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import json, os, pathlib, signal, subprocess, sys, time
 args = sys.argv[1:]
 calls = pathlib.Path(os.environ["IMAGE_CALLS"])
 with calls.open("a") as out: out.write(json.dumps(args) + "\\n")
 if args[0] == "create":
     count = sum(json.loads(row)[0] == "create" for row in calls.read_text().splitlines())
     print(chr(96 + count) * 64)
+    sys.exit(int(os.environ.get('IMAGE_CREATE_EXIT', '0')))
 elif args[0] == "exec":
     if "python3" in args:
         sys.exit(subprocess.call(args[args.index("python3"):]))
-    if any("./build.sh validate" in arg for arg in args): print("build.yaml is valid.")
+    if "find" in args and "/root/zmk-config/.build" in args:
+        sys.stdout.buffer.write(b'/root/zmk-config/.build/held.bin\\0')
+    elif any("./build.sh build" in arg for arg in args): print("Build complete: 1 target(s).")
+    elif any("./build.sh validate" in arg for arg in args): print("build.yaml is valid.")
     else: sys.stdin.buffer.read()
+elif args[0] == "cp":
+    folder = pathlib.Path(os.environ['PHASE_PROBE_ROOT'])
+    (folder / 'phase-group').write_text(str(os.getpgrp()))
+    def stop(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        (folder / 'stopping').touch()
+        while not (folder / 'release').exists(): time.sleep(.01)
+        (folder / 'child-cleanup').touch()
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, stop)
+    (folder / 'copy-ready').touch()
+    while not (folder / 'release').exists(): time.sleep(.01)
+    pathlib.Path('firmware').write_bytes(b'controlled firmware\\n')
 elif args[0] == "rm":
     if os.environ.get("IMAGE_REMOVE_FAIL"): sys.exit(23)
     if os.environ.get("IMAGE_REMOVE_GATE"):
@@ -342,6 +499,163 @@ elif args[0] != "start": sys.exit(99)
 ''')
         docker.chmod(0o755)
         return binary
+
+    def test_parent_only_artifact_interruption_awaits_phase_descendants(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'mv').write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+folder = pathlib.Path(os.environ['PHASE_PROBE_ROOT'])
+if sys.argv[-1].endswith('/build-summary.txt') and not (folder / 'child-cleanup').exists():
+    (folder / 'summary-before-child-cleanup').touch()
+os.execv(os.environ['PHASE_REAL_MV'], ['mv'] + sys.argv[1:])
+''')
+        (binary / 'mv').chmod(0o755)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signum):
+                folder = self.root / ('copy-' + str(signum))
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                           ZMK_BUILD_IMAGE='synthetic.invalid/phase:fixed',
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           IMAGE_CALLS=str(folder / 'calls'), PHASE_PROBE_ROOT=str(folder),
+                           PHASE_REAL_MV=shutil.which('mv'))
+                process = subprocess.Popen(['bash', str(BUILD), str(self.root)], env=env,
+                                           start_new_session=True, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not (folder / 'copy-ready').exists() and time.monotonic() < deadline:
+                        if process.poll() is not None:
+                            output, _ = process.communicate()
+                            self.fail('builder exited before artifact-copy control: ' + output)
+                        time.sleep(.01)
+                    self.assertTrue((folder / 'copy-ready').exists())
+                    process.send_signal(signum)
+                    deadline = time.monotonic() + 5
+                    while (not (folder / 'stopping').exists() and process.poll() is None
+                           and time.monotonic() < deadline):
+                        time.sleep(.01)
+                    self.assertTrue((folder / 'stopping').exists(), 'copy descendant did not receive cancellation')
+                    self.assertIsNone(process.poll(), 'builder completed before phase cleanup')
+                    (folder / 'release').touch()
+                    output, _ = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 128 + signum, output)
+                    self.assertTrue((folder / 'child-cleanup').exists())
+                    self.assertFalse((folder / 'summary-before-child-cleanup').exists())
+                    run = self.run_directory(output)
+                    self.assertIn('Status: FAILED', (run / 'build-summary.txt').read_text())
+                    self.assertFalse((run / 'held.bin').exists())
+                finally:
+                    (folder / 'release').touch()
+                    if (folder / 'phase-group').exists():
+                        try: os.killpg(int((folder / 'phase-group').read_text()), signal.SIGTERM)
+                        except ProcessLookupError: pass
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGTERM)
+                    try: process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
+
+    def make_create_logging_daemon(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'tee').write_text('''#!/usr/bin/env python3
+import os, pathlib, signal, subprocess, sys, time
+data = sys.stdin.buffer.read()
+status = subprocess.run([os.environ['CREATE_REAL_TEE']] + sys.argv[1:], input=data).returncode
+if status: sys.exit(status)
+if any(line == b'a' * 64 for line in data.splitlines()):
+    pathlib.Path(os.environ['CREATE_RECEIPT_OBSERVED']).touch()
+    if os.environ.get('CREATE_LOG_HOLD'):
+        folder = pathlib.Path(os.environ['CREATE_LOG_HOLD'])
+        (folder / 'logger-group').write_text(str(os.getpgrp()))
+        if os.environ.get('CREATE_LOG_TTOU'): os.kill(os.getpid(), signal.SIGTTOU)
+        (folder / 'logger-ready').touch()
+        while not (folder / 'release').exists(): time.sleep(.01)
+    sys.exit(int(os.environ['CREATE_LOG_EXIT']))
+''')
+        (binary / 'tee').chmod(0o755)
+        return binary
+
+    def test_create_receipt_ownership_survives_logging_failure(self):
+        binary = self.make_create_logging_daemon()
+        for create_status, log_status in ((0, 23), (23, 0), (23, 31)):
+            with self.subTest(create=create_status, logger=log_status):
+                folder = self.root / ('create-%s-%s' % (create_status, log_status))
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER='0',
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_BUILD_IMAGE='synthetic.invalid/create:fixed',
+                           IMAGE_CALLS=str(folder / 'calls'), IMAGE_CREATE_EXIT=str(create_status),
+                           CREATE_REAL_TEE=shutil.which('tee'), CREATE_LOG_EXIT=str(log_status),
+                           CREATE_RECEIPT_OBSERVED=str(folder / 'receipt-observed'))
+                completed = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)],
+                                           env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(completed.returncode, 23, completed.stdout + completed.stderr)
+                self.assertTrue((folder / 'receipt-observed').exists(), 'control did not receive a complete create ID')
+                calls = [json.loads(row) for row in (folder / 'calls').read_text().splitlines()]
+                self.assertEqual(sum(call[0] == 'create' for call in calls), 1)
+                self.assertFalse(any(call[0] == 'start' for call in calls))
+                self.assertEqual(['rm', '-f', 'a' * 64] in calls, create_status == 0,
+                                 'successful create ownership must survive logging failure; failed create owns nothing')
+                summary = (self.run_directory(completed.stdout) / 'build-summary.txt').read_text()
+                self.assertIn('Status: FAILED', summary)
+                reason = 'container creation failed' if create_status else 'container creation logging failed'
+                self.assertIn('Reason: ' + reason, summary)
+
+    def test_parent_only_cancellation_stops_post_create_logger(self):
+        binary = self.make_create_logging_daemon()
+        for create_status, keep, tty_stop in ((0, 0, False), (0, 1, False), (23, 0, False),
+                                              (23, 1, False), (0, 0, True)):
+            with self.subTest(create=create_status, keep=keep, tty_stop=tty_stop):
+                folder = self.root / ('logger-%s-%s-%s' % (create_status, keep, tty_stop))
+                folder.mkdir()
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER=str(keep),
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_BUILD_IMAGE='synthetic.invalid/logger:fixed',
+                           IMAGE_CALLS=str(folder / 'calls'), IMAGE_CREATE_EXIT=str(create_status),
+                           CREATE_REAL_TEE=shutil.which('tee'), CREATE_LOG_EXIT='0',
+                           CREATE_LOG_HOLD=str(folder), CREATE_RECEIPT_OBSERVED=str(folder / 'receipt'),
+                           CREATE_LOG_TTOU='1' if tty_stop else '')
+                process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)],
+                                           env=env, start_new_session=True, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not (folder / 'logger-ready').exists() and time.monotonic() < deadline:
+                        if process.poll() is not None:
+                            output, _ = process.communicate()
+                            self.fail('logger control was not reached: ' + output)
+                        time.sleep(.01)
+                    self.assertTrue((folder / 'logger-ready').exists(),
+                                    'owned console writer stopped on terminal job-control signal')
+                    process.send_signal(signal.SIGTERM)
+                    try:
+                        output, _ = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.fail('post-create logger did not stop on parent-only cancellation')
+                    self.assertEqual(process.returncode, create_status or 143, output)
+                    calls = [json.loads(row) for row in (folder / 'calls').read_text().splitlines()]
+                    self.assertFalse(any(call[0] in ('start', 'stop') for call in calls), calls)
+                    self.assertEqual(['rm', '-f', 'a' * 64] in calls, create_status == keep == 0, calls)
+                    summary = (self.run_directory(output) / 'build-summary.txt').read_text()
+                    reason = 'container creation failed' if create_status else 'interrupted by SIGTERM'
+                    self.assertIn('Status: FAILED', summary)
+                    self.assertIn('Reason: ' + reason, summary)
+                finally:
+                    (folder / 'release').touch()
+                    if (folder / 'logger-group').exists():
+                        try:
+                            os.killpg(int((folder / 'logger-group').read_text()), signal.SIGCONT)
+                            os.killpg(int((folder / 'logger-group').read_text()), signal.SIGTERM)
+                        except ProcessLookupError: pass
+                    if process.poll() is None: process.send_signal(signal.SIGTERM)
+                    try: process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
     def test_auto_image_selection_uses_west_manifest_structure(self):
         binary = self.make_image_selection_daemon()
@@ -428,6 +742,32 @@ elif args[0] != "start": sys.exit(99)
                 self.assertEqual([row[-4] for row in commands if row[0] == 'create'], [expected])
                 self.assertFalse(any('python3' in row for row in commands))
 
+    def test_compiler_jobs_host_validation_and_container_forwarding(self):
+        binary = self.make_image_selection_daemon()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        for index, value in enumerate((None, '', '2', '0002', '10', '0', '00', '-1', '1.5', ' 2', '2\n', 'bad')):
+            with self.subTest(value=value):
+                calls = self.root / ('compiler-%d.calls' % index)
+                env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_IN_CONTAINER='0', ZMK_BUILD_IMAGE='synthetic/build:fixed',
+                           ZMK_KEEP_CONTAINER='0', IMAGE_CALLS=str(calls))
+                env.pop('CMAKE_BUILD_PARALLEL_LEVEL', None)
+                if value is not None: env['CMAKE_BUILD_PARALLEL_LEVEL'] = value
+                result = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                        text=True, capture_output=True, timeout=15)
+                valid = value in (None, '', '2', '0002', '10')
+                self.assertEqual(result.returncode, 0 if valid else 1, result.stdout + result.stderr)
+                if not valid:
+                    self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL must be a positive integer', result.stderr)
+                    self.assertFalse(calls.exists(), 'invalid compiler count reached Docker')
+                    continue
+                commands = [json.loads(row) for row in calls.read_text().splitlines()]
+                create = next(row for row in commands if row[0] == 'create')
+                compiler_env = [arg for arg in create if arg.startswith('CMAKE_BUILD_PARALLEL_LEVEL=')]
+                expected = [] if not value else ['CMAKE_BUILD_PARALLEL_LEVEL=' + value.lstrip('0')]
+                self.assertEqual(compiler_env, expected, 'host override must reach Docker without replacing image defaults')
+                if compiler_env: self.assertEqual(create[create.index(compiler_env[0]) - 1], '-e')
+
     def test_auto_image_switch_cancellation_finishes_bootstrap_cleanup(self):
         binary = self.make_image_selection_daemon()
         (self.root / 'config/west.yml').write_text(
@@ -453,7 +793,7 @@ elif args[0] != "start": sys.exit(99)
             commands = [json.loads(row) for row in calls.read_text().splitlines()]
             self.assertEqual(sum(row[0] == 'create' for row in commands), 1)
             self.assertEqual([row for row in commands if row[0] == 'rm'], [['rm', '-f', 'a' * 64]])
-            summary = next((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid)).read_text()
+            summary = (self.run_directory(output) / 'build-summary.txt').read_text()
             self.assertIn('Status: FAILED', summary)
             self.assertIn('Reason: interrupted by SIGTERM', summary)
         finally:
@@ -643,6 +983,30 @@ elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
         self.expect_targets({'include': [{'board': 'A', 'snippet': 'old',
                                           'artifact-name': 'name-{snippet}'}],
                              'exclude': [{'artifact-name': 'name-old'}]}, [], snippets='new')
+
+    def test_exclude_uses_raw_artifact_names_before_normalization(self):
+        for key in ('artifact-name', 'artifact_name'):
+            for remaining in ('retained', 'name_with_space'):
+                with self.subTest(key=key, remaining=remaining):
+                    self.expect_targets({'include': [
+                        {'board': 'A', key: 'name with space'},
+                        {'board': 'B', key: remaining}],
+                        'exclude': [{key: 'name with space'}]}, [target(remaining, board='B')])
+            with self.subTest(key=key, template=True):
+                self.expect_targets({'include': [{'board': 'A', 'snippet': 'old',
+                                                  key: 'name {board} {snippet}'}],
+                                     'exclude': [{key: 'name A old'}]}, [], snippets='cli')
+            with self.subTest(key=key, exact_safe_name=True):
+                self.expect_targets({'include': [
+                    {'board': 'A', key: 'name with space'},
+                    {'board': 'B', key: 'name_with_space'}],
+                    'exclude': [{key: 'name_with_space'}]}, [target('name_with_space')])
+            with self.subTest(key=key, legacy_alias_scope=True):
+                self.expect_targets({'include': [
+                    {'board': 'A', key: 'name with space'},
+                    {'board': 'B', key: 'name_with_space'}],
+                    'exclude': [{'board': 'A', key: 'name_with_space'}]},
+                    [target('name_with_space', board='B')])
 
     def test_current_target_shapes_fixture_exact_trace(self):
         nice = 'nice_nano/nrf52840/zmk'
@@ -888,6 +1252,8 @@ elif sys.argv[1] == 'manifest':
 elif sys.argv[1] == 'zephyr-export': pass
 elif sys.argv[1] == 'build':
     print('controlled build boundary reached')
+    with open(os.environ['PROBE_BUILD_ENV'], 'a') as log:
+        log.write(json.dumps({'compiler_jobs': os.environ.get('CMAKE_BUILD_PARALLEL_LEVEL')}) + '\\n')
     build = pathlib.Path(sys.argv[sys.argv.index('-d') + 1])
     (build / 'zephyr').mkdir(parents=True, exist_ok=True)
     (build / 'intermediate.o').write_text('temporary compiler output\\n')
@@ -933,6 +1299,7 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                    EXTERNAL_MODULES_DIR=str(inputs), OUTPUT_DIR=str(case_root / 'output'),
                    PATH=str(fake_bin) + ('' if fail_remove else os.pathsep + os.environ['PATH']),
                    PROBE_COMMANDS=str(commands), PROBE_ARGV=str(commands.with_suffix('.argv.jsonl')),
+                   PROBE_BUILD_ENV=str(case_root / 'build-env.jsonl'),
                    PROBE_PROJECT_PATH=project_path, PROBE_CONTROL=str(control), PROBE_UPDATE_COUNT=str(counter),
                    PROBE_FAIL_COPY=str(int(fail_copy)), PROBE_PROJECT_DIR=str(project),
                    PROBE_REAL_WEST=shutil.which('west'), PROBE_REAL_RM=shutil.which('rm'))
@@ -940,6 +1307,27 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                                inputs=inputs, backup=backup, stamp=stamp, manifest_stamp=manifest_stamp,
                                digest=digest, ready=ready, commands=commands, counter=counter, control=control,
                                lock=lock, env=env)
+
+    def test_compiler_jobs_container_validation_before_workspace_mutation(self):
+        for value in (None, '', '2', '0002', '0', '00', '-1', '1.5', ' 2', '2\n', 'bad'):
+            with self.subTest(value=value):
+                case = self.make_workspace()
+                case.env.pop('CMAKE_BUILD_PARALLEL_LEVEL', None)
+                case.env['PROBE_BUILD_EXIT'] = '0'
+                if value is not None: case.env['CMAKE_BUILD_PARALLEL_LEVEL'] = value
+                original_stamp = case.stamp.read_bytes()
+                result, output = self.run_workspace(case)
+                valid = value in (None, '', '2', '0002')
+                self.assertEqual(result.returncode, 0 if valid else 1, output)
+                if valid:
+                    captured = [json.loads(row) for row in pathlib.Path(case.env['PROBE_BUILD_ENV']).read_text().splitlines()]
+                    self.assertEqual(captured, [{'compiler_jobs': value.lstrip('0') if value else value}])
+                else:
+                    self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL must be a positive integer', output)
+                    self.assertEqual(case.commands.read_bytes(), b'')
+                    self.assertEqual(case.stamp.read_bytes(), original_stamp)
+                    self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+                    self.assertFalse(pathlib.Path(case.env['PROBE_BUILD_ENV']).exists())
 
     def run_workspace(self, case):
         result = subprocess.run(['bash', str(BUILD), 'build'], env=case.env,
@@ -993,6 +1381,73 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                 self.assertEqual(case.manifest_stamp.read_text(), 'stale\n')
                 self.assertEqual(case.stamp.read_text(), 'project\tmodules/project\n')
 
+    def test_run_reservation_signals_retain_evidence_before_docker(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        (binary / 'mkdir').write_text('''#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, time
+status = subprocess.call([os.environ['RESERVE_REAL_MKDIR']] + sys.argv[1:])
+destination = pathlib.Path(sys.argv[-1])
+if status == 0 and destination.name.startswith('run-'):
+    pathlib.Path(os.environ['RESERVE_REACHED']).write_text(str(destination))
+    while not pathlib.Path(os.environ['RESERVE_RELEASE']).exists(): time.sleep(.01)
+sys.exit(status)
+''')
+        (binary / 'docker').write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+pathlib.Path(os.environ['RESERVE_DOCKER_CALLED']).write_text(repr(sys.argv[1:]))
+sys.exit(99)
+''')
+        for script in binary.iterdir(): script.chmod(0o755)
+        for group in (False, True):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(group=group, signal=signum):
+                    case = self.root / ('reserve-%s-%s' % (group, signum))
+                    case.mkdir()
+                    env = dict(os.environ, ZMK_IN_CONTAINER='0',
+                               PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                               RESERVE_REAL_MKDIR=shutil.which('mkdir'),
+                               RESERVE_REACHED=str(case / 'reached'), RESERVE_RELEASE=str(case / 'release'),
+                               RESERVE_DOCKER_CALLED=str(case / 'docker-called'))
+                    process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                               start_new_session=True, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not (case / 'reached').exists() and time.monotonic() < deadline:
+                            self.assertIsNone(process.poll())
+                            time.sleep(.01)
+                        self.assertTrue((case / 'reached').exists())
+                        if group: os.killpg(process.pid, signum)
+                        else: os.kill(process.pid, signum)
+                        time.sleep(.05)
+                        try:
+                            if group: os.killpg(process.pid, signum)
+                            else: os.kill(process.pid, signum)
+                        except ProcessLookupError:
+                            pass
+                        (case / 'release').touch()
+                        output, _ = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 128 + signum, output)
+                        run = pathlib.Path((case / 'reached').read_text())
+                        self.assertTrue(run.is_dir())
+                        print('RESERVATION: signal=%s group=%s files=%r' %
+                              (signal.Signals(signum).name, group, sorted(p.name for p in run.iterdir())))
+                        self.assertTrue((run / 'build.log').is_file(), output)
+                        self.assertTrue((run / 'build-summary.txt').is_file(), output)
+                        summary = (run / 'build-summary.txt').read_text()
+                        self.assertIn('Status: FAILED', summary)
+                        self.assertIn('Reason: interrupted by ' + signal.Signals(signum).name, summary)
+                        self.assertRegex(summary, r'(?m)^Run sequence: [1-9][0-9]*$')
+                        self.assertEqual(self.run_directory(output), run)
+                        self.assertFalse((case / 'docker-called').exists(), output)
+                    finally:
+                        (case / 'release').touch()
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        if process.poll() is None: process.wait(timeout=3)
+
     def test_create_group_signals_acquire_identity_before_cleanup(self):
         binary = self.root / 'bin'
         binary.mkdir()
@@ -1009,6 +1464,10 @@ elif sys.argv[1] != 'rm': sys.exit(99)
 ''')
         docker.chmod(0o755)
         (self.root / 'build.yaml').write_text('board: A\n')
+        ownership_hook = self.root / 'observe-create-ownership.sh'
+        ownership_hook.write_text('''set -T
+trap 'if [ "${FUNCNAME[0]:-}" = finish_run ]; then trap - DEBUG; printf "%s\\t%s\\n" "${container_id:-}" "${container_created:-}" > "$SIGNAL_OWNED"; fi' DEBUG
+''')
         for mode in ('build', 'validate'):
             for keep in (0, 1):
                 for signum in (signal.SIGINT, signal.SIGTERM):
@@ -1018,7 +1477,8 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                         env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
                                    ZMK_IN_CONTAINER='0', ZMK_KEEP_CONTAINER=str(keep),
                                    SIGNAL_CALLS=str(case / 'calls'), SIGNAL_REACHED=str(case / 'reached'),
-                                   SIGNAL_RELEASE=str(case / 'release'))
+                                   SIGNAL_RELEASE=str(case / 'release'), BASH_ENV=str(ownership_hook),
+                                   SIGNAL_OWNED=str(case / 'owned'))
                         args = ['bash', str(BUILD)]
                         if mode == 'validate': args.append('validate')
                         args.append(str(self.root))
@@ -1036,13 +1496,12 @@ elif sys.argv[1] != 'rm': sys.exit(99)
                             (case / 'release').touch()
                             output, _ = process.communicate(timeout=5)
                             self.assertEqual(process.returncode, 128 + signum, output)
-                            self.assertIn('a' * 64, output)
+                            self.assertEqual((case / 'owned').read_text(), 'a' * 64 + '\t1\n',
+                                             'create ID must be owned before interrupted cleanup')
                             calls = [json.loads(line) for line in (case / 'calls').read_text().splitlines()]
                             self.assertFalse(any(call[0] == 'start' for call in calls), calls)
                             self.assertEqual(['rm', '-f', 'a' * 64] in calls, keep == 0, calls)
-                            summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
-                            self.assertEqual(len(summaries), 1)
-                            summary = summaries[0].read_text()
+                            summary = (self.run_directory(output) / 'build-summary.txt').read_text()
                             self.assertIn('Status: FAILED', summary)
                             self.assertIn('Reason: interrupted by ' + signal.Signals(signum).name, summary)
                         finally:
@@ -1094,9 +1553,7 @@ else: sys.exit(99)
                         output, _ = process.communicate(timeout=5)
                         self.assertTrue((folder / 'complete').exists(), output)
                         self.assertEqual(process.returncode, initial or 128 + signum, output)
-                        summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
-                        self.assertEqual(len(summaries), 1)
-                        summary = summaries[0].read_text()
+                        summary = (self.run_directory(output) / 'build-summary.txt').read_text()
                         self.assertIn('Status: FAILED', summary)
                         reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
                         self.assertIn('Reason: ' + reason, summary)
@@ -1144,9 +1601,7 @@ trap 'if [ "${FUNCNAME[0]:-}" = finish_run ]; then trap - DEBUG; : > "$ENTRY_REA
                     self.assertTrue((folder / 'reached').exists(), output)
                     self.assertTrue((folder / 'cleaned').exists(), output)
                     self.assertEqual(process.returncode, initial or 128 + signum, output)
-                    summaries = list((BUILD.parent / '.build').glob('*-pid-%s/build-summary.txt' % process.pid))
-                    self.assertEqual(len(summaries), 1, output)
-                    summary = summaries[0].read_text()
+                    summary = (self.run_directory(output) / 'build-summary.txt').read_text()
                     self.assertIn('Status: FAILED', summary)
                     reason = 'container start failed' if initial else 'interrupted by ' + signal.Signals(signum).name
                     self.assertIn('Reason: ' + reason, summary)
@@ -1192,16 +1647,15 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
                 output, _ = process.communicate(timeout=10)
                 self.assertTrue((folder / 'reached').exists(), output)
                 self.assertTrue((folder / 'cleaned').exists(), output)
-                runs = list((BUILD.parent / '.build').glob('*-pid-%s' % process.pid))
-                self.assertEqual(len(runs), 1)
-                summary = runs[0] / 'build-summary.txt'
+                run = self.run_directory(output)
+                summary = run / 'build-summary.txt'
                 if name == 'late-signal':
                     self.assertEqual(process.returncode, 0, output)
                     self.assertIn('Status: SUCCESS', summary.read_text())
                 else:
                     self.assertNotEqual(process.returncode, 0, output)
                     self.assertFalse(summary.exists(), output)
-                self.assertFalse(list(runs[0].glob('summary-tmp-*')))
+                self.assertFalse(list(run.glob('summary-tmp-*')))
 
     def test_restore_copy_failure_preserves_recovery_state(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project', True)
@@ -1789,7 +2243,8 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
         root = pathlib.Path('/tmp/windows-copy')
         root.mkdir()
         keep = ['keep.txt', 'nested/valid name.txt', 'nested/COM0.txt',
-                'nested/my..file.txt', 'unicode-名前.txt', 'DEL-\x7f.txt', 'COM⁴.txt']
+                'nested/my..file.txt', 'unicode-名前.txt', 'DEL-\x7f.txt', 'COM⁴.txt',
+                '-C', '--exclude=src', 'literal [ab] $value; & (test).txt', 'unicode-名前-📦.txt']
         bad = ['tail ', 'tail.', 'CON.txt', 'lpt1.extra', 'bad:colon', 'bad?name',
                'bad*name', 'bad"quote', 'bad<name', 'bad>name', 'bad|name',
                'bad\\name', 'bad\nline', 'bad\tcontrol', 'bad\x01control',

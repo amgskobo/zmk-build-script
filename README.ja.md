@@ -115,6 +115,7 @@ firmware は compile しません。build / validate とも、新しい run dire
 | `ZMK_CCACHE_DIR` | container 内の ccache directory（`/workspaces/.ccache`）。永続化する場合は cache volume 上に置きます。 |
 | `ZMK_COPY_IGNORED` | `1` で Git が ignore する file も copy します。 |
 | `ZMK_BUILD_JOBS` | `--jobs` の既定値（1）。 |
+| `CMAKE_BUILD_PARALLEL_LEVEL` | 各 target の compile 並列数を正の十進整数で指定し、container 内の CMake へ渡します。空欄・未指定は選択した image / tool の既定値です。 |
 | `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` の試行回数（3）。 |
 | `ZMK_FALLBACK_BINARY` | `.uf2` の次に探す firmware 拡張子（`bin`）。 |
 | `ZMK_EXTRA_MODULES` | 選択した application の extra module に足す、container から参照できる path。 |
@@ -129,7 +130,13 @@ source process、各sourceのtarget、Ninjaによるcompileは、それぞれ別
 | --- | --- | --- |
 | 一つのlocal wrapperから起動するsource | `--source-jobs N` / `ZMK_EXTERNAL_SOURCE_JOBS` | 1 source |
 | 各source内のtarget | `--jobs N` / `ZMK_BUILD_JOBS` | 1 target |
-| 一つのtarget内のcompile | Ninjaと選択したbuild環境 | build環境の既定値 |
+| 一つのtarget内のcompile | CMake / Ninja 経由の `CMAKE_BUILD_PARALLEL_LEVEL` | build環境の既定値 |
+| 独立した検証 case | `ZMK_TEST_JOBS` / 手動 workflow の `test_jobs` | 4 case。`1` は逐次実行 |
+
+2 target を同時に、それぞれ最大 2 compiler jobs で build する場合は
+`CMAKE_BUILD_PARALLEL_LEVEL=2 bash build.sh path/to/zmk-config --jobs 2` を実行します。
+summary の `Build jobs` と `Compiler jobs` に記録し、compiler jobs の `auto` は host が
+上限を指定していないことを表します。source worker が複数ある場合は、その分も掛け合わせます。
 
 ### 一つのsource内のtarget
 
@@ -154,6 +161,7 @@ bash scripts/auto-build-external.sh --sources-file repos.txt --source-jobs 2 --j
 wrapperがslugを一意化し、sourceごとのclone、cache、container、成果物を分離します。
 空き枠には次のsourceを投入し、一つのsourceが失敗しても他のsourceは継続します。
 別々のwrapper実行で、同じclone用slug・directoryを共有しないでください。
+coordinator の中断や出力失敗では、取得済み worker group を停止・回収してから、元の失敗 status を返します。
 
 ### 独立した実行とcacheの共有
 
@@ -209,6 +217,8 @@ include:
 board / shield 配列は top-level と `include:` の両方で matrix に展開します。
 `defaults:` は不足値を補い、`exclude:` は CLI snippet を合成する前の YAML 値で照合します。
 `cmake_args` / `extra_cmake_args` / `artifact_name` の alias も扱います。
+artifact の除外は、ファイル名へ正規化する前の YAML 由来の名前を優先します。
+同じ board / shield / snippet の条件に一致する名前がなければ、正規化済みの名前も互換 alias として照合します。
 artifact 名は安全な file 名へ正規化し、拡張子つきも含む Windows 予約名と、大小文字を無視した重複を拒否します。
 
 ### 独立application
@@ -287,7 +297,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 
 | wrapper option | 意味 |
 | --- | --- |
-| `--repo URL`, `--path DIR` | source の種類を明示します。 |
+| `--repo URL`, `--path DIR` | source の種類を明示します。明示した `--repo` には空でない URL が必要です。 |
 | `--revision SHA` | 完全なコミットSHAを取得し、一致を確認します。`auto-build-external.sh` では対応する `--repo URL` の後ろに置きます。local path には指定できません。 |
 | `--source-slug NAME`, `--repo-slug NAME` | source の slug を指定します。複数 source wrapper では `--repo` / `--path` の後ろに置きます。 |
 | `--mode build\|validate` | build / validate を選びます。 |
@@ -367,6 +377,7 @@ file 削除は WSL の memory cache を Windows へ強制返却する処理で�
 
 実行中の SIGINT / SIGTERM では中断理由を含む FAILED run を確定します。保持指定の container は中断時に停止し、
 ID と log を確認できる状態で残します。
+run directory の初期確保中も、所有権・連番・log の記録まで中断を遅延し、Docker 起動前の中断でも FAILED summary を残します。
 container 作成中（image の自動 pull を含む）は中断を遅延し、process group 全体への signal でも ID を回収してから終了します。
 中断を繰り返しても、識別前の container を放置しません。終了 handler の入口から cleanup 完了まで中断を遅延します。
 先の build error があれば理由と終了 status を保持し、それ以外の中断は FAILED summary にします。
@@ -385,36 +396,62 @@ path / glob と先頭 dot / hyphen は拒否します。CI は後述の公開用
 firmware と raw log は local の `.build/` に保持します。
 
 ```text
-.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
+.build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne/
 +-- example_corne_left.uf2
++-- example_corne_right.uf2
 +-- build.log
 +-- build-summary.txt
 ```
 
+各 run は全 firmware、実行全体の log、summary を一か所に保持します。日時は local time を使い、
+その後ろに `zmk-config-corne` のような config repository の directory 名を付けます。表示用の名前は小文字化し、
+ASCII 英数字・underscore・hyphen 以外の文字の連続を hyphen に置換します。80 文字までに制限して両端の hyphen を除き、
+空になった場合は `config` を使い、repository 名の dot も hyphen に変換します。
+同じ日時・表示名の実行が重なる場合は directory の atomic な確保によって `-2`、`-3` と連番を付け、既存の出力は上書きしません。
+directory 作成・log 初期化の前に隣接する一時 claim を排他的に確保して所有権を決め、claim の解放失敗は Docker 起動前に実行を失敗させます。
+summary に `Run sequence`（最初の実行は 1）を記録するため、表示名の末尾の数字と衝突時の連番を区別できます。
+status・mode・件数・fallback・連番・期待する image / input / cache の検証は Failure excerpt より前の metadata を読みます。
+生の log 行でこれらの field を補ったり上書きしたりしません。
+
+何をビルドしたかは run 内の firmware 名と summary の file 一覧で判断できます。firmware 名は既存の container 内の
+`build.yaml` parser で決まり、`artifact-name` とその placeholder を優先し、省略時は既存の shield / board 由来の名前を使います。
+matrix 展開、defaults、exclude、snippet、settings-reset target の規則も共通です。command は開始時と成功時に run directory を
+表示し、target 選択前の準備失敗でも実行記録を残します。
+
+成果物回収では、安全で重複しない名前の通常の firmware ファイルだけを取り込みます。
+想定外の名前、link、directory、log・summary との衝突は実行を失敗させ、ホストの実行記録を保持します。
+Unix では回収した firmware の権限を `0644` に揃え、実行権限・特殊権限 bit を取り除きます。
+
 開始済み run は setup、source copy、成果物回収、container 削除の失敗にも FAILED summary と error excerpt を残します。
 build 出力は container の log stream にも流れ、保持した container は `docker logs <container>` で確認できます。
+中断時は、所有する host 側の copy / log process と container の後始末を待ってから最終 summary を確定します。
+log 書込みが失敗した場合も失敗状態を保持し、指定された container cleanup 方針を適用します。
 特定 run の成果物確認は次のように実行します。
 
 ```bash
-bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID
+bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne
 ```
 
 validate の結果は `build` を `validate` に置き換えます。両 mode とも、成功 status と一致する mode を持つ summary、
 および log file が必要です。build の確認では、さらに正の target 数と build target 数・firmware 数の完全一致を要求します。
+既知の metadata field は重複を拒否し、期待値 file がない場合も target・image・cache の field を検証します。
 相対run pathは呼び出し元のdirectoryを基準に解決し、省略時はそのdirectoryの `.build/` を探します。
 別の directory から確認するときは run path を指定します。
-run 名は上記の規則に従います。
+探索の失敗・不完全な列挙はエラーとし、取得不能な証跡の代わりに古い成功 run を選びません。
+run 名は上記の規則に従い、衝突時だけ 2 から始まる `-N` を付けます。自動選択では日時と config 表示名を並べ、
+同じ表示名の summary に記録した連番を数値として扱います。実行を特定する場合は run path を明示します。
+日時のみ、旧 `-N`、旧 `-pid-PID`、連番 metadata のない旧 dot 区切りの directory も検証できます。
 fallback は summary に記録し、記録のない旧 summary は `bin` と解釈します。
 
 品質の検証では、実行前に独立した出力の期待値を定義し、明示run directoryとともに `--expect FILE` を渡します。
-fileはNUL区切りのkey/value対で、必須の `image` 一つ、任意の `target` と `cache`、
+fileはNUL区切りのkey/value対で、必須の `image` 一つ、任意の `target`・`cache`・`jobs`・`compiler-jobs`、
 build modeでは期待するfirmwareのbasenameごとの `artifact` を記録します。validate modeはmetadataのkeyだけを受け付けます。
 
 ```bash
 printf '%s\0' image zmkfirmware/zmk-build-arm:stable \
   artifact example_corne_left.uf2 > expected-output.nul
 bash .github/scripts/check-build-output.sh build \
-  .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID --expect expected-output.nul
+  .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne --expect expected-output.nul
 ```
 
 期待するmetadataはsummaryに一度だけ現れ、値の完全一致が必要です。buildではfirmware名の集合の完全一致と
@@ -426,9 +463,13 @@ local pathを含む期待値fileは非公開で保持します。Bashと標準to
 | workflow | 用途 |
 | --- | --- |
 | [Compatibility](.github/workflows/compatibility.yml) | Windows / macOS / Linux の hosted shell、Ubuntu の Docker / firmware 検証。 |
-| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | 手動の `platform: macos\|windows\|linux\|all`、`mode: validate\|build`。validate は shell / Docker、build は firmware も確認します。 |
+| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | 手動の `platform: macos\|windows\|linux\|all`、`mode: validate\|build\|firmware`。validate は shell / Docker、build は全層、firmware は既存の firmware 層を選びます。 |
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Ubuntu で list を解決し、source ごとに利用可能な self-hosted runner へ割り当てます。 |
 | [Heartbeat](.github/workflows/heartbeat.yml) | 追跡中の heartbeat 記録を更新します。commit / push を含む workflow です。 |
+
+Self-hosted Build の任意入力 `build_image` / `docker_platform` / `target_jobs` / `compiler_jobs` は、それぞれ
+`ZMK_BUILD_IMAGE` / `ZMK_DOCKER_PLATFORM` / `ZMK_BUILD_JOBS` / `CMAKE_BUILD_PARALLEL_LEVEL` 変数へ渡します。空欄の場合は runner の環境と
+builder / Docker の既定値を保持します。macOS job は `/bin/bash`、Windows job は Git Bash を明示します。
 
 ### runnerの登録
 
@@ -439,6 +480,9 @@ repository の Settings → Actions → Runners から、GitHub が表示する 
 runner user で `bash .github/scripts/check-runner-tools.sh` と「保守と検証」を実行します。
 Windows step は標準 install path の Git Bash を明示します。Docker Desktop は同じ account / session で使えることを
 確認します。Linux は sudo 無しの daemon access が必要で、group 変更後は login / service を更新します。
+手動 workflow は native test suite の前に Docker access を確認します。Windows では対話 terminal に加え、
+runner の non-login Git Bash 環境でも Docker を確認します。service は起動時の環境を保持している場合があるため、
+PATH を変更した後は runner の session / service を更新します。
 self-hosted runner は信頼できる workflow に限定します。
 
 ### scheduleと並列数
@@ -452,6 +496,7 @@ online / busy / label / 登録先を確認し、外部 job から除外する場
 ### 公開レポートとCI helper
 
 CI の自動 upload は `.build/public/` の固定項目の text report に限定し、command の結果と既知の test status を記録します。
+host test の失敗時は、検証済みの数値のソース行番号も記録できます。生のエラー文は含めません。
 raw な環境情報、path、source label、runner 名、log、firmware は自動 upload しません。
 外部 job の公開名には source の数値 index を使います。report は raw evidence と別の公開用コピーです。
 hosted runner の raw evidence は一時的で、job の削除後は残りません。詳細な診断には local での再現、
@@ -502,14 +547,42 @@ bash .github/scripts/test.sh all
 
 | 層 | 確認範囲 |
 | --- | --- |
-| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。この検証層には Git が必要です。 |
+| `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白・Unicode 入り target / module / 一時 path、option や shell 構文に見える文字・絵文字を含む literal file 名、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
-| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application、成果物数と依存 identity。 |
-| `all` | `shell`、`docker`、`build` の各層をこの順に実行します。 |
+| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
+| `all` | 独立した shell case と、順序を保つ Docker 検証・firmware の処理を並行して実行します。 |
+
+hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `docker` と `build` を実行します。
+手動 self-hosted の `mode=validate` は `shell` と `docker`、`mode=build` は選択した各 native host で
+`all` を実行します。native Docker で firmware まで確認するときは後者を使います。
+shell または validate の成功だけでは、その確認にはなりません。
+`mode=firmware` は既存の `build` 層を選び、選択した source の他の契約を確認済みの場合に、
+firmware / 並列設定の検証を絞れます。標準・overlay・復元・独立 application の assertion は維持します。
+全層の `mode=build` と hosted 3 OS / Docker の役割は維持します。
+層をまたいで fixture を共有していても、copy・parser・workspace / overlay の復旧・中断・成果物・公開の
+対照試験は維持します。
+
+成果物の検証では、大量 list の byte 数・大きな件数の検証と、file ごとの import 検証を分けます。
+単体・複数 file の実 import、件数不一致の拒否、producer を読み切る対照試験は維持し、
+同じ copy を数百回繰り返す負担を減らします。
+
+output checker は選択した run の検証ごとに summary header を1回解析し、literal な値と重複数を再利用します。
+候補の探索では各候補を個別に読みます。解析は failure excerpt の前で止め、header の NUL を拒否し、
+完全な parser 出力と producer の正常終了を両方確認します。項目ごとの再照会と単純な fixture directory の
+作成では、不要な process 起動を減らします。
+parser には十進数の byte 列を渡し、awk 実装による binary string の NUL 保持には依存しません。
+byte producer も最後まで読み取り、終了 status を確認します。
+
+host の run 名の整形と完了 marker の解析は、それぞれ1つの `awk` process で行います。
+marker の解析は log を最後まで読み、CR と ANSI prefix を除き、同一行に複数ある場合も最後の有効な marker を使います。
+成功した build に marker がない場合は、firmware 件数を使います。host suite は失敗・中断の scenario を維持し、
+helper process の起動数の上限も検証します。実際の起動コストと tool の挙動の確認には、各 native OS での実行が必要です。
 
 validate 専用の [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml) は
 matrix / defaults / exclude / alias / placeholder / reset 重複回避を確認します。
 fixture は代表 board / output の検証であり、upstream の全 board を網羅しません。
+runner の検証結果は、実行した OS・architecture・image の条件に対応します。UNC / drive path の解釈の検証は、
+実 SMB 共有へのアクセスを保証しません。他の architecture・filesystem policy・host 設定は個別の実行が必要です。
 fixture の manifest は ZMK と Zephyr の両方を検証済みコミットに固定し、firmware suite は
 取得した checkout と pin の一致も確認します。更新時は依存の差分をレビューし、影響する test layer を実行します。
 upstream の動く branch に対する互換性確認は、別途明示して実行します。
@@ -522,12 +595,53 @@ upstream の動く branch に対する互換性確認は、別途明示して実
 
 ### 検証記録とtest cache
 
-実行ごとに新しい `.build/test-<UTC>-pid-<PID>/` へ command、raw log、結果と時間、image identity、
+実行ごとに新しい `.build/test-<UTC>.XXXXXX/` へ command、raw log、結果と時間、image identity、
 実行前後の source checksum を保存します。`ZMK_TEST_RESULTS` で repository 外、または directory 全体を
 Git が ignore する新しい保存先を選べます。既存記録は上書きしません。
 `.gitattributes` / `.editorconfig` の UTF-8 / LF を使い、検証のために working tree を書き換えません。
 
-test cache は既定で専用 volume を作り、終了時に削除します。`ZMK_DOCKER_CACHE_VOLUME` を明示した場合は
-再利用・保持します。production cache は指定しません。`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
+`ZMK_TEST_JOBS` は同時に実行する test case の上限です（既定 `4`、十進数で `1` から `16`）。
+`1` を指定すると以前の逐次順序で実行します。手動 self-hosted workflow の `test_jobs` でも指定でき、
+空欄では runner の環境変数または既定値を維持します。各 case の log・時間・完了記録を分離し、
+coordinator が worker の実際の終了 status を確認して、規定の case 順に結果をまとめます。
+中断時は所有する worker group の停止と終了を待ち、その後に cache cleanup と最終公開処理を行います。
+
+cache の準備前に Docker access の成功が必要です。同じ test cache を使う Docker 検証の後に firmware を実行し、
+overlay と復元 build の順序も維持します。独立した host case はこの処理と並行できます。
+test case の枠数・target 並列数・compiler 並列数は別です。target 数 × compiler 数と実行中の host case を合わせて、
+1つの CPU / memory 予算に収めます。依存 download・configure・link では CPU が余る場合があります。
+case の時間は重なるため、合計を wall time として扱いません。
+
+source snapshot は Git の NUL 区切りの順序を保ち、選択された既存 file の checksum を取ります。
+相対引数の先頭を `./` にして、option に見える file 名も literal に扱います。
+引数の件数と byte 数で batch の上限を設け、Windows の command line を小さく保ちながら native process の
+起動を減らします。空・単体・端数、内容と順序、producer 失敗の対照試験で変更検出の範囲を維持します。
+
+`ZMK_TEST_PROFILE=1` で case / source check の時間と、Bash / Git 起動、100 file の書き込み / 読み込み、
+Docker client / exec 呼び出しの少数回の latency probe を追加できます。手動 workflow の `profile` も
+同じ設定で、既定は無効です。raw 出力と `profile.tsv` は非公開で保持します。`ci-tests` は実行成功後に検証済みの
+固定 metric 名・sample 数・ミリ秒・終了 status だけを表示し、`timings MODE FILE` で形式を単独検証できます。
+Docker exec probe は取得済みの validate container を再利用し、その時間は Docker case に含まれます。
+probe は一部の呼び出しを測るもので、全 command の内訳ではありません。入れ子の時間を加算せず、
+計測 / probe の負担を含む実行として通常の benchmark と区別します。
+
+test 後の計測データ検査で失敗した場合は、すべての動作検証が PASS でも公開レポートの CI 結果を FAILED にします。
+診断には固定の拒否理由と既知の metric 名だけを表示し、不正な値は非公開で保持します。
+byte の検査は producer を最後まで読み、終了時の失敗と report 全体の byte 数の不一致も拒否します。
+計測中の source snapshot の診断は別の非公開 log に保存し、警告が計測値に混入することを防ぎます。
+case 完了前に失敗した場合も、元の非ゼロの終了 status を保持します。
+結果の置き換えが完了していない場合は、確定または clear されるまで公開を拒否します。
+
+test cache は既定で専用 volume を作り、終了時に削除します。production cache は指定しません。
+
+| test cache の設定 | 動作 |
+| --- | --- |
+| `ZMK_DOCKER_CACHE_VOLUME` | 明示した専用 volume を再利用・保持し、managed prefix より優先します。 |
+| `ZMK_TEST_CACHE_PREFIX` | `zmk-build-script-test-` で始まる opt-in prefix。完全な image digest と明示した Docker platform があれば、その組み合わせ専用の cache を作って保持します。未指定・floating・自動選択では fresh cache を維持します。 |
+
+self-hosted workflow は repository / OS ごとの prefix を設定します。同じ OS の job は cache を保護するため
+直列化し、異なる OS の job は独立して実行します。表示するのは固定形式の Docker CPU / memory 容量の数値と、
+既存 cache override の有無だけです。host / device の識別値と実 cache 名は非公開の証跡に保持します。
+`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
 復元検証では保持します。各 build / validate の直後に、その run を明示して output check を実行します。
 local / remote CI / host platform / 実機の結果は分けて報告し、公開操作は user の明示指示がある場合だけ行います。

@@ -123,6 +123,7 @@ such as `00` are rejected. See [Parallel builds](#parallel-builds) for concurren
 | `ZMK_CCACHE_DIR` | ccache directory inside the container (`/workspaces/.ccache`). Keep it on the cache volume for persistence. |
 | `ZMK_COPY_IGNORED` | `1` also copies files ignored by Git. |
 | `ZMK_BUILD_JOBS` | Default for `--jobs` (1). |
+| `CMAKE_BUILD_PARALLEL_LEVEL` | Positive decimal compiler-job limit per target, forwarded to CMake in the container. Empty/unset uses the selected image/tool default. |
 | `ZMK_WEST_UPDATE_ATTEMPTS` | `west update` attempts (3). |
 | `ZMK_FALLBACK_BINARY` | Firmware extension tried after `.uf2` (`bin`). |
 | `ZMK_EXTRA_MODULES` | Container-visible module paths appended to the selected application's extra modules. |
@@ -137,7 +138,13 @@ Source processes, build targets and Ninja compilation have separate concurrency:
 | --- | --- | --- |
 | Sources in one local wrapper invocation | `--source-jobs N` / `ZMK_EXTERNAL_SOURCE_JOBS` | 1 source |
 | Targets in each source | `--jobs N` / `ZMK_BUILD_JOBS` | 1 target |
-| Compilation within a target | Ninja and the selected build environment | Build-environment default |
+| Compilation within a target | `CMAKE_BUILD_PARALLEL_LEVEL` via CMake/Ninja | Build-environment default |
+| Independent verification cases | `ZMK_TEST_JOBS` / manual workflow `test_jobs` | 4 cases; `1` selects sequential execution |
+
+For two targets with at most two compiler jobs each, run
+`CMAKE_BUILD_PARALLEL_LEVEL=2 bash build.sh path/to/zmk-config --jobs 2`.
+The summary records `Build jobs` and `Compiler jobs`; `auto` for compiler jobs
+means the host supplied no limit. Source workers multiply these limits.
 
 ### Targets in one source
 
@@ -163,6 +170,8 @@ The wrapper assigns unique slugs and separates each source's clone, cache,
 container and artifacts. Its rolling queue starts the next source when a slot
 opens; a source failure does not stop the other sources. Keep separate wrapper
 invocations from sharing clone slugs/directories.
+If the coordinator is interrupted or its output fails, it stops and waits for
+its acquired worker groups before returning the original failure status.
 
 ### Independent invocations and shared caches
 
@@ -222,6 +231,9 @@ appended. Alias spellings `cmake_args`, `extra_cmake_args` and `artifact_name` a
 also accepted. Artifact names are normalized to safe filenames; Windows device
 names, including names with extensions, and case-insensitive duplicates are
 rejected.
+Artifact exclusions first match the YAML-derived name before filename normalization.
+A normalized name remains a compatibility alias when no literal name matches the
+same board/shield/snippet selectors.
 
 ### Standalone applications
 
@@ -311,7 +323,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 
 | Wrapper option | Meaning |
 | --- | --- |
-| `--repo URL`, `--path DIR` | Select an explicit source type. |
+| `--repo URL`, `--path DIR` | Select an explicit source type. An explicit `--repo` requires a nonempty URL. |
 | `--revision SHA` | Fetch and verify an exact full commit SHA. In `auto-build-external.sh`, place it after the corresponding `--repo URL`; local paths cannot have a revision. |
 | `--source-slug NAME`, `--repo-slug NAME` | Set a source's slug; in the multi-source wrapper, place it after `--repo` / `--path`. |
 | `--mode build\|validate` | Select build or validation. |
@@ -400,6 +412,8 @@ reclamation belongs to the host operating system.
 During execution, SIGINT and SIGTERM finalize a FAILED run with the interruption
 reason. A retained container is stopped on interruption; its identity and logs
 remain available.
+Initial run-directory reservation defers cancellation until ownership, the run
+sequence and log are recorded, retaining a FAILED summary before Docker starts.
 During container creation (including an automatic image pull), cancellation is
 deferred until the returned ID has been acquired, including process-group
 interruptions. Repeated cancellation does not abandon an unidentified container.
@@ -424,33 +438,74 @@ or leading dot/hyphen. CI uploads the publication reports described below;
 firmware and raw logs remain in local `.build/` storage.
 
 ```text
-.build/run-YYYY-MM-DD_HH-MM-SS-pid-PID/
+.build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne/
 +-- example_corne_left.uf2
++-- example_corne_right.uf2
 +-- build.log
 +-- build-summary.txt
 ```
 
+Each run keeps all firmware, its combined log and summary together. The timestamp
+uses local time and is followed by the config repository's directory name, such
+as `zmk-config-corne`. The display label is lowercased, replaces runs of characters
+outside ASCII letters/digits/underscore/hyphen with a hyphen, and is limited to
+80 characters with edge hyphens removed; an empty result uses `config`. Dots in
+repository names become hyphens as part of this normalization.
+Simultaneous runs with the same timestamp and label add `-2`, `-3`, and so on
+through an atomic directory reservation. Existing output is never overwritten.
+A temporary exclusive sibling claim establishes ownership before directory
+creation and log initialization; failure to release it fails the run before Docker starts.
+The summary records `Run sequence` (1 for the first run), so a label ending in
+digits can be distinguished from the collision suffix. Status, mode, count,
+fallback, sequence and expected image/input/cache checks read metadata before
+the failure excerpt. Raw log lines cannot supply or override these fields.
+
+Identify the built targets inside the run from the firmware names and summary's
+file list. Firmware names come from the existing container-side `build.yaml`
+parser: `artifact-name` and its placeholders take precedence; without it, the
+existing shield/board name is used. Matrix expansion, defaults, exclusions,
+snippets and settings-reset targets keep the same rules. The command reports the
+run directory at startup and again on success, including evidence for setup
+failures before target selection.
+
+Artifact recovery imports only regular firmware files with safe, unique names.
+Unexpected names, links, directories and collisions with the log or summary fail
+the run while preserving the host evidence files. Imported firmware permissions
+are normalized to `0644` on Unix; executable and special permission bits are removed.
+
 Started runs retain a failure summary and error excerpt even when setup, source
 copy, artifact recovery or container cleanup fails. Build output also goes to the
 container log stream; inspect a retained container with `docker logs <container>`.
+Interruption waits for owned host copy/log processes and container cleanup before
+the final summary. Log-write failures retain a failure outcome and the configured
+container cleanup policy.
 Check a specific run with:
 
 ```bash
-bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID
+bash .github/scripts/check-build-output.sh build .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne
 ```
 
 Use `validate` instead of `build` for validation output. Both modes require a
 successful summary with the matching mode and a log file. Build checks also
 require a positive target count and exactly one firmware per build target.
+Known metadata fields must be unique, including target, image and cache fields
+when no expectations file is supplied.
 Relative run paths resolve from the caller's directory. Without a run path, the
 checker searches that directory's `.build/`. Pass the run path when checking from
 elsewhere.
-Run names must follow the displayed convention. The summary records the selected
-fallback; older summaries default to `bin`.
+Incomplete or failed discovery is an error; it cannot select an older successful
+run as a substitute for unavailable evidence.
+Run names follow the displayed convention with an optional `-N` collision suffix
+from 2. Automatic selection orders timestamps and config labels, then collision
+sequences recorded in summaries numerically for matching labels; pass an explicit run path to identify
+one invocation. Legacy timestamp-only, `-N` and `-pid-PID` run directories remain
+checkable, including earlier dotted suffixes without sequence metadata. The summary records the selected fallback; older summaries default to
+`bin`.
 
 For a quality gate, define expected outputs independently before building and pass
 `--expect FILE` with an explicit run directory. The file contains NUL-delimited
-key/value pairs: one required `image`, optional `target` and `cache`, and one
+key/value pairs: one required `image`, optional `target`, `cache`, `jobs` and
+`compiler-jobs`, and one
 `artifact` per expected firmware basename in build mode. Validate mode accepts
 only the metadata keys. For example:
 
@@ -458,7 +513,7 @@ only the metadata keys. For example:
 printf '%s\0' image zmkfirmware/zmk-build-arm:stable \
   artifact example_corne_left.uf2 > expected-output.nul
 bash .github/scripts/check-build-output.sh build \
-  .build/run-YYYY-MM-DD_HH-MM-SS-pid-PID --expect expected-output.nul
+  .build/run-YYYY-MM-DD_HH-MM-SS-zmk-config-corne --expect expected-output.nul
 ```
 
 Expected metadata must match exactly and appear once in the summary. Build checks
@@ -472,9 +527,15 @@ without an additional host parser dependency.
 | Workflow | Purpose |
 | --- | --- |
 | [Compatibility](.github/workflows/compatibility.yml) | Hosted shell checks on Windows/macOS/Linux; Docker and firmware checks on Ubuntu. |
-| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | Manual `platform: macos\|windows\|linux\|all`, `mode: validate\|build`. Validate runs shell and Docker contracts; build also compiles fixtures. |
+| [Self-hosted Build](.github/workflows/self-hosted-build.yml) | Manual `platform: macos\|windows\|linux\|all`, `mode: validate\|build\|firmware`. Validate runs shell and Docker contracts; build runs all layers; firmware selects the existing firmware layer. |
 | [Auto Build External ZMK Repos](.github/workflows/auto-build.yml) | Resolve the list on Ubuntu, then route each source to an eligible self-hosted runner. |
 | [Heartbeat](.github/workflows/heartbeat.yml) | Update the tracked heartbeat record; this workflow commits and pushes. |
+
+Self-hosted Build accepts optional `build_image`, `docker_platform`, `target_jobs`
+and `compiler_jobs` inputs, passed through `ZMK_BUILD_IMAGE`,
+`ZMK_DOCKER_PLATFORM`, `ZMK_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` respectively.
+Blank inputs retain the runner's environment and the builder/Docker defaults.
+The macOS job uses `/bin/bash`; the Windows job uses Git Bash explicitly.
 
 ### Runner setup
 
@@ -487,6 +548,10 @@ Run `bash .github/scripts/check-runner-tools.sh` and the maintenance checks as
 that user. Windows steps explicitly use Git Bash at its standard installation
 path. Docker Desktop must be accessible in the same account/session. Linux needs
 Docker daemon access without sudo; refresh the login/service after group changes.
+The manual workflow checks Docker access before the native test suite. On Windows,
+check Docker from the runner's non-login Git Bash environment as well as an
+interactive terminal; a running service may still have the environment from when
+it started. Refresh the runner session/service after changing its PATH.
 Limit self-hosted execution to trusted workflows.
 
 ### Scheduling and parallelism
@@ -502,8 +567,9 @@ Check online/busy state, labels and registration scope. Remove
 ### Public reports and CI helpers
 
 CI publishes only fixed-field text reports under `.build/public/`. These contain
-the command outcome and recognized test statuses. Raw environment records,
-paths, source labels, runner names, logs and firmware are excluded from automatic
+the command outcome and recognized test statuses. A host test failure can also
+include a validated numeric source line, without raw error text. Raw environment
+records, paths, source labels, runner names, logs and firmware are excluded from automatic
 uploads. External jobs use a numeric source index in their public names.
 These reports are sanitized copies, separate from the raw evidence. On hosted
 runners, raw evidence is temporary and is lost when the job is removed; detailed
@@ -561,14 +627,47 @@ bash .github/scripts/test.sh all
 
 | Layer | Scope |
 | --- | --- |
-| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Git is required for this test layer. |
+| `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module and temporary paths with spaces/Unicode, literal option-like/shell-character/emoji filenames, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
 | `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
-| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets; exact outputs and dependency identities. |
-| `all` | Run the `shell`, `docker` and `build` layers in that order. |
+| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
+| `all` | Run independent shell cases alongside the ordered Docker contracts and firmware chain. |
+
+Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
+Ubuntu. Manual self-hosted `mode=validate` runs `shell` and `docker`;
+`mode=build` runs `all` on each selected native host. Use the latter for native
+Docker firmware coverage: a shell or validate result alone does not establish it.
+`mode=firmware` selects the existing `build` layer for focused firmware/concurrency
+checks after the other contracts have been covered on the selected source. It keeps
+the standard, overlay, restoration and standalone assertions. Full `mode=build`
+and hosted three-OS/Docker roles remain unchanged.
+Retain the copy, parser, workspace/overlay recovery, cancellation, artifact and
+publication controls even when they share fixtures across layers.
+
+Artifact tests separate large-list byte pressure and large-count validation from
+per-file import checks. Single and multiple real imports, incomplete-count rejection
+and producer-drain controls remain mandatory without repeating identical copies
+hundreds of times.
+
+The output checker parses a summary header once per selected-run check and reuses
+its literal values and duplicate counts. Candidate discovery reads each candidate
+separately. Parsing stops before the failure excerpt, rejects header NUL bytes and
+requires complete parser output plus a successful producer status. Repeated field
+queries and simple fixture directory creation avoid unnecessary process launches.
+The parser receives decimal bytes so NUL handling does not depend on an awk
+implementation storing binary strings; the byte producer is drained and checked too.
+
+Host run-name normalization and completion-marker parsing each use one `awk` process.
+Marker parsing drains the log, strips CR and ANSI prefixes, and retains the last valid marker,
+including multiple markers on one line. Successful builds without a marker still use the firmware
+count. The host suite retains failure/cancellation scenarios and checks a helper-process budget;
+native OS runs remain necessary to verify their actual startup costs and tool behavior.
 
 The validate-only [target-shape fixture](.github/fixtures/target-shapes-zmk-config/build.yaml)
 covers matrices, defaults, exclusions, aliases, placeholders and reset de-duplication.
 The fixtures exercise representative boards and outputs, not every upstream board.
+Runner coverage is specific to the exercised OS, architecture and image. UNC/drive
+path classification does not establish access to an actual SMB share. Other
+architectures, filesystem policies and host configurations need their own runs.
 Their manifests pin both ZMK and Zephyr to tested commits; the firmware suite
 also verifies the resolved checkouts against those pins. Update them deliberately
 with dependency review and the affected test layers. Keep tests against moving
@@ -585,13 +684,60 @@ cache and full artifact name set immediately after each successful build.
 ### Evidence and test caches
 
 Each invocation records commands, raw logs, status/timing, image identity and
-source checksums before/after in a fresh `.build/test-<UTC>-pid-<PID>/`.
+source checksums before/after in a fresh `.build/test-<UTC>.XXXXXX/`.
 `ZMK_TEST_RESULTS` can select another new directory outside the repository or
 fully ignored by Git. Existing evidence is never overwritten. Use UTF-8/LF via
 `.gitattributes` and `.editorconfig`; checks preserve the working tree.
 
-Tests create and remove a dedicated cache by default. An explicitly supplied
-`ZMK_DOCKER_CACHE_VOLUME` is reused and retained; never use a production cache.
+`ZMK_TEST_JOBS` bounds concurrent test cases (default `4`, decimal `1` through `16`).
+Set it to `1` for the previous sequential order. The manual self-hosted workflow
+also accepts `test_jobs`; a blank input preserves the runner environment or default.
+Each case has separate logs, timing and completion records; the coordinator merges
+results in the documented case order and checks actual worker exits. Interruption
+stops and awaits owned worker groups before cache cleanup and final publication.
+
+Docker access must pass before cache preparation. Docker contracts precede firmware
+on their shared test cache; overlay and restoration builds retain their required
+order. Independent host cases can overlap that chain. Test-case slots, target jobs
+and compiler jobs are separate: include target jobs times compiler jobs, plus active
+host cases, in one CPU/memory budget. Dependency downloads, configure and link steps
+can still leave CPUs idle. Case timings overlap and must not be summed as wall time.
+
+Source snapshots checksum existing selected files in Git's NUL-delimited order.
+Relative operands start with `./` so option-like filenames remain literal. Batches
+are bounded by argument count and bytes to reduce native process startup while
+keeping Windows command lines small. Empty/single/remainder, content/order and
+producer-failure controls retain the drift check's coverage.
+
+Set `ZMK_TEST_PROFILE=1` for optional case/source-check timings and small latency
+probes for Bash/Git launches, 100 file writes/reads and Docker client/exec calls.
+The manual workflow exposes the same `profile` switch, disabled by default.
+Raw output and `profile.tsv` stay private. After a successful invocation, `ci-tests` prints only validated fixed
+metric names, sample counts, milliseconds and exit statuses; `timings MODE FILE`
+checks that format independently. Docker exec probes reuse an acquired validation
+container and are included in the Docker case time. Probes are samples rather than
+complete command accounting; nested timings must not be added together. Profiled
+runs include measurement/probe overhead and are separate from normal benchmarks.
+
+If post-test timing validation fails, the publication
+report records a failed CI outcome even when all behavioral cases passed. Diagnostics expose
+only a fixed rejection reason and a recognized metric name; invalid values stay private.
+Byte checks drain their producer, propagate its failures and cross-check the complete report's byte count.
+During profiling, source snapshot diagnostics have separate private logs so warnings do not become timing values.
+Failures before any case completes retain their original nonzero exit status.
+An unfinished outcome replacement blocks publication until it is finalized or cleared.
+
+Tests create and remove a dedicated cache by default; never use a production cache.
+
+| Test cache control | Behaviour |
+| --- | --- |
+| `ZMK_DOCKER_CACHE_VOLUME` | Explicit dedicated volume; reused and retained, taking precedence over a managed prefix. |
+| `ZMK_TEST_CACHE_PREFIX` | Opt-in prefix starting `zmk-build-script-test-`. With a full image digest and explicit Docker platform, derive and retain a separate cache for that image/platform. Unset, floating or automatic selections keep fresh caches. |
+
+The self-hosted workflow supplies a repository/OS prefix. Jobs for the same OS are
+serialized to protect that cache; different OS jobs remain independent. It prints
+only fixed numeric Docker CPU/memory capacity and presence of an existing cache
+override. Host/device identifiers and actual cache names stay in private evidence.
 `ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while
 restoration always retains it. Each build/validate result is checked immediately
 using its exact run directory. Report local, remote CI, host-platform and physical
