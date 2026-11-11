@@ -347,6 +347,12 @@ ZMK は fresh な container source の `ZMK_CONFIG=/root/zmk-config/config` を�
 依存の再利用判定は import を含む resolved manifest で行います。update の失敗・中断後は再試行し、
 解決できない manifest を ready と記録しません。古い workspace root の整理は、overlay 復元後に
 完全な project 一覧を取得できた場合だけ行います。復元失敗ではbuildを止め、backupと復旧記録を保持します。
+最後の `west update` 要約に失敗した project 名がない場合は、`ZMK_WEST_UPDATE_ATTEMPTS` 回の
+一括試行後に、active な全 project を対象とする診断をもう1周行います。一時的な resolved manifest と
+local 設定を使い、workspace の設定は変更しません。完全な project 選択が前後で一致し、各 command の
+終了値と最後の失敗名を確認できる必要があります。update 失敗後の継続には、その最終診断で失敗した
+全 project に明示的な `-m` 入力が必要です。overlay によって上流の依存 cache を ready と記録せず、
+特定できない失敗では build を止めます。
 overlay の復元完了は project ごとに記録してから backup を削除します。後続 project の失敗後も、
 先に復元した project を削除せず再試行できます。既存の2列の復旧記録も扱います。
 

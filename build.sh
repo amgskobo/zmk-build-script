@@ -478,14 +478,92 @@ sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
         [ -n "${missing}" ]
     }
 
+    west_update_last_line() {
+        awk 'NF {last = $0} END {print last}' "$1"
+    }
+
     west_update_failed_projects() {
         local log_path="$1"
-        sed -nE \
+        west_update_last_line "${log_path}" | sed -nE \
             -e 's/^ERROR: update failed for projects?:[[:space:]]*//p' \
-            -e 's/^ERROR: update failed for project[[:space:]]+//p' \
-            "${log_path}" |
+            -e 's/^ERROR: update failed for project[[:space:]]+//p' |
             tr ',' '\n' |
             awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if ($0 != "") print}'
+    }
+
+    diagnose_west_update_projects() {
+        local diagnostic_dir projects flat_projects name path status last_error failed="" count=0
+        diagnostic_dir="$(mktemp -d "${WORK_DIR}/.west/update-diagnostics.XXXXXX")" ||
+            fail "cannot prepare diagnostic west update"
+        if ! west manifest --resolve > "${diagnostic_dir}/west.yml" ||
+            ! workspace_project_list > "${diagnostic_dir}/projects.before"; then
+            fail "cannot verify diagnostic west update project graph"
+        fi
+        # A resolved, not frozen, manifest preserves the intended revisions. Plain
+        # named updates reject imported projects, so use a temporary flattened view
+        # with the effective local options and the original active project set.
+        cp "${WEST_CONFIG_LOCAL-${WORK_DIR}/.west/config}" "${diagnostic_dir}/config" ||
+            fail "cannot prepare diagnostic west update configuration"
+        WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west config --local manifest.path \
+            "${diagnostic_dir#"${WORK_DIR}/"}" || fail "cannot prepare diagnostic west update configuration"
+        WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west config --local manifest.file west.yml ||
+            fail "cannot prepare diagnostic west update configuration"
+        if ! WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west manifest --resolve > "${diagnostic_dir}/flat.yml" ||
+            ! WEST_CONFIG_LOCAL="${diagnostic_dir}/config" workspace_project_list > "${diagnostic_dir}/projects.flat"; then
+            fail "cannot verify diagnostic west update project graph"
+        fi
+        python3 - "${diagnostic_dir}/west.yml" "${diagnostic_dir}/flat.yml" <<'PY' ||
+import sys
+import yaml
+
+documents = []
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as source:
+        document = yaml.safe_load(source)
+    document["manifest"].get("self", {}).pop("path", None)
+    documents.append(document)
+if documents[0] != documents[1]:
+    sys.exit("flattened diagnostic manifest does not match the resolved project graph")
+PY
+            fail "cannot verify diagnostic west update project graph"
+        projects="$(awk -F '\t' '$1 != "manifest"' "${diagnostic_dir}/projects.before")"
+        flat_projects="$(awk -F '\t' '$1 != "manifest"' "${diagnostic_dir}/projects.flat")"
+        [ -n "${projects}" ] && [ "${projects}" = "${flat_projects}" ] ||
+            fail "cannot verify diagnostic west update project graph"
+        log "west omitted failure identities; running one final diagnostic update of every active project"
+        while IFS=$'\t' read -r name path; do
+            [ -n "${name}" ] && [ "${name}" != "manifest" ] || continue
+            count=$((count + 1))
+            log "Diagnostic west update: ${name}"
+            if WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west update --fetch-opt=--filter=tree:0 -- "${name}" \
+                > "${diagnostic_dir}/project.log" 2>&1; then
+                status=0
+            else
+                status=$?
+            fi
+            cat "${diagnostic_dir}/project.log" || fail "cannot read diagnostic west update output"
+            log "Diagnostic west update result: ${name} (exit=${status})"
+            if [ "${status}" != 0 ]; then
+                last_error="$(west_update_last_line "${diagnostic_dir}/project.log")"
+                [ "${last_error}" = "ERROR: update failed for project ${name}" ] ||
+                    fail "cannot identify diagnostic west update failure: ${name} (exit=${status})"
+                failed="${failed}${failed:+$'\n'}${name}"
+            fi
+        done <<EOF
+${projects}
+EOF
+        if [ "${count}" = 0 ] || ! west manifest --resolve > "${diagnostic_dir}/manifest.after" ||
+            ! workspace_project_list > "${diagnostic_dir}/projects.after" ||
+            ! cmp -s "${diagnostic_dir}/west.yml" "${diagnostic_dir}/manifest.after" ||
+            ! cmp -s "${diagnostic_dir}/projects.before" "${diagnostic_dir}/projects.after"; then
+            fail "cannot verify diagnostic west update project graph"
+        fi
+        # This complete final pass replaces the bulk failure; it never unions
+        # identities from an earlier attempt. Local overlays do not mark it ready.
+        WEST_UPDATE_FAILED_PROJECTS="${failed}"
+        WEST_UPDATE_FAILED=0
+        [ -z "${failed}" ] || WEST_UPDATE_FAILED=1
+        rm -rf "${diagnostic_dir}" || fail "cannot remove diagnostic west update files"
     }
 
     verify_west_update_result() {
@@ -705,8 +783,13 @@ PY
                 WEST_UPDATE_FAILED=1
             done
             if [ "${WEST_UPDATE_FAILED}" = "1" ]; then
-                WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
                 log "west update failed after ${WEST_UPDATE_ATTEMPTS} attempt(s); checking explicit module inputs before continuing"
+                if [ "$(west_update_last_line "${west_update_log}")" = \
+                    "ERROR: update failed for multiple projects; see above" ]; then
+                    diagnose_west_update_projects
+                else
+                    WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
+                fi
             fi
             rm -f "${west_update_log}"
             west zephyr-export || true

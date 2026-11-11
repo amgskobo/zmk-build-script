@@ -377,6 +377,14 @@ updates are retried; unresolved manifests cannot mark a cache ready. Obsolete
 workspace roots are pruned only after restoring overlays and obtaining a
 complete project list. A failed restoration stops the build and keeps the
 affected backup and recovery record.
+If the final `west update` summary omits failed project names, the builder runs
+one additional diagnostic pass over every active project after
+`ZMK_WEST_UPDATE_ATTEMPTS` bulk attempts. It uses a temporary resolved manifest
+and local configuration without changing the workspace configuration. Complete,
+unchanged project selections and each command's exit and final named failure
+are required. Continuing after a failed update also requires an explicit `-m`
+input for every project that failed that final pass; overlays do not mark the
+upstream dependency cache ready. Unknown failures stop the build.
 Overlay recovery records each completed project before deleting its backup.
 A later project's failure can therefore be retried without deleting earlier
 restorations. Existing two-column recovery records remain supported.

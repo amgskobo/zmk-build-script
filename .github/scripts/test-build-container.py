@@ -1175,6 +1175,7 @@ elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
         backup = workspace / '.west/local-overlay-backups/project'
         stamp = workspace / '.west/local-overlays.tsv'
         (workspace / '.west').mkdir(exist_ok=True)
+        (workspace / '.west/config').write_text('[manifest]\npath = config\n')
         if prior_overlay:
             backup.mkdir(parents=True)
             (backup / 'content.txt').write_text('original project\n')
@@ -1200,9 +1201,16 @@ elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
 import json, os, pathlib, subprocess, sys
 with open(os.environ['PROBE_ARGV'], 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')
 with open(os.environ['PROBE_COMMANDS'], 'a') as log: log.write('west ' + ' '.join(sys.argv[1:]) + '\\n')
+if os.environ.get('PROBE_ALL_REAL_WEST') == '1' and sys.argv[1] not in ('build', 'zephyr-export'):
+    sys.exit(subprocess.call([os.environ['PROBE_REAL_WEST']] + sys.argv[1:]))
 projects = [('zmk', 'zmk'), ('project', os.environ['PROBE_PROJECT_PATH'])]
 if os.environ.get('PROBE_OMIT_PROJECT') == '1': projects = projects[:1]
 if sys.argv[1] == 'list':
+    if pathlib.Path(os.environ['PROBE_DIAGNOSTIC_LIST_FAILURE']).exists():
+        print('zmk\\tzmk')
+        sys.exit('injected incomplete diagnostic project list')
+    if os.environ.get('PROBE_RESOLVE_REAL') == '1' and os.environ.get('WEST_CONFIG_LOCAL'):
+        sys.exit(subprocess.call([os.environ['PROBE_REAL_WEST']] + sys.argv[1:]))
     wanted = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith('-') else None
     fault = os.environ.get('PROBE_LIST_FAILURE')
     if fault == 'always' or (fault == 'before-update' and not pathlib.Path(os.environ['PROBE_UPDATE_COUNT']).exists()):
@@ -1214,6 +1222,18 @@ if sys.argv[1] == 'list':
         if wanted is None or name == wanted: print(name + '\\t' + path)
 elif sys.argv[1] == 'update':
     control = json.loads(pathlib.Path(os.environ['PROBE_CONTROL']).read_text())
+    if '--' in sys.argv:
+        name = sys.argv[sys.argv.index('--') + 1]
+        action = control.get('diagnostics', {}).get(name, {'exit': 0})
+        status = action.get('exit', 0)
+        if action.get('change_import'):
+            manifest = pathlib.Path(os.environ['WORK_DIR']) / 'config/dependencies.yml'
+            manifest.write_text(manifest.read_text().replace('revision: v1', 'revision: v2'))
+        if action.get('list_failure'):
+            pathlib.Path(os.environ['PROBE_DIAGNOSTIC_LIST_FAILURE']).touch()
+        if status:
+            print(action.get('error', 'ERROR: update failed for project ' + name), file=sys.stderr)
+        sys.exit(status)
     counter = pathlib.Path(os.environ['PROBE_UPDATE_COUNT'])
     attempt = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(attempt))
@@ -1223,7 +1243,7 @@ elif sys.argv[1] == 'update':
     if lock.exists(): sys.exit('stale lock reached west update: ' + str(lock))
     action = actions[min(attempt - 1, len(actions) - 1)]
     status = action.get('exit', 0)
-    print('controlled update attempt %d status=%d; lock absent' % (attempt, status))
+    print('controlled update attempt %d status=%d; lock absent' % (attempt, status), flush=True)
     workspace = pathlib.Path(os.environ['WORK_DIR'])
     for name, path in projects:
         if status == 0 or (action.get('failed') is not None and name not in action['failed']):
@@ -1240,15 +1260,20 @@ elif sys.argv[1] == 'update':
         lock.write_text('stale lock from failed attempt\\n')
     if status:
         failed = action.get('failed')
-        if failed:
+        if action.get('generic'):
+            print('ERROR: update failed for multiple projects; see above', file=sys.stderr)
+        elif failed:
             suffix = 's:' if len(failed) > 1 else ''
             print('ERROR: update failed for project' + suffix + ' ' + ', '.join(failed), file=sys.stderr)
         else: print('ERROR: transport failed before project identities were available', file=sys.stderr)
+        if action.get('terminal_error'): print(action['terminal_error'], file=sys.stderr)
     sys.exit(status)
 elif sys.argv[1] == 'manifest':
     if os.environ.get('PROBE_RESOLVE_REAL') == '1':
         sys.exit(subprocess.call([os.environ['PROBE_REAL_WEST']] + sys.argv[1:]))
     sys.stdout.write((pathlib.Path(os.environ['WORK_DIR']) / 'config/west.yml').read_text())
+elif sys.argv[1] == 'config':
+    sys.exit(subprocess.call([os.environ['PROBE_REAL_WEST']] + sys.argv[1:]))
 elif sys.argv[1] == 'zephyr-export': pass
 elif sys.argv[1] == 'build':
     print('controlled build boundary reached')
@@ -1301,6 +1326,7 @@ os.execv(os.environ['PROBE_REAL_RM'], ['rm'] + sys.argv[1:])
                    PROBE_COMMANDS=str(commands), PROBE_ARGV=str(commands.with_suffix('.argv.jsonl')),
                    PROBE_BUILD_ENV=str(case_root / 'build-env.jsonl'),
                    PROBE_PROJECT_PATH=project_path, PROBE_CONTROL=str(control), PROBE_UPDATE_COUNT=str(counter),
+                   PROBE_DIAGNOSTIC_LIST_FAILURE=str(case_root / 'diagnostic-list-failure'),
                    PROBE_FAIL_COPY=str(int(fail_copy)), PROBE_PROJECT_DIR=str(project),
                    PROBE_REAL_WEST=shutil.which('west'), PROBE_REAL_RM=shutil.which('rm'))
         return SimpleNamespace(root=case_root, source=source, workspace=workspace, project=project,
@@ -2152,6 +2178,209 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
                     self.assertIn('potentially stale dependencies', output)
                     self.assertNotIn('controlled build boundary reached', output)
                 self.assertFalse(case.manifest_stamp.exists())
+
+    def generic_update_workspace(self, *, diagnostics, updates=None):
+        case, imported = self.imported_manifest_workspace()
+        case.env['ZMK_WEST_UPDATE_ATTEMPTS'] = '2'
+        case.env['WEST_CONFIG_LOCAL'] = str(case.root / 'effective-west.conf')
+        config = '[manifest]\npath = config\ngroup-filter = -disabled\n[update]\nfetch = always\n'
+        pathlib.Path(case.env['WEST_CONFIG_LOCAL']).write_text(config)
+        imported['manifest']['projects'][1].update({'clone-depth': 7, 'submodules': False})
+        imported['manifest']['projects'].append({
+            'name': 'inactive', 'url': 'https://invalid.test/inactive', 'revision': 'v1',
+            'path': 'modules/inactive', 'groups': ['disabled']})
+        for directory in (case.source, case.workspace):
+            (directory / 'config/dependencies.yml').write_text(yaml.safe_dump(imported))
+        control = json.loads(case.control.read_text())
+        control.update(updates=updates or [
+            {'exit': 23, 'failed': ['zmk']}, {'exit': 23, 'generic': True}],
+            diagnostics=diagnostics)
+        case.control.write_text(json.dumps(control))
+        (case.inputs / 'project').mkdir()
+        (case.inputs / 'project/content.txt').write_text('explicit local project\n')
+        case.effective_config = config
+        return case
+
+    def diagnostic_update_names(self, case):
+        calls = [json.loads(line) for line in case.commands.with_suffix('.argv.jsonl').read_text().splitlines()]
+        return [call[call.index('--') + 1] for call in calls if call[0] == 'update' and '--' in call]
+
+    def test_generic_update_summary_recovers_only_final_named_failures(self):
+        case = self.generic_update_workspace(diagnostics={'project': {'exit': 23}})
+        original = (case.workspace / '.west/config').read_bytes()
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(case.counter.read_text(), '2')
+        self.assertEqual(self.diagnostic_update_names(case), ['zmk', 'project'])
+        self.assertIn('failed project(s) were supplied locally: project', output)
+        self.assertNotIn('without local override: zmk', output)
+        self.assertFalse(case.manifest_stamp.exists())
+        self.assertEqual((case.workspace / '.west/config').read_bytes(), original)
+        self.assertEqual(pathlib.Path(case.env['WEST_CONFIG_LOCAL']).read_text(), case.effective_config)
+        self.assertEqual((case.project / 'content.txt').read_text(), 'explicit local project\n')
+
+    def test_generic_update_summary_success_marks_only_complete_recovery_ready(self):
+        case = self.generic_update_workspace(diagnostics={})
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(self.diagnostic_update_names(case), ['zmk', 'project'])
+        self.assertTrue(case.manifest_stamp.is_file())
+        self.assertNotIn('failed project(s) were supplied locally', output)
+
+    def test_generic_update_summary_rejects_non_overridden_final_failure(self):
+        case = self.generic_update_workspace(diagnostics={'zmk': {'exit': 23}, 'project': {'exit': 23}})
+        result, output = self.run_workspace(case)
+        self.assertNotEqual(result.returncode, 71, output)
+        self.assertIn('without local override: zmk', output)
+        self.assertEqual(self.diagnostic_update_names(case), ['zmk', 'project'])
+        self.assertNotIn('controlled build boundary reached', output)
+        self.assertFalse(case.manifest_stamp.exists())
+
+    def test_generic_update_summary_rejects_unknown_or_wrong_named_diagnostic(self):
+        for error in ('ERROR: transport failed before project identities were available',
+                      'ERROR: update failed for project zmk',
+                      'ERROR: update failed for projects: project, zmk',
+                      'ERROR: update failed for multiple projects; see above',
+                      'ERROR: update failed for project project\nERROR: unknown terminal failure',
+                      'ERROR: update failed for project project\nFATAL ERROR: unknown terminal failure',
+                      'ERROR: update failed for project project\nTraceback: unexpected terminal failure',
+                      'ERROR: update failed for project project\nunclassified terminal output'):
+            with self.subTest(error=error):
+                case = self.generic_update_workspace(diagnostics={'project': {'exit': 23, 'error': error}})
+                result, output = self.run_workspace(case)
+                self.assertNotEqual(result.returncode, 71, output)
+                self.assertIn('cannot identify diagnostic west update failure', output)
+                self.assertNotIn('controlled build boundary reached', output)
+                self.assertFalse(case.manifest_stamp.exists())
+
+    def test_update_summary_followed_by_unknown_terminal_output_stops(self):
+        for generic in (False, True):
+            for tail in ('FATAL ERROR: unknown terminal failure',
+                         'Traceback: unexpected terminal failure', 'unclassified terminal output'):
+                with self.subTest(generic=generic, tail=tail):
+                    case = self.generic_update_workspace(diagnostics={}, updates=[{
+                        'exit': 23, 'failed': ['project'], 'generic': generic, 'terminal_error': tail}])
+                    result, output = self.run_workspace(case)
+                    self.assertNotEqual(result.returncode, 71, output)
+                    self.assertIn('potentially stale dependencies', output)
+                    self.assertEqual(self.diagnostic_update_names(case), [])
+                    self.assertNotIn('controlled build boundary reached', output)
+                    self.assertFalse(case.manifest_stamp.exists())
+
+    def test_generic_update_summary_rejects_empty_or_missing_effective_local_config(self):
+        for config in ('', 'missing-local-config'):
+            with self.subTest(config=config):
+                case = self.generic_update_workspace(diagnostics={})
+                # Keep resolution as a controlled boundary so this exercises the
+                # config-copy guard rather than West's earlier missing-config error.
+                case.env['PROBE_RESOLVE_REAL'] = '0'
+                case.env['WEST_CONFIG_LOCAL'] = str(case.root / config) if config else ''
+                result, output = self.run_workspace(case)
+                self.assertNotEqual(result.returncode, 71, output)
+                self.assertIn('cannot prepare diagnostic west update configuration', output)
+                self.assertEqual(self.diagnostic_update_names(case), [])
+                self.assertNotIn('controlled build boundary reached', output)
+                self.assertFalse(case.manifest_stamp.exists())
+
+    def test_generic_update_summary_rejects_diagnostic_graph_or_list_drift(self):
+        for fault in ('change_import', 'list_failure'):
+            with self.subTest(fault=fault):
+                case = self.generic_update_workspace(diagnostics={'project': {fault: True}})
+                result, output = self.run_workspace(case)
+                self.assertNotEqual(result.returncode, 71, output)
+                self.assertIn('cannot verify diagnostic west update project graph', output)
+                self.assertNotIn('controlled build boundary reached', output)
+                self.assertFalse(case.manifest_stamp.exists())
+
+    def test_named_update_summary_does_not_start_diagnostic_recovery(self):
+        case = self.generic_update_workspace(diagnostics={'zmk': {'exit': 23}}, updates=[
+            {'exit': 23, 'generic': True}, {'exit': 23, 'failed': ['project']}])
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(self.diagnostic_update_names(case), [])
+        self.assertIn('failed project(s) were supplied locally: project', output)
+        self.assertFalse(case.manifest_stamp.exists())
+
+    def test_real_west_generic_missing_sha_and_imported_project_overrides(self):
+        case = self.make_workspace(prior_overlay=False)
+        case.env['PROBE_ALL_REAL_WEST'] = '1'
+        repository = case.root / 'local-origin'
+        repository.mkdir()
+        git_env = dict(os.environ, GIT_AUTHOR_NAME='Fixture Author',
+                       GIT_AUTHOR_EMAIL='fixture@example.invalid', GIT_COMMITTER_NAME='Fixture Author',
+                       GIT_COMMITTER_EMAIL='fixture@example.invalid')
+
+        def git(*args, cwd=repository):
+            result = subprocess.run(['git', *args], cwd=cwd, env=git_env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+
+        missing = '1' * 40
+        url = repository.as_uri()
+        imported = {'name': 'project-19', 'url': url, 'revision': missing,
+                    'path': 'modules/project-19', 'clone-depth': 2, 'submodules': False}
+        (repository / 'west.yml').write_text(yaml.safe_dump({'manifest': {'projects': [imported]}}))
+        (repository / 'content.txt').write_text('real local Git fixture\n')
+        git('init', '-q')
+        git('add', '.')
+        git('commit', '-qm', 'Create synthetic local update fixture')
+        revision = git('rev-parse', 'HEAD')
+        projects = [{'name': 'zmk', 'url': url, 'revision': revision, 'path': 'zmk', 'import': True}]
+        projects += [{'name': 'project-%d' % index, 'url': url, 'revision': missing,
+                      'path': 'modules/project-%d' % index} for index in range(19)]
+        projects += [{'name': 'inactive', 'url': url, 'revision': missing,
+                      'path': 'modules/inactive', 'groups': ['disabled']}]
+        manifest = yaml.safe_dump({'manifest': {'projects': projects}})
+        for directory in (case.source, case.workspace):
+            (directory / 'config/west.yml').write_text(manifest)
+        config = '[manifest]\npath = config\ngroup-filter = -disabled\n[update]\nfetch = always\n'
+        (case.workspace / '.west/config').write_text(config)
+        shutil.rmtree(case.workspace / 'zmk')
+        shutil.rmtree(case.project)
+        for project in projects[:-1] + [imported]:
+            destination = case.workspace / project['path']
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            git('clone', '-q', url, str(destination))
+            git('update-ref', 'refs/heads/manifest-rev', revision, cwd=destination)
+            if project['name'] != 'zmk':
+                local = case.inputs / project['name']
+                local.mkdir()
+                (local / 'content.txt').write_text('explicit synthetic local override\n')
+        selected = subprocess.run([case.env['PROBE_REAL_WEST'], 'list', '-f', '{name}'],
+                                  cwd=case.workspace, env=case.env, text=True, capture_output=True)
+        self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
+        names = [name for name in selected.stdout.splitlines() if name != 'manifest']
+        self.assertEqual(len(names), 21)
+        self.assertIn('project-19', names)
+        self.assertNotIn('inactive', names)
+        # Real west rejects an imported named selector before the flattened view.
+        direct = subprocess.run([case.env['PROBE_REAL_WEST'], 'update', '--', 'project-19'],
+                                cwd=case.workspace, env=case.env, text=True, capture_output=True)
+        self.assertNotEqual(direct.returncode, 0)
+        self.assertIn('resolved via project imports', direct.stdout + direct.stderr)
+        for covered in (True, False):
+            with self.subTest(all_failed_projects_explicitly_overridden=covered):
+                if not covered:
+                    shutil.rmtree(case.inputs / 'project-0')
+                before = len(self.diagnostic_update_names(case)) if case.commands.with_suffix('.argv.jsonl').exists() else 0
+                result, output = self.run_workspace(case)
+                self.assertIn('ERROR: update failed for multiple projects; see above', output)
+                self.assertEqual(self.diagnostic_update_names(case)[before:], names)
+                results = re.findall(r'Diagnostic west update result: (\S+) \(exit=(\d+)\)', output)
+                self.assertEqual([name for name, status in results], names)
+                self.assertEqual([name for name, status in results if status == '0'], ['zmk'])
+                self.assertEqual(len([status for name, status in results if status != '0']), 20)
+                if covered:
+                    self.assertEqual(result.returncode, 71, output)
+                    self.assertIn('controlled build boundary reached', output)
+                    self.assertIn('failed project(s) were supplied locally:', output)
+                else:
+                    self.assertNotEqual(result.returncode, 71, output)
+                    self.assertIn('without local override: project-0', output)
+                    self.assertNotIn('controlled build boundary reached', output)
+                self.assertFalse(case.manifest_stamp.exists())
+                self.assertFalse((case.workspace / 'modules/inactive').exists())
+                self.assertEqual((case.workspace / '.west/config').read_text(), config)
 
     def test_interrupted_overlay_apply_is_restored_on_next_build(self):
         case = self.make_workspace(prior_overlay=False, local_override=True, update_actions=[{'exit': 0}])
