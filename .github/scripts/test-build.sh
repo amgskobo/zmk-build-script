@@ -79,6 +79,46 @@ cp "${repo_root}/build.sh" "${tool_root}/build.sh"
 cp "${repo_root}/.github/fixtures/ci-zmk-config/config/west.yml" "${fixture}/config/west.yml"
 cp "${repo_root}/.github/fixtures/ci-zmk-config/build.yaml" "${fixture}/build.yaml"
 
+# Option-looking operands must be removed, and real deletion failures propagated.
+for clean_entry in -- -draft; do printf 'clean fixture\n' > "${tool_root}/.build/${clean_entry}"; done
+printf 'keep\n' > "${tool_root}/.build/.gitkeep"
+bash "${tool_root}/build.sh" clean > "${tmp_dir}/clean-options.log" 2>&1
+[ ! -e "${tool_root}/.build/--" ] && [ ! -e "${tool_root}/.build/-draft" ]
+[ -f "${tool_root}/.build/.gitkeep" ]
+clean_bin="${tmp_dir}/clean-bin"
+mkdir "${clean_bin}"
+cat > "${clean_bin}/rm" <<'EOF'
+#!/usr/bin/env bash
+echo 'injected clean deletion failure' >&2
+exit 23
+EOF
+chmod +x "${clean_bin}/rm"
+printf 'retain on error\n' > "${tool_root}/.build/-draft"
+if PATH="${clean_bin}:${PATH}" bash "${tool_root}/build.sh" clean > "${tmp_dir}/clean-failure.log" 2>&1; then
+  echo 'clean accepted deletion failure' >&2; exit 1
+fi
+grep -q 'injected clean deletion failure' "${tmp_dir}/clean-failure.log"
+[ -f "${tool_root}/.build/-draft" ]
+rm -f "${tool_root}/.build/-draft"
+
+# Calling clean in a condition must not turn a failed cd into deletion from
+# the caller directory (the guard explicitly disables implicit errexit).
+clean_caller="${tmp_dir}/clean caller"
+mkdir "${clean_caller}"
+printf 'caller sentinel\n' > "${clean_caller}/must-preserve"
+clean_hook="${tmp_dir}/clean-cd-hook.sh"
+cat > "${clean_hook}" <<'EOF'
+cd() {
+  case "$1" in */.build) echo 'injected clean cd failure' >&2; return 23 ;; esac
+  builtin cd "$@"
+}
+EOF
+if (builtin cd "${clean_caller}" && BASH_ENV="${clean_hook}" bash "${tool_root}/build.sh" clean > "${tmp_dir}/clean-cd.log" 2>&1); then
+  echo 'clean accepted failed directory entry' >&2; exit 1
+fi
+cmp "${clean_caller}/must-preserve" <(printf 'caller sentinel\n')
+grep -q 'injected clean cd failure' "${tmp_dir}/clean-cd.log"
+
 add_payload_dirs() {
   local root="$1" dir
   mkdir -p "${root}"/{modules,tools,zmk,bootloader,optional,src,build,.cache,nested/build,nested/.cache}
@@ -363,7 +403,11 @@ EOF
 cat > "${copy_bin}/git" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = ls-files ]; then
-  case "${COPY_CONTROL}" in git-failure) exit 23 ;; git-empty) exit 0 ;; esac
+  case "${COPY_CONTROL}" in
+    git-failure) exit 23 ;;
+    git-empty) exit 0 ;;
+    submodule-git-failure) [ ! -f .git ] || exit 23 ;;
+  esac
 fi
 exec "${COPY_REAL_GIT}" "$@"
 EOF
@@ -470,13 +514,81 @@ for root in "${native_target}" "${native_module}"; do
   # Keep the nested fixed-exclusion names visible; ignore only the intended bulk.
   printf '/artifacts/\n/web/node_modules/\n' > "${root}/.gitignore"
 done
+# Real absorbed gitlinks use their own ignore rules; tar must never recurse
+# directly into a gitlink directory from the parent ls-files result.
+submodule_origin="${tmp_dir}/submodule origin"
+mkdir "${submodule_origin}"
+git_in "${submodule_origin}" init -q
+git_in "${submodule_origin}" config core.autocrlf false
+printf '/private-cache/\n' > "${submodule_origin}/.gitignore"
+printf 'tracked submodule\n' > "${submodule_origin}/tracked.txt"
+git_in "${submodule_origin}" add .
+git_in "${submodule_origin}" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
+empty_origin="${tmp_dir}/empty origin"
+mkdir "${empty_origin}"
+git_in "${empty_origin}" init -q
+git_in "${empty_origin}" config core.autocrlf false
+git_in "${empty_origin}" -c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm empty
+# A clone does not inherit the parent's local core.autocrlf=false. Prove
+# that an inherited true setting changes checkout bytes and the LF oracle rejects it.
+autocrlf_control="${tmp_dir}/autocrlf control"
+mkdir "${autocrlf_control}"
+git_in "${autocrlf_control}" init -q
+git_in "${autocrlf_control}" -c core.autocrlf=true -c protocol.file.allow=always \
+  submodule add -q '../submodule origin' 'nested module'
+cmp "${autocrlf_control}/nested module/tracked.txt" <(printf 'tracked submodule\r\n')
+if cmp "${autocrlf_control}/nested module/tracked.txt" <(printf 'tracked submodule\n') \
+    > "${tmp_dir}/autocrlf-control.log" 2>&1; then
+  echo 'LF oracle accepted inherited CRLF checkout' >&2; exit 1
+else
+  [ "$?" = 1 ]
+fi
+echo '[host-contract] control inherited-autocrlf LF oracle rejected'
+
+add_lf_fixture_submodule() {
+  local root="$1" url="$2" path="$3"
+  # Deliberately carry an inherited true setting, then override it for the
+  # clone's first checkout. Persist false only in this fixture for later writes.
+  git_in "${root}" -c core.autocrlf=true -c core.autocrlf=false -c protocol.file.allow=always \
+    submodule add -q "${url}" "${path}"
+  git_in "${root}/${path}" config core.autocrlf false
+}
+for root in "${native_target}" "${native_module}"; do
+  add_lf_fixture_submodule "${root}" '../submodule origin' 'nested module'
+  cmp "${root}/nested module/tracked.txt" <(printf 'tracked submodule\n')
+  mkdir "${root}/nested module/private-cache"
+  printf 'ignored private cache\n' > "${root}/nested module/private-cache/secret.txt"
+  printf 'visible submodule\n' > "${root}/nested module/visible.txt"
+  printf 'ignored tracked submodule\n' > "${root}/nested module/private-cache/tracked.txt"
+  git_in "${root}/nested module" add -f private-cache/tracked.txt
+  printf 'deleted submodule\n' > "${root}/nested module/deleted.txt"
+  git_in "${root}/nested module" add deleted.txt
+  rm "${root}/nested module/deleted.txt"
+  mkdir "${root}/nested module/build"
+  printf 'nested build retained\n' > "${root}/nested module/build/keep.txt"
+  git_in "${root}/nested module" check-ignore -q private-cache/secret.txt
+  [ -f "${root}/nested module/.git" ]
+  add_lf_fixture_submodule "${root}/nested module" '../submodule origin' 'deep module'
+  cmp "${root}/nested module/deep module/tracked.txt" <(printf 'tracked submodule\n')
+  mkdir "${root}/nested module/deep module/private-cache"
+  printf 'deep ignored\n' > "${root}/nested module/deep module/private-cache/secret.txt"
+  add_lf_fixture_submodule "${root}" '../empty origin' 'empty module'
+  mkdir "${root}/empty module/private-cache"
+  printf 'private-cache/\n' >> "${root}/.git/modules/empty module/info/exclude"
+  printf 'empty ignored\n' > "${root}/empty module/private-cache/secret.txt"
+  git_in "${root}/empty module" check-ignore -q private-cache/secret.txt
+  # An uninitialized registered gitlink must not inherit its parent's Git list.
+  gitlink_revision="$(git_in "${submodule_origin}" rev-parse HEAD)"
+  git_in "${root}" update-index --add --cacheinfo "160000,${gitlink_revision},uninitialized module"
+  mkdir "${root}/uninitialized module"
+done
 generated_target="$(make_target 'native generated target' west)"
 generated_module="$(make_module '.hidden generated module' west)"
 add_native_copy_payload "${generated_target}" target
 add_native_copy_payload "${generated_module}" module
 add_generated_git_markers "${generated_target}"
 add_generated_git_markers "${generated_module}"
-for copy_case in git-visible git-opt-out git-failure git-empty no-null generated no-west no-markers; do
+for copy_case in git-visible git-opt-out git-failure submodule-git-failure git-empty no-null generated no-west no-markers; do
   echo "[host-contract] native-copy ${copy_case}"
   copy_target="${native_target}"
   copy_module="${native_module}"
@@ -523,7 +635,28 @@ for copy_case in git-visible git-opt-out git-failure git-empty no-null generated
   MSYS=winsymlinks:sys "${copy_real_tar}" --no-same-owner -xf "${copy_streams}/2.tar" -C "${copy_streams}/module"
   assert_native_copy_payload "${copy_target}" "${copy_streams}/target" target "${copy_policy}" "${copy_generated}"
   assert_native_copy_payload "${copy_module}" "${copy_streams}/module" module "${copy_policy}" "${copy_generated}"
+  if [ "${copy_case}" = submodule-git-failure ]; then
+    for copied in "${copy_streams}/target" "${copy_streams}/module"; do
+      cmp "${copied}/nested module/private-cache/secret.txt" <(printf 'ignored private cache\n')
+      cmp "${copied}/empty module/private-cache/secret.txt" <(printf 'empty ignored\n')
+    done
+  fi
   if [ "${copy_case}" = git-visible ]; then
+    for copied in "${copy_streams}/target" "${copy_streams}/module"; do
+      cmp "${copied}/nested module/tracked.txt" <(printf 'tracked submodule\n')
+      cmp "${copied}/nested module/visible.txt" <(printf 'visible submodule\n')
+      [ ! -e "${copied}/nested module/private-cache/secret.txt" ] || {
+        echo 'Git-visible copy imported ignored submodule content' >&2; exit 1;
+      }
+      cmp "${copied}/nested module/private-cache/tracked.txt" <(printf 'ignored tracked submodule\n')
+      cmp "${copied}/nested module/build/keep.txt" <(printf 'nested build retained\n')
+      cmp "${copied}/nested module/deep module/tracked.txt" <(printf 'tracked submodule\n')
+      [ ! -e "${copied}/nested module/deep module/private-cache/secret.txt" ]
+      [ ! -e "${copied}/empty module/private-cache/secret.txt" ]
+      [ ! -e "${copied}/uninitialized module" ]
+      [ ! -e "${copied}/nested module/deleted.txt" ]
+      [ ! -e "${copied}/nested module/.git" ]
+    done
     # Named control: losing one literal filename fails even when the archive extracts.
     rm "${copy_streams}/target/literal [ab] \$value; & (test).txt"
     if assert_native_copy_payload "${copy_target}" "${copy_streams}/target" target visible keep \

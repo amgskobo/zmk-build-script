@@ -85,6 +85,27 @@ Mode: validate
 EOF
 run_ok validate
 
+# A newer started run without its final summary must hide older successes.
+unfinished="${case_root}/.build/run-2026-05-24_00-00-00-ci-zmk-config"
+mkdir "${unfinished}"
+printf 'unfinished build\n' > "${unfinished}/build.log"
+run_fail validate 'build-summary.txt was not produced'
+run_fail validate 'build-summary.txt was not produced' "${unfinished}"
+rm -rf "${unfinished}"
+# Missing sequence metadata makes same-second numeric labels ambiguous.
+mkdir "${run_path}-2" "${run_path}-10"
+printf 'older unfinished\n' > "${run_path}-2/build.log"
+printf 'completed newer\n' > "${run_path}-10/build.log"
+printf 'Status: SUCCESS\nMode: validate\nRun sequence: 10\n' > "${run_path}-10/build-summary.txt"
+run_fail validate 'build-summary.txt was not produced'
+# A later timestamp can supersede an older incomplete run unambiguously.
+mkdir "${unfinished}"
+printf 'later completed\n' > "${unfinished}/build.log"
+printf 'Status: SUCCESS\nMode: validate\nRun sequence: 1\n' > "${unfinished}/build-summary.txt"
+run_ok validate
+rm -rf "${unfinished}"
+rm -rf "${run_path}-2" "${run_path}-10"
+
 # Partial enumeration is unavailable evidence, never an older successful run.
 # Drain each real producer before injecting its final failure, independently of
 # metadata parsing; an explicit run must remain usable without discovery.
@@ -104,6 +125,43 @@ EOF
     run_ok validate "${run_path}"
   rm "${discovery_bin}/${discovery_command}"
 done
+
+# One regular file containing a line separator cannot count as two artifacts.
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 2
+EOF
+printf 'one real firmware\n' > "${run_path}/one"$'\n'"two.uf2"
+run_fail build 'Unsafe firmware artifact filename' "${run_path}"
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: build
+Built targets: 1
+EOF
+printf 'firmware\n' > "${run_path}/one.uf2"
+firmware_bin="${tmp_dir}/firmware-bin"
+mkdir "${firmware_bin}"
+cat > "${firmware_bin}/find" <<'EOF'
+#!/usr/bin/env bash
+case "${FIRMWARE_PRODUCER}" in
+  failure) "${FIRMWARE_REAL_FIND}" "$@"; exit 23 ;;
+  truncated) printf '%s/one.uf2' "$1" ;;
+esac
+EOF
+chmod +x "${firmware_bin}/find"
+firmware_real_find="$(command -v find)"
+PATH="${firmware_bin}:${PATH}" FIRMWARE_PRODUCER=failure FIRMWARE_REAL_FIND="${firmware_real_find}" \
+  run_fail build 'Failed to enumerate firmware artifacts' "${run_path}"
+PATH="${firmware_bin}:${PATH}" FIRMWARE_PRODUCER=truncated \
+  run_fail build 'Incomplete firmware artifact enumeration' "${run_path}"
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+EOF
 
 # The config label follows the timestamp; collision suffixes use hyphens.
 for suffix in -2 -10; do
