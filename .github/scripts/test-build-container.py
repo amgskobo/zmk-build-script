@@ -1182,7 +1182,9 @@ elif sys.argv[1] not in ("info", "rm"): sys.exit(99)
             stamp.write_text('project\t' + project_path + '\n')
         manifest_stamp = workspace / '.west/manifest.sha256'
         digest = hashlib.sha256(manifest.encode()).hexdigest()
-        ready = 'complete-resolved:' + digest
+        active = 'zmk\tzmk\nproject\t' + os.path.normpath(project_path)
+        ready = 'complete-resolved-active:' + hashlib.sha256(
+            (manifest.rstrip('\n') + '\nactive-projects:\n' + active + '\n').encode()).hexdigest()
         manifest_stamp.write_text(('stale' if force_update else ready) + '\n')
         inputs = case_root / 'inputs'
         inputs.mkdir()
@@ -1707,6 +1709,12 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
         west.write_text(west.read_text().replace(
             "projects = [('zmk', 'zmk'), ('project', os.environ['PROBE_PROJECT_PATH'])]",
             "projects = [('zmk', 'zmk'), ('project', os.environ['PROBE_PROJECT_PATH']), ('second', 'modules/second')]"))
+        # This cache was earned with all three active projects. Restoration
+        # changes overlay state, not the selected dependency graph.
+        ready_graph = ('manifest: {projects: []}\nactive-projects:\nzmk\tzmk\n'
+                       'project\tmodules/project\nsecond\tmodules/second\n')
+        case.manifest_stamp.write_text('complete-resolved-active:' +
+                                       hashlib.sha256(ready_graph.encode()).hexdigest() + '\n')
         rsync = fake / 'rsync'
         rsync.write_text(rsync.read_text().replace(
             "if 'local-overlay-backups' in source.parts and",
@@ -1782,13 +1790,45 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
         for path in ('../outside', 'modules/../../outside', 'modules/..',
                      str(self.root / 'absolute-project')):
             with self.subTest(path=path):
-                result, output, commands, backup, stamp, project = self.workspace_restore(path, False)
+                # The current manifest is valid; only the legacy recovery
+                # record is invalid, so this must reach the recorded-path guard.
+                case = self.make_workspace()
+                case.stamp.write_text('project\t' + path + '\n')
+                destination = (case.workspace / path).resolve()
+                destination.mkdir(parents=True, exist_ok=True)
+                sentinel = destination / 'must-preserve.txt'
+                sentinel.write_text('recorded destination sentinel\n')
+                original_stamp = case.stamp.read_bytes()
+                result, output = self.run_workspace(case)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('invalid recorded module input overlay path', output)
                 self.assertNotIn('Restoring previous module input overlay', output)
-                self.assertTrue(backup.is_dir())
-                self.assertTrue(stamp.is_file())
-                self.assertNotIn('west build ', commands.read_text())
+                self.assertTrue(case.backup.is_dir())
+                self.assertEqual((case.backup / 'content.txt').read_text(), 'original project\n')
+                self.assertEqual(case.stamp.read_bytes(), original_stamp)
+                self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+                self.assertEqual(sentinel.read_text(), 'recorded destination sentinel\n')
+                self.assertNotIn('west update ', case.commands.read_text())
+                self.assertNotIn('west build ', case.commands.read_text())
+
+    def test_current_graph_rejects_absolute_and_escaping_parent_paths(self):
+        for path in ('../outside', 'modules/../../outside', 'modules/..',
+                     str(self.root / 'absolute-current-project')):
+            with self.subTest(path=path):
+                case = self.make_workspace(project_path=path, prior_overlay=False)
+                sentinel = case.project / 'must-preserve.txt'
+                sentinel.write_text('current graph sentinel\n')
+                original_ready = case.manifest_stamp.read_bytes()
+                result, output = self.run_workspace(case)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('unsafe west project path', output)
+                self.assertEqual(sentinel.read_text(), 'current graph sentinel\n')
+                self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+                self.assertEqual(case.manifest_stamp.read_bytes(), original_ready)
+                self.assertFalse(case.stamp.exists())
+                self.assertFalse(case.backup.exists())
+                self.assertNotIn('west update ', case.commands.read_text())
+                self.assertNotIn('west build ', case.commands.read_text())
 
     def test_restore_allows_dots_inside_project_path(self):
         result, output, commands, backup, stamp, project = self.workspace_restore('modules/project..version', False)
@@ -2027,6 +2067,253 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
                 self.assertEqual(output.count('Removing stale workspace entry: ' + name + '\n'), 1)
         self.assertFalse(case.counter.exists())
 
+    def test_project_parent_symlink_escape_stops_before_restore_or_overlay(self):
+        for prior_overlay, local_override in ((True, False), (False, True)):
+            with self.subTest(restore=prior_overlay, overlay=local_override):
+                case = self.make_workspace(prior_overlay=prior_overlay, local_override=local_override)
+                outside = case.root / 'outside'
+                (case.workspace / 'modules').rename(outside)
+                (case.workspace / 'modules').symlink_to(outside, target_is_directory=True)
+                self.assertTrue((case.workspace / 'modules').is_symlink())
+                before = (outside / 'project/content.txt').read_bytes()
+                result, output = self.run_workspace(case)
+                self.assertEqual((outside / 'project/content.txt').read_bytes(), before)
+                self.assertNotEqual(result.returncode, 71, output)
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn('physical workspace', output)
+                self.assertNotIn('west update ', case.commands.read_text())
+                self.assertNotIn('west build ', case.commands.read_text())
+                if prior_overlay:
+                    self.assertTrue(case.backup.is_dir())
+                    self.assertEqual(case.stamp.read_text(), 'project\tmodules/project\n')
+
+    def test_recorded_obsolete_overlay_parent_symlink_escape_is_rejected(self):
+        case = self.make_workspace()
+        outside = case.root / 'outside'
+        outside.mkdir()
+        (outside / 'project').mkdir()
+        sentinel = outside / 'project/content.txt'
+        sentinel.write_text('outside sentinel\n')
+        (case.workspace / 'retired').symlink_to(outside, target_is_directory=True)
+        case.stamp.write_text('project\tretired/project\n')
+        result, output = self.run_workspace(case)
+        self.assertEqual(sentinel.read_text(), 'outside sentinel\n')
+        self.assertNotEqual(result.returncode, 71, output)
+        self.assertIn('unsafe module input overlay path', output)
+        self.assertTrue(case.backup.is_dir())
+        self.assertEqual(case.stamp.read_text(), 'project\tretired/project\n')
+
+    def test_pruning_preserves_active_project_physical_root_through_alias(self):
+        case = self.make_workspace(prior_overlay=False)
+        (case.workspace / 'modules').rename(case.workspace / 'physical modules')
+        (case.workspace / 'modules').symlink_to('physical modules', target_is_directory=True)
+        self.assertTrue((case.workspace / 'modules').is_symlink())
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+        self.assertFalse(case.counter.exists(), output)
+
+    def test_unresolved_real_west_import_cannot_update_through_escaping_parent(self):
+        case = self.make_workspace(prior_overlay=False, force_update=True)
+        case.env['PROBE_ALL_REAL_WEST'] = '1'
+        repository = case.root / 'import-origin'
+        repository.mkdir()
+        (repository / 'west.yml').write_text('manifest: {projects: []}\n')
+        (repository / 'upstream-payload.txt').write_text('upstream payload\n')
+        git_env = dict(os.environ, GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                       GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+        for args in (('init', '-q'), ('add', '.'), ('commit', '-qm', 'importer')):
+            result = subprocess.run(['git', *args], cwd=repository, env=git_env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repository, text=True).strip()
+        projects = [dict(name='zmk', path='zmk', url=repository.as_uri(), revision=revision),
+                    dict(name='project', path='modules/project', url=repository.as_uri(),
+                         revision=revision, **{'import': True})]
+        for directory in (case.source, case.workspace):
+            (directory / 'config/west.yml').write_text(yaml.safe_dump({'manifest': {'projects': projects}}))
+        outside = case.root / 'outside'
+        (case.workspace / 'modules').rename(outside)
+        (case.workspace / 'modules').symlink_to(outside, target_is_directory=True)
+        sentinel = outside / 'project/must-preserve.txt'
+        sentinel.write_text('outside sentinel\n')
+        before = sorted(str(path.relative_to(outside)) for path in outside.rglob('*'))
+        preflight = subprocess.run([case.env['PROBE_REAL_WEST'], 'list', '-f', '{name}\t{path}'],
+                                   cwd=case.workspace, env=case.env, text=True, capture_output=True)
+        self.assertNotEqual(preflight.returncode, 0, 'control must have an unresolved importer')
+        result, output = self.run_workspace(case)
+        self.assertEqual(sorted(str(path.relative_to(outside)) for path in outside.rglob('*')), before)
+        self.assertEqual(sentinel.read_text(), 'outside sentinel\n')
+        self.assertNotIn('west update ', case.commands.read_text())
+        self.assertNotIn('west build ', case.commands.read_text())
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertNotEqual(result.returncode, 71, output)
+
+    def test_importer_update_cannot_introduce_project_through_existing_escaping_alias(self):
+        case = self.make_workspace(prior_overlay=False)
+        case.env['PROBE_ALL_REAL_WEST'] = '1'
+        repository = case.root / 'transition-origin'
+        repository.mkdir()
+        git_env = dict(os.environ, GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                       GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+
+        def git(*args):
+            result = subprocess.run(['git', *args], cwd=repository, env=git_env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+
+        git('init', '-q')
+        (repository / 'upstream-payload.txt').write_text('upstream payload\n')
+        git('add', '.')
+        git('commit', '-qm', 'base payload')
+        revision_base = git('rev-parse', 'HEAD')
+        # The keeper shares modules/ with the newly introduced project, so
+        # pruning cannot remove the unlisted redirect before update.
+        (repository / 'west.yml').write_text(yaml.safe_dump({'manifest': {'projects': [
+            dict(name='keeper', path='modules/keeper', url=repository.as_uri(), revision=revision_base)
+        ]}}))
+        git('add', '.')
+        git('commit', '-qm', 'importer A')
+        revision_a = git('rev-parse', 'HEAD')
+        shutil.rmtree(case.workspace / 'zmk')
+        shutil.rmtree(case.workspace / 'modules')
+
+        def select(revision):
+            projects = [dict(name='zmk', path='zmk', url=repository.as_uri(), revision=revision_a),
+                        dict(name='importer', path='importer', url=repository.as_uri(),
+                             revision=revision, **{'import': True})]
+            (case.source / 'config/west.yml').write_text(yaml.safe_dump({'manifest': {'projects': projects}}))
+
+        select(revision_a)
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertTrue((case.workspace / 'modules/keeper/.git').exists())
+        (repository / 'west.yml').write_text(yaml.safe_dump({'manifest': {'projects': [
+            dict(name='keeper', path='modules/keeper', url=repository.as_uri(), revision=revision_a),
+            dict(name='introduced', path='modules/redirect/project', url=repository.as_uri(), revision=revision_a)
+        ]}}))
+        git('commit', '-qam', 'importer B')
+        revision_b = git('rev-parse', 'HEAD')
+        select(revision_b)
+        # Sync the manifest for an independent pre-update list oracle. West
+        # still resolves the old imported manifest from its manifest-rev ref.
+        shutil.copyfile(case.source / 'config/west.yml', case.workspace / 'config/west.yml')
+        outside = case.root / 'outside'
+        outside.mkdir()
+        sentinel = outside / 'must-preserve.txt'
+        sentinel.write_text('outside sentinel\n')
+        (case.workspace / 'modules/redirect').symlink_to(outside, target_is_directory=True)
+        preflight = subprocess.run([case.env['PROBE_REAL_WEST'], 'list', '-f', '{name}\t{path}'],
+                                   cwd=case.workspace, env=case.env, text=True, capture_output=True)
+        self.assertEqual(preflight.returncode, 0, preflight.stdout + preflight.stderr)
+        self.assertNotIn('introduced', preflight.stdout)
+        command_before = case.commands.read_text()
+        result, output = self.run_workspace(case)
+        self.assertEqual(sorted(path.name for path in outside.iterdir()), ['must-preserve.txt'])
+        self.assertEqual(sentinel.read_text(), 'outside sentinel\n')
+        self.assertNotIn('west update ', case.commands.read_text()[len(command_before):])
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertNotEqual(result.returncode, 71, output)
+
+    def test_overlay_backup_parent_symlink_escape_preserves_outside_recovery(self):
+        case = self.make_workspace(update_actions=[{'exit': 0}])
+        outside = case.root / 'outside-backups'
+        case.backup.parent.rename(outside)
+        case.backup.parent.symlink_to(outside, target_is_directory=True)
+        sentinel = outside / 'project/must-preserve.txt'
+        sentinel.write_text('outside backup sentinel\n')
+        original_stamp = case.stamp.read_bytes()
+        # Exercise the deleting tar-copy backend as well as backup cleanup.
+        (pathlib.Path(case.env['PATH'].split(os.pathsep)[0]) / 'rsync').unlink()
+        result, output = self.run_workspace(case)
+        self.assertTrue(sentinel.is_file(), output)
+        self.assertEqual(sentinel.read_text(), 'outside backup sentinel\n')
+        self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+        self.assertEqual(case.stamp.read_bytes(), original_stamp)
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertNotEqual(result.returncode, 71, output)
+
+    def test_pruning_preserves_intermediate_alias_chain(self):
+        case = self.make_workspace(prior_overlay=False)
+        (case.workspace / 'physical').mkdir()
+        (case.workspace / 'modules').rename(case.workspace / 'physical/modules')
+        (case.workspace / 'route').symlink_to('physical', target_is_directory=True)
+        (case.workspace / 'modules').symlink_to('route/modules', target_is_directory=True)
+        result, output = self.run_workspace(case)
+        self.assertTrue((case.workspace / 'route').is_symlink(), output)
+        self.assertTrue(case.project.is_dir(), output)
+        self.assertEqual((case.project / 'content.txt').read_text(), 'local override\n')
+        self.assertEqual(result.returncode, 71, output)
+        self.assertFalse(case.counter.exists(), output)
+
+    def test_real_west_group_reenable_updates_to_current_revision(self):
+        case = self.make_workspace(prior_overlay=False)
+        case.env['PROBE_ALL_REAL_WEST'] = '1'
+        repository = case.root / 'group-origin'
+        repository.mkdir()
+        git_env = dict(os.environ, GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                       GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid')
+
+        def git(*args, cwd=repository):
+            result = subprocess.run(['git', *args], cwd=cwd, env=git_env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout.strip()
+
+        git('init', '-q')
+        (repository / 'content.txt').write_text('revision A\n')
+        git('add', '.')
+        git('commit', '-qm', 'A')
+        revision_a = git('rev-parse', 'HEAD')
+        (repository / 'content.txt').write_text('revision B\n')
+        git('commit', '-qam', 'B')
+        revision_b = git('rev-parse', 'HEAD')
+        self.assertNotEqual(revision_a, revision_b)
+        shutil.rmtree(case.project)
+        shutil.rmtree(case.workspace / 'zmk')
+
+        def select(revision, enabled):
+            projects = [dict(name='zmk', url=repository.as_uri(), revision=revision_b),
+                        dict(name='project', path='modules/project', url=repository.as_uri(),
+                             revision=revision, groups=['selected']),
+                        dict(name='keeper', path='modules/keeper', url=repository.as_uri(), revision=revision_b)]
+            (case.source / 'config/west.yml').write_text(yaml.safe_dump({'manifest': {'projects': projects}}))
+            (case.workspace / '.west/config').write_text('[manifest]\npath = config\ngroup-filter = ' +
+                                                        ('+selected' if enabled else '-selected') + '\n')
+
+        select(revision_a, True)
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(git('rev-parse', 'HEAD', cwd=case.project), revision_a)
+        select(revision_b, False)
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(git('rev-parse', 'HEAD', cwd=case.project), revision_a)
+        disabled_stamp = case.manifest_stamp.read_text()
+        select(revision_b, True)
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(git('rev-parse', 'HEAD', cwd=case.project), revision_b)
+        self.assertIn('Updating west dependencies', output)
+        self.assertNotEqual(case.manifest_stamp.read_text(), disabled_stamp)
+        ready_stamp = case.manifest_stamp.read_text()
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertNotIn('Updating west dependencies', output)
+        self.assertEqual(git('rev-parse', 'HEAD', cwd=case.project), revision_b)
+        self.assertEqual(case.manifest_stamp.read_text(), ready_stamp)
+
+    def test_active_selection_change_invalidates_ready_stamp(self):
+        case = self.make_workspace(prior_overlay=False, update_actions=[{'exit': 0}])
+        # The complete resolved manifest is unchanged. The previous stamp was
+        # earned with only zmk active; reenabling project requires a new update.
+        inactive = 'manifest: {projects: []}\nactive-projects:\nzmk\tzmk\n'
+        case.manifest_stamp.write_text('complete-resolved-active:' +
+                                       hashlib.sha256(inactive.encode()).hexdigest() + '\n')
+        result, output = self.run_workspace(case)
+        self.assertEqual(result.returncode, 71, output)
+        self.assertEqual(case.counter.read_text(), '1')
+        self.assertEqual((case.project / 'content.txt').read_text(), 'resolved project\n')
+        self.assertEqual(case.manifest_stamp.read_text(), case.ready + '\n')
+
     def test_pruning_normalizes_in_workspace_parent_components(self):
         for path in ('project', './project', 'modules/../project', 'case..name/project'):
             with self.subTest(path=path):
@@ -2051,6 +2338,9 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
                 text = west.read_text().replace("projects = [('zmk', 'zmk'),", "projects = [('zephyr', 'zephyr'), ('zmk', 'zmk'),")
                 text = text.replace("    fault = os.environ.get('PROBE_LIST_FAILURE')", "    if wanted == 'zephyr':\n        print(str(pathlib.Path(os.environ['WORK_DIR']) / 'zephyr'))\n        sys.exit(0)\n    fault = os.environ.get('PROBE_LIST_FAILURE')")
                 west.write_text(text)
+                standalone_ready = 'manifest: {projects: []}\nactive-projects:\nzephyr\tzephyr\nzmk\tzmk\nproject\tmodules/project\n'
+                case.manifest_stamp.write_text('complete-resolved-active:' +
+                                               hashlib.sha256(standalone_ready.encode()).hexdigest() + '\n')
                 case.env['PROBE_BUILD_EXIT'] = '0'
                 result, output = self.run_workspace(case)
                 self.assertEqual(result.returncode, 0, output)
@@ -2059,14 +2349,14 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
                 self.assertEqual(sum(args[0] == 'build' for args in calls), 3)
 
     def test_recorded_overlay_restores_before_obsolete_root_is_pruned(self):
-        case = self.make_workspace()
+        case = self.make_workspace(update_actions=[{'exit': 0}])
         case.env['PROBE_OMIT_PROJECT'] = '1'
         result, output = self.run_workspace(case)
         self.assertEqual(result.returncode, 71, output)
         self.assertFalse((case.workspace / 'modules').exists(), output)
         self.assertFalse(case.backup.exists())
         self.assertFalse(case.stamp.exists())
-        self.assertFalse(case.counter.exists())
+        self.assertEqual(case.counter.read_text(), '1')
         self.assertLess(output.index('Restoring previous module input overlay'),
                         output.index('Removing stale workspace entry: modules'))
 
@@ -2402,10 +2692,10 @@ os.execv(os.environ['PUBLISH_REAL_MV'], ['mv'] + sys.argv[1:])
         self.assertEqual(case.counter.read_text(), '1')
 
     def test_legacy_manifest_marker_requires_reverification(self):
-        for prefix in ('', 'complete:'):
+        for prefix in ('', 'complete:', 'complete-resolved:'):
             with self.subTest(prefix=prefix):
                 case = self.make_workspace(prior_overlay=False, update_actions=[{'exit': 0}])
-                # Both older formats hashed only the entry manifest, without resolving imports.
+                # Older formats lack the combined resolved-manifest and active-selection identity.
                 case.manifest_stamp.write_text(prefix + case.digest + '\n')
                 (case.project / 'content.txt').write_text('unverified legacy checkout\n')
                 result, output = self.run_workspace(case)

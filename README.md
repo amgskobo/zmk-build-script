@@ -284,7 +284,8 @@ input list; module paths are passed internally with NUL delimiters.
 ### Source copy
 
 Git working trees copy tracked files plus non-ignored untracked files. Deleted
-tracked files are omitted; ignored tracked files remain included. With
+tracked files are omitted; ignored tracked files remain included. Checked-out
+submodules apply their own tracked and non-ignored file selection recursively. With
 `ZMK_COPY_IGNORED=1`, unavailable Git, failed or empty file listing, or a
 non-working-tree source, copying falls back to the full source with fixed exclusions.
 
@@ -372,11 +373,18 @@ Use a dedicated volume per source and application; see
 
 The container keeps a west workspace and copies only `config/` into it. ZMK uses
 `ZMK_CONFIG=/root/zmk-config/config` from the fresh container source. Dependency
-reuse checks the resolved manifest, including imports. Failed or interrupted
+reuse checks the resolved manifest, including imports, and the effective active
+project selection, including local group filters. Older readiness records are
+revalidated by updating dependencies. Failed or interrupted
 updates are retried; unresolved manifests cannot mark a cache ready. Obsolete
 workspace roots are pruned only after restoring overlays and obtaining a
 complete project list. A failed restoration stops the build and keeps the
-affected backup and recovery record.
+affected backup and recovery record. Project and overlay destinations must remain
+physically inside the workspace, including through symlink parents; pruning retains
+the physical roots and intermediate aliases of active projects. Before every dependency
+update, every existing directory alias in the workspace is checked conservatively,
+including aliases outside the currently resolved graph: imports may introduce new
+project paths during update. Aliases escaping the workspace stop the build.
 If the final `west update` summary omits failed project names, the builder runs
 one additional diagnostic pass over every active project after
 `ZMK_WEST_UPDATE_ATTEMPTS` bulk attempts. It uses a temporary resolved manifest
@@ -507,7 +515,10 @@ Run names follow the displayed convention with an optional `-N` collision suffix
 from 2. Automatic selection orders timestamps and config labels, then collision
 sequences recorded in summaries numerically for matching labels; pass an explicit run path to identify
 one invocation. Legacy timestamp-only, `-N` and `-pid-PID` run directories remain
-checkable, including earlier dotted suffixes without sequence metadata. The summary records the selected fallback; older summaries default to
+checkable, including earlier dotted suffixes without sequence metadata. Automatic checks
+reject an unfinished run at the selected timestamp or a later timestamp. Missing
+sequence metadata makes same-second numeric labels ambiguous; use an explicit
+completed run path to check a particular result. The summary records the selected fallback; older summaries default to
 `bin`.
 
 For a quality gate, define expected outputs independently before building and pass
