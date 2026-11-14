@@ -527,9 +527,35 @@ git_in "${submodule_origin}" -c user.name=Fixture -c user.email=fixture@example.
 empty_origin="${tmp_dir}/empty origin"
 mkdir "${empty_origin}"
 git_in "${empty_origin}" init -q
+git_in "${empty_origin}" config core.autocrlf false
 git_in "${empty_origin}" -c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm empty
+# A clone does not inherit the parent's local core.autocrlf=false. Prove
+# that an inherited true setting changes checkout bytes and the LF oracle rejects it.
+autocrlf_control="${tmp_dir}/autocrlf control"
+mkdir "${autocrlf_control}"
+git_in "${autocrlf_control}" init -q
+git_in "${autocrlf_control}" -c core.autocrlf=true -c protocol.file.allow=always \
+  submodule add -q '../submodule origin' 'nested module'
+cmp "${autocrlf_control}/nested module/tracked.txt" <(printf 'tracked submodule\r\n')
+if cmp "${autocrlf_control}/nested module/tracked.txt" <(printf 'tracked submodule\n') \
+    > "${tmp_dir}/autocrlf-control.log" 2>&1; then
+  echo 'LF oracle accepted inherited CRLF checkout' >&2; exit 1
+else
+  [ "$?" = 1 ]
+fi
+echo '[host-contract] control inherited-autocrlf LF oracle rejected'
+
+add_lf_fixture_submodule() {
+  local root="$1" url="$2" path="$3"
+  # Deliberately carry an inherited true setting, then override it for the
+  # clone's first checkout. Persist false only in this fixture for later writes.
+  git_in "${root}" -c core.autocrlf=true -c core.autocrlf=false -c protocol.file.allow=always \
+    submodule add -q "${url}" "${path}"
+  git_in "${root}/${path}" config core.autocrlf false
+}
 for root in "${native_target}" "${native_module}"; do
-  git_in "${root}" -c protocol.file.allow=always submodule add -q '../submodule origin' 'nested module'
+  add_lf_fixture_submodule "${root}" '../submodule origin' 'nested module'
+  cmp "${root}/nested module/tracked.txt" <(printf 'tracked submodule\n')
   mkdir "${root}/nested module/private-cache"
   printf 'ignored private cache\n' > "${root}/nested module/private-cache/secret.txt"
   printf 'visible submodule\n' > "${root}/nested module/visible.txt"
@@ -542,10 +568,11 @@ for root in "${native_target}" "${native_module}"; do
   printf 'nested build retained\n' > "${root}/nested module/build/keep.txt"
   git_in "${root}/nested module" check-ignore -q private-cache/secret.txt
   [ -f "${root}/nested module/.git" ]
-  git_in "${root}/nested module" -c protocol.file.allow=always submodule add -q '../submodule origin' 'deep module'
+  add_lf_fixture_submodule "${root}/nested module" '../submodule origin' 'deep module'
+  cmp "${root}/nested module/deep module/tracked.txt" <(printf 'tracked submodule\n')
   mkdir "${root}/nested module/deep module/private-cache"
   printf 'deep ignored\n' > "${root}/nested module/deep module/private-cache/secret.txt"
-  git_in "${root}" -c protocol.file.allow=always submodule add -q '../empty origin' 'empty module'
+  add_lf_fixture_submodule "${root}" '../empty origin' 'empty module'
   mkdir "${root}/empty module/private-cache"
   printf 'private-cache/\n' >> "${root}/.git/modules/empty module/info/exclude"
   printf 'empty ignored\n' > "${root}/empty module/private-cache/secret.txt"
