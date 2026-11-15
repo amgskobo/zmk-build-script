@@ -529,6 +529,7 @@ read_run_order() {
   base="${directory##*/}"
   RUN_ORDER_KEY="${base%%.*}" RUN_ORDER_NUMBER=1
   case "${base}" in *.*) RUN_ORDER_NUMBER="${base##*.}" ;; esac
+  [ -f "${summary}" ] || return 0
   # Excerpts can contain arbitrary build output, including lines resembling metadata.
   read_summary_metadata "${summary}" || return 1
   summary_field 'Run sequence' || return 1
@@ -583,15 +584,27 @@ else
   fi
 
   build_summary=""
-  latest_key="" latest_number=0
-  if ! candidate_summaries="$(find .build -mindepth 2 -maxdepth 2 -type f -name build-summary.txt -print | sort)"; then
+  latest_key="" latest_number=0 unfinished_key="" unfinished_summary=""
+  if ! candidate_summaries="$(find .build -mindepth 1 -maxdepth 1 -type d -print | sort)"; then
     echo 'Failed to enumerate build summaries.' >&2
     exit 1
   fi
   while IFS= read -r summary; do
     [ -n "${summary}" ] || continue
-    candidate_dir="${summary%/*}"
+    candidate_dir="${summary}"
+    summary="${candidate_dir}/build-summary.txt"
+    case "${candidate_dir##*/}" in
+      run-*) ;;
+      *) [ -f "${summary}" ] || continue ;;
+    esac
     require_valid_run_dir "${candidate_dir}" "build summary directory"
+    if [ ! -f "${summary}" ]; then
+      unfinished_timestamp="${candidate_dir##*/}"
+      unfinished_timestamp="${unfinished_timestamp:0:23}"
+      if [[ "${unfinished_timestamp}" > "${unfinished_key}" || "${unfinished_timestamp}" = "${unfinished_key}" ]]; then
+        unfinished_key="${unfinished_timestamp}" unfinished_summary="${summary}"
+      fi
+    fi
     read_run_order "${candidate_dir}" "${summary}"
     candidate_key="${RUN_ORDER_KEY}" candidate_number="${RUN_ORDER_NUMBER}"
     # Compare decimal strings without octal interpretation or machine integer overflow.
@@ -604,6 +617,12 @@ else
       latest_key="${candidate_key}" latest_number="${candidate_number}"
     fi
   done <<< "${candidate_summaries}"
+  # Without final sequence metadata, same-second labels ending in numbers
+  # cannot be distinguished from collisions. Never certify an older success.
+  if [ -n "${unfinished_summary}" ] &&
+      [[ "${unfinished_key}" > "${latest_key:0:23}" || "${unfinished_key}" = "${latest_key:0:23}" ]]; then
+    build_summary="${unfinished_summary}"
+  fi
 fi
 
 if [ -z "${build_summary}" ] || [ ! -f "${build_summary}" ]; then
@@ -677,19 +696,36 @@ if [ "${mode}" = "build" ]; then
   esac
   [ "${built_targets}" -gt 0 ] || { echo "Built targets must be positive" >&2; exit 1; }
 
-  firmware_list="$(
-    find "${run_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' -o -name "*.${fallback}" \) ! -iname build.log ! -iname build-summary.txt -print |
-      sort
-  )"
-  if [ -z "${firmware_list}" ]; then
+  firmware_raw="$(mktemp "${TMPDIR:-/tmp}/zmk-check-firmware.XXXXXX")"
+  if ! find "${run_dir}" -maxdepth 1 -type f \( -name '*.uf2' -o -name '*.hex' -o -name '*.bin' -o -name "*.${fallback}" \) ! -iname build.log ! -iname build-summary.txt -print0 > "${firmware_raw}"; then
+    rm -f "${firmware_raw}"
+    echo 'Failed to enumerate firmware artifacts.' >&2; exit 1
+  fi
+  firmware_count=0
+  firmware_files=()
+  while :; do
+    firmware_file=""
+    if ! IFS= read -r -d '' firmware_file; then
+      if [ -n "${firmware_file}" ]; then
+        rm -f "${firmware_raw}"
+        echo 'Incomplete firmware artifact enumeration.' >&2; exit 1
+      fi
+      break
+    fi
+    firmware_name="${firmware_file##*/}"
+    case "${firmware_name}" in
+      ''|*[!A-Za-z0-9._-]*|.*|-*)
+        rm -f "${firmware_raw}"
+        echo 'Unsafe firmware artifact filename.' >&2; exit 1 ;;
+    esac
+    firmware_count=$((firmware_count + 1))
+    firmware_files+=("${firmware_file}")
+  done < "${firmware_raw}"
+  rm -f "${firmware_raw}" || exit 1
+  if [ "${firmware_count}" = 0 ]; then
     echo "No firmware artifact was produced for build mode." >&2
     exit 1
   fi
-
-  firmware_count=0
-  while IFS= read -r firmware_file; do
-    [ -z "${firmware_file}" ] || firmware_count=$((firmware_count + 1))
-  done <<< "${firmware_list}"
   if [ "${firmware_count}" -lt "${built_targets}" ]; then
     echo "Firmware artifact count (${firmware_count}) is lower than built target count (${built_targets})." >&2
     exit 1
@@ -702,9 +738,9 @@ if [ "${mode}" = "build" ]; then
 
   echo "[output] built targets: ${built_targets}"
   echo "[output] firmware artifacts: ${firmware_count}"
-  while IFS= read -r firmware_file; do
+  for firmware_file in "${firmware_files[@]}"; do
     printf '[output] firmware artifact: %s\n' "${firmware_file}"
-  done <<< "${firmware_list}"
+  done
 fi
 
 check_expected_output() {
@@ -759,12 +795,12 @@ check_expected_output() {
   fi
   [ "${#artifacts[@]}" -gt 0 ] || { echo 'Invalid output expectations: build artifacts are required.' >&2; return 1; }
   [ "${#artifacts[@]}" = "${built_targets}" ] || { echo 'expected artifact count does not match built target count' >&2; return 1; }
-  while IFS= read -r file || [ -n "${file}" ]; do
+  for file in "${firmware_files[@]}"; do
     name="${file##*/}"; matched=0
     for value in "${artifacts[@]}"; do [ "${name}" != "${value}" ] || matched=1; done
     [ "${matched}" = 1 ] || { echo 'unexpected firmware name for output expectations' >&2; return 1; }
     [ -s "${file}" ] || { echo 'empty expected firmware' >&2; return 1; }
-  done <<< "${firmware_list}"
+  done
 }
 
 [ -z "${expected_file}" ] || check_expected_output

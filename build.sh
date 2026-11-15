@@ -372,15 +372,18 @@ PY
     }
 
     sync_config_to_workspace() {
+        validate_overlay_destination manifest "${CONFIG_DIR}"
         log "Syncing config into persistent west workspace"
         mkdir -p "${WORK_DIR}"
         copy_tree "${SOURCE_DIR}/${CONFIG_DIR}" "${WORK_DIR}/${CONFIG_DIR}"
     }
 
     manifest_digest() {
-        local resolved
+        local resolved active
         # Resolve with west so local and project imports share west's own semantics.
         resolved="$(west manifest --resolve)" || return 1
+        active="$(workspace_project_list)" || return 1
+        resolved="${resolved}"$'\nactive-projects:\n'"${active}"
         if command -v sha256sum >/dev/null 2>&1; then
             printf '%s\n' "${resolved}" | sha256sum | awk '{print $1}'
         else
@@ -391,7 +394,7 @@ PY
     manifest_stamp_value() {
         local digest
         digest="$(manifest_digest)" || return 1
-        printf 'complete-resolved:%s\n' "${digest}"
+        printf 'complete-resolved-active:%s\n' "${digest}"
     }
 
     manifest_changed() {
@@ -419,26 +422,81 @@ PY
     }
 
     normalize_project_paths() {
-        python3 -c '
+        WORK_DIR="${WORK_DIR}" python3 -c '
+import os
 import posixpath
 import sys
 
+workspace = os.path.realpath(os.environ["WORK_DIR"])
 rows = []
 for line in sys.stdin.read().split("\n"):
     if not line:
         continue
     name, separator, path = line.partition("\t")
+    physical = os.path.realpath(os.path.join(workspace, path))
     path = posixpath.normpath(path)
     if not separator or path in (".", "..") or path.startswith(("/", "../")):
         sys.exit("invalid west project path")
+    if os.path.commonpath([workspace, physical]) != workspace or physical == workspace:
+        sys.exit("west project path escapes physical workspace: " + path)
     rows.append(name + "\t" + path)
 sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
 '
     }
 
+    validate_workspace_project_paths() {
+        local projects
+        # A failed west command is handled by update/retry logic, but successful
+        # output containing an unsafe path must stop before any workspace mutation.
+        if projects="$(cd "${WORK_DIR}" && west list -f $'{name}\t{path}')"; then
+            printf '%s\n' "${projects}" | normalize_project_paths >/dev/null ||
+                fail "unsafe west project path"
+        else
+            validate_workspace_directory_aliases
+        fi
+    }
+
+    validate_workspace_directory_aliases() {
+        # An importer may reveal new paths during update even when the old
+        # resolved graph was available. Check aliases before every update.
+        python3 - "${WORK_DIR}" <<'PYLINKS' || fail "unsafe workspace directory alias"
+import os
+import sys
+
+workspace = os.path.realpath(sys.argv[1])
+def error(exc):
+    raise exc
+for parent, directories, files in os.walk(workspace, followlinks=False, onerror=error):
+    for name in directories + files:
+        path = os.path.join(parent, name)
+        if os.path.islink(path) and (os.path.isdir(path) or not os.path.exists(path)):
+            physical = os.path.realpath(path)
+            if os.path.commonpath([workspace, physical]) != workspace:
+                sys.exit("directory alias escapes physical workspace: " + path)
+    directories[:] = [name for name in directories if name != ".git"]
+PYLINKS
+    }
+
+    validate_overlay_destination() {
+        printf '%s\t%s\n' "$1" "$2" | normalize_project_paths >/dev/null ||
+            fail "unsafe module input overlay path: $2"
+    }
+
+    validate_workspace_control_paths() {
+        local path
+        for path in .west .build .west/manifest.sha256 .west/local-overlays.tsv .west/local-overlay-backups; do
+            validate_overlay_destination workspace-control "${path}"
+        done
+    }
+
+    validate_overlay_backup() {
+        case "$1" in ''|.|..|*/*) fail "invalid module input overlay name" ;; esac
+        validate_overlay_destination overlay-backup ".west/local-overlay-backups/$1"
+    }
+
     prune_workspace_roots() {
         local keep=(.west .build "${CONFIG_DIR}")
-        local projects name path root entry
+        local projects name path root entry aliases
         if ! projects="$(workspace_project_list)"; then
             log "Skipping workspace pruning because the west project list is unavailable"
             return 1
@@ -448,6 +506,23 @@ sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
             root="${path%%/*}"
             [ -z "${root}" ] || keep+=("${root}")
         done <<< "${projects}"
+
+        # Preserve every top-level alias whose physical directory contains an
+        # active project, including intermediate aliases in a multi-hop route.
+        aliases="$(printf '%s\n' "${projects}" | WORK_DIR="${WORK_DIR}" python3 -c '
+import os
+import sys
+workspace = os.path.realpath(os.environ["WORK_DIR"])
+projects = [os.path.realpath(os.path.join(workspace, row.split("\t", 1)[1]))
+            for row in sys.stdin.read().splitlines() if "\t" in row]
+for name in os.listdir(workspace):
+    physical = os.path.realpath(os.path.join(workspace, name))
+    if any(os.path.commonpath([physical, project]) == physical for project in projects):
+        print(name)
+')" || fail "cannot resolve workspace project roots"
+        while IFS= read -r root; do
+            [ -z "${root}" ] || keep+=("${root}")
+        done <<< "${aliases}"
 
         shopt -s nullglob dotglob
         for entry in "${WORK_DIR}"/*; do
@@ -478,14 +553,93 @@ sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
         [ -n "${missing}" ]
     }
 
+    west_update_last_line() {
+        awk 'NF {last = $0} END {print last}' "$1"
+    }
+
     west_update_failed_projects() {
         local log_path="$1"
-        sed -nE \
+        west_update_last_line "${log_path}" | sed -nE \
             -e 's/^ERROR: update failed for projects?:[[:space:]]*//p' \
-            -e 's/^ERROR: update failed for project[[:space:]]+//p' \
-            "${log_path}" |
+            -e 's/^ERROR: update failed for project[[:space:]]+//p' |
             tr ',' '\n' |
             awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if ($0 != "") print}'
+    }
+
+    diagnose_west_update_projects() {
+        local diagnostic_dir projects flat_projects name path status last_error failed="" count=0
+        diagnostic_dir="$(mktemp -d "${WORK_DIR}/.west/update-diagnostics.XXXXXX")" ||
+            fail "cannot prepare diagnostic west update"
+        if ! west manifest --resolve > "${diagnostic_dir}/west.yml" ||
+            ! workspace_project_list > "${diagnostic_dir}/projects.before"; then
+            fail "cannot verify diagnostic west update project graph"
+        fi
+        # A resolved, not frozen, manifest preserves the intended revisions. Plain
+        # named updates reject imported projects, so use a temporary flattened view
+        # with the effective local options and the original active project set.
+        cp "${WEST_CONFIG_LOCAL-${WORK_DIR}/.west/config}" "${diagnostic_dir}/config" ||
+            fail "cannot prepare diagnostic west update configuration"
+        WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west config --local manifest.path \
+            "${diagnostic_dir#"${WORK_DIR}/"}" || fail "cannot prepare diagnostic west update configuration"
+        WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west config --local manifest.file west.yml ||
+            fail "cannot prepare diagnostic west update configuration"
+        if ! WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west manifest --resolve > "${diagnostic_dir}/flat.yml" ||
+            ! WEST_CONFIG_LOCAL="${diagnostic_dir}/config" workspace_project_list > "${diagnostic_dir}/projects.flat"; then
+            fail "cannot verify diagnostic west update project graph"
+        fi
+        python3 - "${diagnostic_dir}/west.yml" "${diagnostic_dir}/flat.yml" <<'PY' ||
+import sys
+import yaml
+
+documents = []
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as source:
+        document = yaml.safe_load(source)
+    document["manifest"].get("self", {}).pop("path", None)
+    documents.append(document)
+if documents[0] != documents[1]:
+    sys.exit("flattened diagnostic manifest does not match the resolved project graph")
+PY
+            fail "cannot verify diagnostic west update project graph"
+        projects="$(awk -F '\t' '$1 != "manifest"' "${diagnostic_dir}/projects.before")"
+        flat_projects="$(awk -F '\t' '$1 != "manifest"' "${diagnostic_dir}/projects.flat")"
+        [ -n "${projects}" ] && [ "${projects}" = "${flat_projects}" ] ||
+            fail "cannot verify diagnostic west update project graph"
+        log "west omitted failure identities; running one final diagnostic update of every active project"
+        while IFS=$'\t' read -r name path; do
+            [ -n "${name}" ] && [ "${name}" != "manifest" ] || continue
+            count=$((count + 1))
+            log "Diagnostic west update: ${name}"
+            validate_workspace_directory_aliases
+            if WEST_CONFIG_LOCAL="${diagnostic_dir}/config" west update --fetch-opt=--filter=tree:0 -- "${name}" \
+                > "${diagnostic_dir}/project.log" 2>&1; then
+                status=0
+            else
+                status=$?
+            fi
+            cat "${diagnostic_dir}/project.log" || fail "cannot read diagnostic west update output"
+            log "Diagnostic west update result: ${name} (exit=${status})"
+            if [ "${status}" != 0 ]; then
+                last_error="$(west_update_last_line "${diagnostic_dir}/project.log")"
+                [ "${last_error}" = "ERROR: update failed for project ${name}" ] ||
+                    fail "cannot identify diagnostic west update failure: ${name} (exit=${status})"
+                failed="${failed}${failed:+$'\n'}${name}"
+            fi
+        done <<EOF
+${projects}
+EOF
+        if [ "${count}" = 0 ] || ! west manifest --resolve > "${diagnostic_dir}/manifest.after" ||
+            ! workspace_project_list > "${diagnostic_dir}/projects.after" ||
+            ! cmp -s "${diagnostic_dir}/west.yml" "${diagnostic_dir}/manifest.after" ||
+            ! cmp -s "${diagnostic_dir}/projects.before" "${diagnostic_dir}/projects.after"; then
+            fail "cannot verify diagnostic west update project graph"
+        fi
+        # This complete final pass replaces the bulk failure; it never unions
+        # identities from an earlier attempt. Local overlays do not mark it ready.
+        WEST_UPDATE_FAILED_PROJECTS="${failed}"
+        WEST_UPDATE_FAILED=0
+        [ -z "${failed}" ] || WEST_UPDATE_FAILED=1
+        rm -rf "${diagnostic_dir}" || fail "cannot remove diagnostic west update files"
     }
 
     verify_west_update_result() {
@@ -528,6 +682,7 @@ sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             if project_path="$(project_path_for_name "${name}")" && [ -e "${WORK_DIR}/${project_path}" ]; then
+                validate_overlay_destination "${name}" "${project_path}"
                 log "Clearing stale module input overlay: ${name} -> ${project_path}"
                 rm -rf "${WORK_DIR:?}/${project_path}"
             fi
@@ -543,6 +698,8 @@ sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
             case "/${project_path}/" in
                 //*|*/../*) fail "invalid recorded module input overlay path: ${project_path}" ;;
             esac
+            validate_overlay_destination "${name}" "${project_path}"
+            validate_overlay_backup "${name}"
             backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
             case "${state}" in
                 restored)
@@ -618,6 +775,8 @@ PY
 
     backup_module_input_overlay_project() {
         local name="$1" project_path="$2" backup_path
+        validate_overlay_destination "${name}" "${project_path}"
+        validate_overlay_backup "${name}"
         backup_path="${LOCAL_OVERLAY_BACKUP_DIR}/${name}"
         rm -rf "${backup_path}"
         if [ -e "${WORK_DIR}/${project_path}" ]; then
@@ -658,6 +817,7 @@ PY
     }
 
     ensure_west_workspace() {
+        validate_workspace_control_paths
         sync_config_to_workspace
         cd "${WORK_DIR}"
 
@@ -668,6 +828,7 @@ PY
             need_full_update=1
         fi
 
+        validate_workspace_project_paths
         if clear_recorded_local_overlays; then
             need_full_update=1
         fi
@@ -682,6 +843,7 @@ PY
         fi
 
         if [ "${need_full_update}" = "1" ]; then
+            validate_workspace_project_paths
             log "Updating west dependencies"
             validate_positive_int "ZMK_WEST_UPDATE_ATTEMPTS" "${WEST_UPDATE_ATTEMPTS}"
             # A failed/interrupted update must never leave an old ready marker in place.
@@ -698,6 +860,7 @@ PY
                     log "Removing stale git index.lock files"
                     find "${WORK_DIR}" -path '*/.git/index.lock' -type f -exec rm -f -- {} +
                 fi
+                validate_workspace_directory_aliases
                 if west update --fetch-opt=--filter=tree:0 2>&1 | tee "${west_update_log}"; then
                     WEST_UPDATE_FAILED=0
                     break
@@ -705,8 +868,13 @@ PY
                 WEST_UPDATE_FAILED=1
             done
             if [ "${WEST_UPDATE_FAILED}" = "1" ]; then
-                WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
                 log "west update failed after ${WEST_UPDATE_ATTEMPTS} attempt(s); checking explicit module inputs before continuing"
+                if [ "$(west_update_last_line "${west_update_log}")" = \
+                    "ERROR: update failed for multiple projects; see above" ]; then
+                    diagnose_west_update_projects
+                else
+                    WEST_UPDATE_FAILED_PROJECTS="$(west_update_failed_projects "${west_update_log}")"
+                fi
             fi
             rm -f "${west_update_log}"
             west zephyr-export || true
@@ -759,6 +927,7 @@ EOF
             [ -n "${mod}" ] || continue
             name="$(basename "${mod}")"
             if project_path="$(project_path_for_name "${name}")"; then
+                validate_overlay_destination "${name}" "${project_path}"
                 log "Overlaying module input west project: ${name} -> ${project_path}"
                 backup_module_input_overlay_project "${name}" "${project_path}"
                 # Record recovery before the first destination mutation, including partial copy failures.
@@ -1311,18 +1480,18 @@ BUILD_JOBS="${ZMK_BUILD_JOBS:-1}"
 MODULES=()
 
 clean_artifacts() {
-    mkdir -p "${SCRIPT_DIR}/.build"
+    mkdir -p "${SCRIPT_DIR}/.build" || return 1
     (
-        cd "${SCRIPT_DIR}/.build"
+        cd "${SCRIPT_DIR}/.build" || return 1
         shopt -s nullglob dotglob
         for entry in * .*; do
             case "${entry}" in
                 .|..|.gitkeep) continue ;;
             esac
-            rm -rf "${entry}"
+            rm -rf -- "${entry}" || return 1
         done
-    )
-    touch "${SCRIPT_DIR}/.build/.gitkeep"
+    ) || return 1
+    touch "${SCRIPT_DIR}/.build/.gitkeep" || return 1
     echo -e "${GREEN}Cleaned .build artifacts.${NC}"
 }
 
@@ -1705,7 +1874,7 @@ is_excluded_source_root() {
 # Returns 1 when the list cannot be used, so that the caller copies the whole directory: ZMK_COPY_IGNORED=1, no git,
 # not a Git working tree, git failing (for example "dubious ownership"), or no file left.
 git_visible_file_list() {
-    local dir="$1" out="$2" raw file
+    local dir="$1" out="$2" raw file nested nested_file status=0 root_filter="${3:-1}"
     [ "${ZMK_COPY_IGNORED:-0}" != "1" ] || return 1
     command -v git >/dev/null 2>&1 || return 1
     # BSD tar supports --null but omits it from its short help; probe an empty file list instead.
@@ -1719,12 +1888,27 @@ git_visible_file_list() {
     fi
     # A tracked file deleted from the work tree is still listed; tar would fail on it.
     while IFS= read -r -d '' file; do
-        if ! is_excluded_source_root "${file}" && { [ -e "${dir}/${file}" ] || [ -L "${dir}/${file}" ]; }; then
-            printf './%s\0' "${file}"
+        if { [ "${root_filter}" = 0 ] || ! is_excluded_source_root "${file}"; } && { [ -e "${dir}/${file}" ] || [ -L "${dir}/${file}" ]; }; then
+            if [ -d "${dir}/${file}" ] && [ ! -L "${dir}/${file}" ]; then
+                # Git emits gitlinks as directories. Never let tar recurse past
+                # their own tracked/nonignored selection boundary.
+                [ -e "${dir}/${file}/.git" ] || continue
+                nested="${out}.submodule"
+                if git_visible_file_list "${dir}/${file}" "${nested}" 0; then
+                    while IFS= read -r -d '' nested_file; do
+                        printf './%s/%s\0' "${file}" "${nested_file#./}"
+                    done < "${nested}"
+                elif [ -e "${dir}/${file}/.git" ]; then
+                    status=1
+                fi
+                rm -f "${nested}"
+            else
+                printf './%s\0' "${file}"
+            fi
         fi
     done <"${raw}" >"${out}"
     rm -f "${raw}"
-    [ -s "${out}" ]
+    [ "${status}" = 0 ] && { [ -s "${out}" ] || [ "${root_filter}" = 0 ]; }
 }
 
 # Write ${dir} as a tar stream. A Git working tree is copied without the files its ignore rules match (artifacts/,

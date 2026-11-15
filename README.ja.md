@@ -264,6 +264,7 @@ build fileが `zephyr/` 配下だけにあるmoduleも、metadataを検証しま
 
 Git working tree では tracked と ignore されない untracked file を copy します。
 削除済み tracked file は除き、ignore に一致する tracked file は保持します。
+checkout 済み submodule も、それぞれの tracked / ignore されない file 選択を再帰的に適用します。
 `ZMK_COPY_IGNORED=1`、Git が使えない場合、一覧取得失敗・空一覧、非 working tree では、固定除外つきの全 copy に戻します。
 
 常に `.git` / `.west` / `__pycache__` と、top-level の `.zmk` / `.build` / `.cache` / `.ccache` /
@@ -344,9 +345,21 @@ sourceとapplicationごとに専用volumeを使います。
 
 container は west workspace を再利用し、そこへは `config/` だけを同期します。
 ZMK は fresh な container source の `ZMK_CONFIG=/root/zmk-config/config` を使います。
-依存の再利用判定は import を含む resolved manifest で行います。update の失敗・中断後は再試行し、
+依存の再利用判定は import を含む resolved manifest と、local group filter を含む有効な active project
+選択で行います。旧形式の ready 記録は依存 update によって再検証します。update の失敗・中断後は再試行し、
 解決できない manifest を ready と記録しません。古い workspace root の整理は、overlay 復元後に
 完全な project 一覧を取得できた場合だけ行います。復元失敗ではbuildを止め、backupと復旧記録を保持します。
+project / overlay の宛先は symlink の親を経由しても物理的に workspace 内に収まる必要があります。
+workspace 内の別名で参照する active project の物理 root と中間の別名も整理時に保持します。
+依存 update の前には毎回、現在解決できる graph 外も含む workspace 内の既存 directory 別名を
+すべて保守的に検証します。import が update 中に新しい project path を導入する場合にも備え、
+workspace 外へ逃げる別名があれば build を停止します。
+最後の `west update` 要約に失敗した project 名がない場合は、`ZMK_WEST_UPDATE_ATTEMPTS` 回の
+一括試行後に、active な全 project を対象とする診断をもう1周行います。一時的な resolved manifest と
+local 設定を使い、workspace の設定は変更しません。完全な project 選択が前後で一致し、各 command の
+終了値と最後の失敗名を確認できる必要があります。update 失敗後の継続には、その最終診断で失敗した
+全 project に明示的な `-m` 入力が必要です。overlay によって上流の依存 cache を ready と記録せず、
+特定できない失敗では build を止めます。
 overlay の復元完了は project ごとに記録してから backup を削除します。後続 project の失敗後も、
 先に復元した project を削除せず再試行できます。既存の2列の復旧記録も扱います。
 
@@ -439,7 +452,9 @@ validate の結果は `build` を `validate` に置き換えます。両 mode �
 別の directory から確認するときは run path を指定します。
 探索の失敗・不完全な列挙はエラーとし、取得不能な証跡の代わりに古い成功 run を選びません。
 run 名は上記の規則に従い、衝突時だけ 2 から始まる `-N` を付けます。自動選択では日時と config 表示名を並べ、
-同じ表示名の summary に記録した連番を数値として扱います。実行を特定する場合は run path を明示します。
+同じ表示名の summary に記録した連番を数値として扱います。選択対象と同じ日時または後の日時に
+未完了 run があれば自動検証を拒否します。連番 metadata がない同秒の数値付き表示名は判別できないため、
+特定の完了結果を検証する場合は run path を明示します。
 日時のみ、旧 `-N`、旧 `-pid-PID`、連番 metadata のない旧 dot 区切りの directory も検証できます。
 fallback は summary に記録し、記録のない旧 summary は `bin` と解釈します。
 
