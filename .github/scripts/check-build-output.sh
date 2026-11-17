@@ -457,6 +457,18 @@ case "${mode}" in
         [ "${source_status}" = 0 ] || status=1
         publish_report "$2" "${status}" || status=1 ;;
     esac
+    if [ "${mode}" = ci-tests ] && [ "${status}" != 0 ]; then
+      failure_line="$(LC_ALL=C awk '
+        { sub(/\r$/, "") }
+        /^\[output-contract\] failure line: [1-9][0-9]*$/ {
+          matches++; if (length($NF) <= 6) line = $NF
+        }
+        END { if (matches == 1) print line }
+      ' "${ci_execution}/command.log")" || failure_line=
+      if public_source_line "${failure_line}"; then
+        printf 'Output contract failure line: %s\n' "${failure_line}"
+      fi
+    fi
     printf '%s\n' "${status}" > "${ci_execution}/exit.status"
     if [ "${status}" = 0 ]; then
       echo 'Verification command completed successfully.'

@@ -28,6 +28,7 @@ cleanup() {
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
+trap 'output_contract_status=$? output_contract_line=$LINENO; printf "[output-contract] failure line: %s\n" "${output_contract_line}" >&2; exit "${output_contract_status}"' ERR
 
 reset_case() {
   rm -rf "${case_root}"
@@ -982,6 +983,32 @@ for expected in 23 0; do
   if grep -Eq 'synthetic-private-host|/synthetic/private|private-device|secret=' "${ci_root}/.build/public/build.txt"; then exit 1; fi
 done
 [ "$(find "${ci_root}/.build" -name command.log -type f | wc -l | tr -d '[:space:]')" = 4 ]
+
+cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${TEST_FAILURE_MARKER}"
+echo 'synthetic-private-host /synthetic/private secret=value' >&2
+exit 1
+EOF
+for marker in valid cr zero oversized duplicate private; do
+  failure_marker='[output-contract] failure line: 42'
+  case "${marker}" in
+    cr) failure_marker="${failure_marker}"$'\r' ;;
+    zero) failure_marker='[output-contract] failure line: 0' ;;
+    oversized) failure_marker='[output-contract] failure line: 9999999' ;;
+    duplicate) failure_marker="${failure_marker}"$'\n'"${failure_marker}" ;;
+    private) failure_marker='[output-contract] failure line: /synthetic/private secret=value' ;;
+  esac
+  if (cd "${ci_root}"; ZMK_TEST_PROFILE=0 TEST_FAILURE_MARKER="${failure_marker}" \
+      bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/failure-line-console" 2>&1; then
+    echo 'output diagnostic hid the original test failure' >&2; exit 1
+  fi
+  case "${marker}" in
+    valid|cr) grep -qx 'Output contract failure line: 42' "${tmp_dir}/failure-line-console" ;;
+    *) if grep '^Output contract failure line:' "${tmp_dir}/failure-line-console" >/dev/null; then exit 1; fi ;;
+  esac
+  if grep -Eq 'synthetic-private|/synthetic/private|secret=' "${tmp_dir}/failure-line-console"; then exit 1; fi
+done
 
 cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
 #!/usr/bin/env bash
