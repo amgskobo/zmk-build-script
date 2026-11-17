@@ -129,6 +129,18 @@ class ContainerContracts(unittest.TestCase):
         self.expect_targets({'application': '.', 'board': 'A'}, [target('A-zmk')])
         self.assertFalse((self.root / 'zephyr/module.yml').exists())
 
+    def test_hosted_clean_lane_requires_pristine(self):
+        workflow = yaml.load(pathlib.Path('/tmp/workflows/compatibility.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        job = workflow['jobs']['docker']
+        self.assertEqual(job.get('env', {}).get('ZMK_TEST_PRISTINE'), '1',
+                         'hosted Docker and firmware checks must exercise pristine')
+        commands = [step.get('run') for step in job['steps']]
+        self.assertIn('bash .github/scripts/check-build-output.sh ci-tests docker', commands)
+        self.assertIn('bash .github/scripts/check-build-output.sh ci-tests build', commands)
+        for step in job['steps']:
+            self.assertNotIn('ZMK_TEST_PRISTINE', step.get('env', {}))
+
     def test_external_workflow_forwards_pristine_in_both_modes(self):
         workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
         steps = [step for step in workflow['jobs']['build-runner']['steps']

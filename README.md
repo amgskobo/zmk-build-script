@@ -658,12 +658,13 @@ bash .github/scripts/test.sh all
 | Layer | Scope |
 | --- | --- |
 | `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module and temporary paths with spaces/Unicode, literal option-like/shell-character/emoji filenames, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
-| `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
-| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
+| `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Build/validate must reject pristine with running or stopped cache holders. The pristine lane also checks validation recovery after releasing its own holders and removal of stale workspace/ccache state. Uses the image's Python/PyYAML. |
+| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. The pristine lane seeds stale workspace/ccache state before the standard build and verifies its removal. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run independent shell cases alongside the ordered Docker contracts and firmware chain. |
 
 Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
-Ubuntu. Manual self-hosted `mode=validate` runs `shell` and `docker`;
+Ubuntu with `ZMK_TEST_PRISTINE=1` required for both Docker and firmware checks.
+Manual self-hosted `mode=validate` runs `shell` and `docker`;
 `mode=build` runs `all` on each selected native host. Use the latter for native
 Docker firmware coverage: a shell or validate result alone does not establish it.
 `mode=firmware` selects the existing `build` layer for focused firmware/concurrency
@@ -768,7 +769,11 @@ The self-hosted workflow supplies a repository/OS prefix. Jobs for the same OS a
 serialized to protect that cache; different OS jobs remain independent. It prints
 only fixed numeric Docker CPU/memory capacity and presence of an existing cache
 override. Host/device identifiers and actual cache names stay in private evidence.
-`ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while
-restoration always retains it. Each build/validate result is checked immediately
+`ZMK_TEST_PRISTINE=1` tests a reset after the Docker cache-holder rejection cases
+and before the standard firmware build, including removal of seeded stale state
+at the volume root, in the workspace and in ccache. Restoration always retains
+the cache. `ZMK_TEST_PRISTINE=0` selects reuse checks; its success does not establish
+pristine success. Tests release only their own acquired container references and
+reject unknown holders. Each build/validate result is checked immediately
 using its exact run directory. Report local, remote CI, host-platform and physical
 hardware evidence separately. Publication requires an explicit user instruction.

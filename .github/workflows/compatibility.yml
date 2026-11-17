@@ -46,6 +46,8 @@ jobs:
     name: Docker contracts and firmware
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      ZMK_TEST_PRISTINE: '1'
     defaults:
       run:
         shell: bash

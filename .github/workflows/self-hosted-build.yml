@@ -16,7 +16,7 @@ on:
         options: [validate, build, firmware]
         default: validate
       pristine:
-        description: Reset the dedicated test cache before the standard build
+        description: Reset the dedicated test cache for pristine validation and standard build
         required: true
         type: boolean
         default: true
