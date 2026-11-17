@@ -1179,6 +1179,7 @@ external_diagnostic_bin="${tmp_dir}/external-diagnostic-bin"
 mkdir "${external_diagnostic_bin}"
 cat > "${external_diagnostic_bin}/docker" <<'EOF'
 #!/usr/bin/env bash
+[ "${MSYS_NO_PATHCONV:-}" = 1 ] && [ "${MSYS2_ARG_CONV_EXCL:-}" = '*' ] || exit 29
 case "$1" in
   info) printf '%s\r\n' "${DIAGNOSTIC_PLATFORM}" ;;
   ps)
@@ -1191,17 +1192,30 @@ case "$1" in
 esac
 EOF
 chmod +x "${external_diagnostic_bin}/docker"
+cat > "${external_diagnostic_bin}/cat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${DIAGNOSTIC_CAT_NORMALIZE:-0}" = 1 ]; then
+  "${DIAGNOSTIC_REAL_CAT}" "$@" | tr -d '\r'
+else
+  exec "${DIAGNOSTIC_REAL_CAT}" "$@"
+fi
+EOF
+chmod +x "${external_diagnostic_bin}/cat"
+diagnostic_real_cat="$(command -v cat)"
 printf 'Status: FAILED\nMode: build\nReason: cache reset failed\nDocker image: zmkfirmware/zmk-build-arm:3.5-branch\n' \
   > "${ci_root}/.build/${run_name}/build-summary.txt"
-for probe in holders empty failed malformed nul unknown-platform; do
-  diagnostic_users=1 diagnostic_ps_status=0 diagnostic_platform=linux/x86_64 expected_users=1 expected_platform=linux-amd64
+for probe in holders normalized-cat empty failed malformed nul unknown-platform; do
+  diagnostic_users=1 diagnostic_ps_status=0 diagnostic_platform=linux/x86_64 expected_users=1 expected_platform=linux-amd64 diagnostic_cat_normalize=0
   case "${probe}" in
+    normalized-cat) diagnostic_cat_normalize=1 ;;
     empty) diagnostic_users=0 expected_users=0 ;;
     failed) diagnostic_ps_status=23 expected_users=unavailable ;;
     malformed|nul) diagnostic_users="${probe}" expected_users=unavailable ;;
     unknown-platform) diagnostic_platform='synthetic-private-host /synthetic/private secret=value'; expected_platform=unavailable ;;
   esac
   (cd "${ci_root}"; PATH="${external_diagnostic_bin}:${PATH}" DIAGNOSTIC_PLATFORM="${diagnostic_platform}" \
+    DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_CAT_NORMALIZE="${diagnostic_cat_normalize}" \
     DIAGNOSTIC_USERS="${diagnostic_users}" DIAGNOSTIC_PS_STATUS="${diagnostic_ps_status}" DIAGNOSTIC_ARGV="${tmp_dir}/diagnostic.argv" \
     bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/diagnostic-console" 2>&1
   grep -qx 'External diagnostic phase: cache-reset' "${tmp_dir}/diagnostic-console"

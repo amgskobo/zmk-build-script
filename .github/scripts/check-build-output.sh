@@ -319,15 +319,20 @@ external_diagnostics() {
       case "${image}" in stable|legacy-3.5|zephyr-4.1|other) ;; *) image=unavailable ;; esac
     fi
   fi
-  if docker info --format '{{.OSType}}/{{.Architecture}}' > "${directory}/docker-platform.txt" 2>> "${directory}/command.log"; then
-    record="$(cat "${directory}/docker-platform.txt")" || return 1
-    if cmp -s "${directory}/docker-platform.txt" <(printf '%s\n' "${record}"); then
-      case "${record%$'\r'}" in
-        linux/amd64|linux/x86_64) platform=linux-amd64 ;;
-        linux/arm64|linux/aarch64) platform=linux-arm64 ;;
-        linux/arm/v7|linux/armv7l) platform=linux-armv7 ;;
-      esac
-    fi
+  if MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker info --format '{{.OSType}}/{{.Architecture}}' \
+      > "${directory}/docker-platform.txt" 2>> "${directory}/command.log"; then
+    # Compare complete known byte records directly: a text-mode cat can strip
+    # CR on Windows, while shell substitution can discard NUL or final newlines.
+    for record in linux/amd64 linux/x86_64 linux/arm64 linux/aarch64 linux/arm/v7 linux/armv7l; do
+      if cmp -s "${directory}/docker-platform.txt" <(printf '%s\n' "${record}") ||
+          cmp -s "${directory}/docker-platform.txt" <(printf '%s\r\n' "${record}"); then
+        case "${record}" in
+          linux/amd64|linux/x86_64) platform=linux-amd64 ;;
+          linux/arm64|linux/aarch64) platform=linux-arm64 ;;
+          linux/arm/v7|linux/armv7l) platform=linux-armv7 ;;
+        esac
+      fi
+    done
   fi
   if source_file="$(cat .build/ci-source-file 2>> "${directory}/command.log")" &&
       bash "${repo_root}/scripts/auto-build-external.sh" --list --sources-file "${source_file}" --source-index "${index}" \
@@ -338,7 +343,8 @@ external_diagnostics() {
       case "${cache}" in
         ''|*[!A-Za-z0-9_.-]*) ;;
         *)
-          if docker ps -aq --no-trunc --filter "volume=${cache}" > "${directory}/cache-users.txt" 2>> "${directory}/command.log"; then
+          if MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker ps -aq --no-trunc --filter "volume=${cache}" \
+              > "${directory}/cache-users.txt" 2>> "${directory}/command.log"; then
             count=0 valid=1
             LC_ALL=C tr -d '\000' < "${directory}/cache-users.txt" > "${directory}/cache-users.checked" || return 1
             cmp -s "${directory}/cache-users.txt" "${directory}/cache-users.checked" || valid=0

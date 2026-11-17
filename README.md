@@ -592,8 +592,9 @@ Check online/busy state, labels and registration scope. Remove
 ### Public reports and CI helpers
 
 CI publishes only fixed-field text reports under `.build/public/`. These contain
-the command outcome and recognized test statuses. A host or output-contract test failure can also
-include a validated numeric source line, without raw error text. Raw environment
+the command outcome and recognized test statuses. A host test failure can also
+include a validated numeric source line. Output-contract failures can print a
+validated numeric source line in the CI log. Neither includes raw error text. Raw environment
 records, paths, source labels, runner names, logs and firmware are excluded from automatic
 uploads. External jobs use a numeric source index in their public names.
 These reports are sanitized copies, separate from the raw evidence. On hosted
