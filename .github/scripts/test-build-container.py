@@ -177,6 +177,35 @@ class ContainerContracts(unittest.TestCase):
                             self.assertNotIn('unselected.git', (self.root / record).read_text())
                             self.assertNotIn(source, result.stdout.decode())
 
+    def test_external_workflow_selects_platform_and_original_source_privately(self):
+        workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+        inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(inputs['platform']['type'], 'choice')
+        self.assertEqual(inputs['platform']['options'], ['auto', 'macos', 'windows', 'linux'])
+        self.assertEqual(inputs['platform']['default'], 'auto')
+        self.assertEqual(inputs['source_index']['type'], 'string')
+        self.assertEqual(inputs['source_index']['default'], '')
+        resolver = workflow['jobs']['sources']
+        self.assertEqual(resolver['outputs']['runner_labels'], '${{ steps.resolve.outputs.runner_labels }}')
+        prepare = next(s for s in resolver['steps'] if s.get('name') == 'Prepare private source selector')
+        self.assertIn("'.build/ci-source-index'", prepare['with']['script'])
+        self.assertIn("'.build/ci-runner-platform'", prepare['with']['script'])
+        self.assertIn('source_index', prepare['with']['script'])
+        self.assertIn('platform', prepare['with']['script'])
+        self.assertEqual(workflow['jobs']['build-runner']['runs-on'],
+                         '${{ fromJSON(needs.sources.outputs.runner_labels) }}')
+        self.assertEqual(workflow['on']['schedule'], [{'cron': '13 0 * * *'}])
+        self.assertEqual(workflow['jobs']['build-runner']['timeout-minutes'], '180')
+        steps = workflow['jobs']['build-runner']['steps']
+        diagnostics = [s for s in steps if s.get('name', '').startswith('Inspect external failure (')]
+        self.assertEqual(len(diagnostics), 2)
+        for step in diagnostics:
+            self.assertIn('failure()', step['if'])
+            self.assertEqual(step['env'], {'SOURCE_INDEX': '${{ matrix.source.index }}'})
+            self.assertEqual(step['run'], 'bash .github/scripts/check-build-output.sh ci-diagnostics "${SOURCE_INDEX}" "${EXTERNAL_MODE}"')
+        self.assertLess(steps.index(diagnostics[-1]),
+                        next(i for i, s in enumerate(steps) if s.get('name') == 'Preserve private evidence (Unix)'))
+
     def test_external_clone_pins_commit_after_default_branch_advances(self):
         # Run the production clone command with real Git. Only Docker transport is local.
         source_tree = pathlib.Path('/tmp/source')

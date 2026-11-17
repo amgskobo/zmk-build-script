@@ -502,6 +502,12 @@ self-hosted runner は信頼できる workflow に限定します。
 
 ### scheduleと並列数
 
+外部 workflow の手動実行では `platform: auto|macos|windows|linux` と任意の
+`source_index` を指定できます。既定の `auto` は利用可能な対象 runner を使い、OS を選ぶと
+必須の custom label を保持したまま標準の OS label を追加します。source index は解決した一覧から
+元の番号と固定 revision を保持して1件を選び、空欄では全件を選びます。
+定期実行は OS の自動割り当てと全件選択を維持します。
+
 外部 matrix は `runner.os` で Bash / Git Bash と artifact 名を選びます。
 `source_jobs` は matrix 並列数（既定 4）、`build_jobs` は target 並列数（既定 1）です。
 schedule は同じ既定値で pristine build を行います。cron は UTC、JST 換算は workflow comment に記載し、
@@ -543,6 +549,9 @@ archive は自動 upload の対象に含めず、hosted runner では一時的�
 外部 CI は `ci-matrix` と `ci-source-index N` を使い、workflow event から実行時に準備する非公開の
 `.build/ci-source-file` を読みます。selector は常に list file として扱い、不足する list は matrix 解決時に失敗させます。
 CI helper は呼び出し元の directory にかかわらず、この repository の root を基準に実行します。
+外部 job が失敗したときは archive 前に `ci-diagnostics INDEX build|validate` を実行し、
+許可した summary の失敗段階・image 系統、Docker architecture、対象 cache を保持する container 数だけを表示します。
+取得できない項目は `unavailable` とし、生のエラー、container ID、cache 名、path は非公開に保ちます。
 matrix と step の環境変数には数値 index だけを渡し、source の path / URL / slug は
 runner 自身の事前表示にも command 出力にも含めません。selector の準備には `actions/github-script` に付属する Node runtime を使い、
 local CLI の host 必須依存は増やしません。

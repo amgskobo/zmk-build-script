@@ -709,6 +709,49 @@ run_path="${case_root}/.build/${run_name}"
 run_ok validate "${run_path}"
 run_fail validate 'run directory' "${case_root}/../case..name/.build/${run_name}"
 
+# Diagnostics reuse validated metadata and never copy error text into public output.
+while IFS='|' read -r diagnostic_reason diagnostic_phase; do
+  reset_case
+  write_summary <<EOF
+Status: FAILED
+Mode: build
+Reason: ${diagnostic_reason}
+Docker image: zmkfirmware/zmk-build-arm:3.5-branch
+
+Failure excerpt
+Reason: synthetic-private-host /synthetic/private secret=value
+EOF
+  diagnostic="$(cd "${case_root}"; bash "${checker}" diagnostic build "${run_path}")"
+  [ "${diagnostic}" = "${diagnostic_phase}"$'\t'legacy-3.5 ]
+done <<'EOF'
+host setup failed|setup
+run directory reservation failed|reservation
+cache reset failed|cache-reset
+container creation failed|container-create
+container start failed|container-start
+manifest image selection failed|image-selection
+source copy failed|source-copy
+validation failed|validation
+firmware build failed|compile
+artifact copy failed|artifact-copy
+container cleanup failed|cleanup
+interrupted by TERM|interrupted
+synthetic-private-host /synthetic/private secret=value|unknown
+EOF
+printf 'Reason: cache reset failed\n' >> "${run_path}/build-summary.txt"
+# A log excerpt cannot replace the header's reason.
+diagnostic="$(cd "${case_root}"; bash "${checker}" diagnostic build "${run_path}")"
+[ "${diagnostic}" = unknown$'\t'legacy-3.5 ]
+printf 'Status: FAILED\nMode: build\nReason: cache reset failed\nReason: firmware build failed\n' > "${run_path}/build-summary.txt"
+if (cd "${case_root}"; bash "${checker}" diagnostic build "${run_path}") >/dev/null 2>&1; then
+  echo 'diagnostics accepted duplicate summary metadata' >&2; exit 1
+fi
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+EOF
+
 # Publication copies contain only fixed labels/statuses, never raw identities or binaries.
 mkdir -p "${case_root}/raw evidence"
 printf 'case\tstatus\tseconds\nsyntax\tPASS\t1\nfirmware\tFAIL(23)\t2\nsynthetic-private-host\tPASS\t3\n' \
@@ -1083,6 +1126,86 @@ printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
 grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/matrix-output"
 grep -qx 'Resolved source count: 2' "${tmp_dir}/matrix-summary"
 if grep -Eq '/synthetic/private|first|second' "${tmp_dir}/matrix-output" "${tmp_dir}/matrix-summary" "${tmp_dir}/matrix-console"; then exit 1; fi
+# Regression control: selecting one original source must not silently run the full list.
+printf '0002' > "${ci_root}/.build/ci-source-index"
+(cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/selected-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/selected-matrix-summary" \
+  bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/selected-matrix-console" 2>&1
+if ! grep -qx 'matrix={"include":\[{"index":2}\]}' "${tmp_dir}/selected-matrix-output"; then
+  echo 'CI matrix ignored the selected original source index' >&2; exit 1
+fi
+grep -qx 'Resolved source count: 1' "${tmp_dir}/selected-matrix-summary"
+for platform in auto macos windows linux; do
+  printf '%s' "${platform}" > "${ci_root}/.build/ci-runner-platform"
+  (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/platform-${platform}-output" GITHUB_STEP_SUMMARY="${tmp_dir}/platform-summary" \
+    bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/platform-console" 2>&1
+  case "${platform}" in
+    auto) labels='["self-hosted","zmk-docker","zmk-docker-active"]' ;;
+    macos) labels='["self-hosted","macOS","zmk-docker","zmk-docker-active"]' ;;
+    windows) labels='["self-hosted","Windows","zmk-docker","zmk-docker-active"]' ;;
+    linux) labels='["self-hosted","Linux","zmk-docker","zmk-docker-active"]' ;;
+  esac
+  grep -Fxq "runner_labels=${labels}" "${tmp_dir}/platform-${platform}-output"
+  grep -qx 'matrix={"include":\[{"index":2}\]}' "${tmp_dir}/platform-${platform}-output"
+done
+rm "${ci_root}/.build/ci-source-index" "${ci_root}/.build/ci-runner-platform"
+external_diagnostic_bin="${tmp_dir}/external-diagnostic-bin"
+mkdir "${external_diagnostic_bin}"
+cat > "${external_diagnostic_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  info) printf '%s\r\n' "${DIAGNOSTIC_PLATFORM}" ;;
+  ps)
+    printf '%s\0' "$@" > "${DIAGNOSTIC_ARGV}"
+    [ "${DIAGNOSTIC_USERS}" != 1 ] || printf '%064d\r\n' 1
+    [ "${DIAGNOSTIC_USERS}" != malformed ] || printf 'not-a-container-id\n'
+    [ "${DIAGNOSTIC_USERS}" != nul ] || printf '%064d\000\n' 1
+    exit "${DIAGNOSTIC_PS_STATUS}" ;;
+  *) exit 29 ;;
+esac
+EOF
+chmod +x "${external_diagnostic_bin}/docker"
+printf 'Status: FAILED\nMode: build\nReason: cache reset failed\nDocker image: zmkfirmware/zmk-build-arm:3.5-branch\n' \
+  > "${ci_root}/.build/${run_name}/build-summary.txt"
+for probe in holders empty failed malformed nul unknown-platform; do
+  diagnostic_users=1 diagnostic_ps_status=0 diagnostic_platform=linux/x86_64 expected_users=1 expected_platform=linux-amd64
+  case "${probe}" in
+    empty) diagnostic_users=0 expected_users=0 ;;
+    failed) diagnostic_ps_status=23 expected_users=unavailable ;;
+    malformed|nul) diagnostic_users="${probe}" expected_users=unavailable ;;
+    unknown-platform) diagnostic_platform='synthetic-private-host /synthetic/private secret=value'; expected_platform=unavailable ;;
+  esac
+  (cd "${ci_root}"; PATH="${external_diagnostic_bin}:${PATH}" DIAGNOSTIC_PLATFORM="${diagnostic_platform}" \
+    DIAGNOSTIC_USERS="${diagnostic_users}" DIAGNOSTIC_PS_STATUS="${diagnostic_ps_status}" DIAGNOSTIC_ARGV="${tmp_dir}/diagnostic.argv" \
+    bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/diagnostic-console" 2>&1
+  grep -qx 'External diagnostic phase: cache-reset' "${tmp_dir}/diagnostic-console"
+  grep -qx 'External diagnostic image: legacy-3.5' "${tmp_dir}/diagnostic-console"
+  grep -qx "External diagnostic docker-platform: ${expected_platform}" "${tmp_dir}/diagnostic-console"
+  grep -qx "External diagnostic cache-users: ${expected_users}" "${tmp_dir}/diagnostic-console"
+  cmp "${tmp_dir}/diagnostic.argv" <(printf '%s\0' ps -aq --no-trunc --filter volume=zmk-cache-external-second)
+  if grep -Eq 'synthetic-private|/synthetic/private|secret=|zmk-cache|0000000000' "${tmp_dir}/diagnostic-console"; then
+    echo 'external diagnostics disclosed raw data' >&2; exit 1
+  fi
+done
+printf 'Status: SUCCESS\nMode: build\nBuilt targets: 1\n' > "${ci_root}/.build/${run_name}/build-summary.txt"
+for selection in index-zero index-octal-zero index-negative index-missing index-newline index-nul platform-unknown platform-nul index-link; do
+  case "${selection}" in
+    index-zero) printf 0 > "${ci_root}/.build/ci-source-index" ;;
+    index-octal-zero) printf 00 > "${ci_root}/.build/ci-source-index" ;;
+    index-negative) printf -- -1 > "${ci_root}/.build/ci-source-index" ;;
+    index-missing) printf 3 > "${ci_root}/.build/ci-source-index" ;;
+    index-newline) printf '1\n2' > "${ci_root}/.build/ci-source-index" ;;
+    index-nul) printf '2\000' > "${ci_root}/.build/ci-source-index" ;;
+    platform-unknown) printf 'macOS' > "${ci_root}/.build/ci-runner-platform" ;;
+    platform-nul) printf 'macos\000' > "${ci_root}/.build/ci-runner-platform" ;;
+    index-link) MSYS=winsymlinks:sys ln -s "${ci_root}/sources.txt" "${ci_root}/.build/ci-source-index"; test -L "${ci_root}/.build/ci-source-index" ;;
+  esac
+  if (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/rejected-${selection}-output" GITHUB_STEP_SUMMARY="${tmp_dir}/rejected-summary" \
+      bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/rejected-console" 2>&1; then
+    echo "CI matrix accepted invalid private selection: ${selection}" >&2; exit 1
+  fi
+  [ ! -e "${tmp_dir}/rejected-${selection}-output" ]
+  rm -f "${ci_root}/.build/ci-source-index" "${ci_root}/.build/ci-runner-platform"
+done
 # A selector is always a list file, never an inferred source or a URL.
 for selector in missing-list.txt https://example.invalid/sources.txt; do
   printf '%s\n' "${selector}" > "${ci_root}/.build/ci-source-file"

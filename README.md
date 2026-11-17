@@ -575,6 +575,12 @@ Limit self-hosted execution to trusted workflows.
 
 ### Scheduling and parallelism
 
+Manual external runs accept `platform: auto|macos|windows|linux` and an optional
+`source_index`. The default `auto` permits any eligible runner; selecting an OS
+adds its standard label while retaining the required custom labels. A source index
+selects one entry from the resolved list with its original index and pinned revision;
+blank selects the full list. Scheduled runs retain automatic routing and the full list.
+
 External matrix jobs use `runner.os` for Bash/Git Bash selection and artifact
 names. `source_jobs` caps matrix parallelism (default 4); `build_jobs` controls
 target parallelism (default 1). Scheduled runs use these defaults and pristine
@@ -625,6 +631,10 @@ External CI uses `ci-matrix` and `ci-source-index N` with a private
 `.build/ci-source-file` selector prepared from the workflow event at runtime.
 The selector always names a list file; missing lists fail during matrix resolution.
 CI helpers operate from this repository's root regardless of the caller's directory.
+Failed external jobs run `ci-diagnostics INDEX build|validate` before archiving.
+It reports an allowlisted summary phase and image family, Docker architecture and
+the number of containers retaining that source's cache. Unavailable observations
+remain `unavailable`; raw errors, container IDs, cache names and paths stay private.
 Only numeric indices enter the matrix and step environment; source paths, URLs
 and slugs stay out of runner-generated step details as well as command output.
 The selector preparation uses the Node runtime bundled with `actions/github-script`;
