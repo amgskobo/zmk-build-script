@@ -2,6 +2,7 @@
 set -euo pipefail
 # Synthetic coordinator fixtures choose their cache policy explicitly.
 export ZMK_TEST_CACHE_PREFIX=
+export ZMK_EXTERNAL_CACHE_PREFIX= GITHUB_ACTIONS= GITHUB_REPOSITORY= GITHUB_REF=
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 checker="${repo_root}/.github/scripts/check-build-output.sh"
@@ -956,6 +957,7 @@ cp "${checker}" "${ci_root}/.github/scripts/check-build-output.sh"
 cat > "${ci_root}/scripts/build-external-source.sh" <<'EOF'
 #!/usr/bin/env bash
 echo 'synthetic-private-host /synthetic/private/source secret=value'
+[ -z "${CACHE_PREFIX_CAPTURE:-}" ] || printf '%s' "${ZMK_EXTERNAL_CACHE_PREFIX:-zmk-cache-external}" > "${CACHE_PREFIX_CAPTURE}"
 [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo 'private source identity' >> "${GITHUB_STEP_SUMMARY}"
 exit "${PUBLIC_PROBE_EXIT}"
 EOF
@@ -1226,6 +1228,105 @@ for probe in holders normalized-cat empty failed malformed nul unknown-platform;
   if grep -Eq 'synthetic-private|/synthetic/private|secret=|zmk-cache|0000000000' "${tmp_dir}/diagnostic-console"; then
     echo 'external diagnostics disclosed raw data' >&2; exit 1
   fi
+done
+# CI caches are stable within a repository/ref and distinct across refs/forks.
+# The same wrapper entry and diagnostic selector must receive the same prefix.
+for scoped_case in main repeated topic tag fork direct explicit local; do
+  scoped_repo=synthetic-owner/project scoped_ref=refs/heads/main scoped_actions=true scoped_prefix=
+  scoped_args=(ci-source-index 2)
+  case "${scoped_case}" in
+    topic) scoped_ref=refs/heads/synthetic-private-topic ;;
+    tag) scoped_ref=refs/tags/synthetic-private-topic ;;
+    fork) scoped_repo=synthetic-fork/project ;;
+    direct) scoped_args=(ci-source --path /synthetic/private/second) ;;
+    explicit) scoped_repo= scoped_ref= scoped_prefix=synthetic-explicit-prefix ;;
+    local) scoped_actions= ;;
+  esac
+  (cd "${ci_root}"; GITHUB_ACTIONS="${scoped_actions}" GITHUB_REPOSITORY="${scoped_repo}" GITHUB_REF="${scoped_ref}" \
+    GITHUB_RUN_ID="${scoped_case}" ZMK_EXTERNAL_CACHE_PREFIX="${scoped_prefix}" PUBLIC_PROBE_EXIT=0 \
+    CACHE_PREFIX_CAPTURE="${tmp_dir}/cache-${scoped_case}" \
+    bash .github/scripts/check-build-output.sh "${scoped_args[@]}") > "${tmp_dir}/cache-${scoped_case}-console" 2>&1
+  scoped_actual="$(cat "${tmp_dir}/cache-${scoped_case}")"
+  case "${scoped_case}" in
+    explicit) [ "${scoped_actual}" = synthetic-explicit-prefix ] ;;
+    local) [ "${scoped_actual}" = zmk-cache-external ] ;;
+    *)
+      case "${scoped_actual}" in zmk-cache-external-ci-*) ;; *) echo 'CI external cache lacks a repository/ref namespace' >&2; exit 1 ;; esac
+      scoped_hash="${scoped_actual#zmk-cache-external-ci-}"
+      case "${scoped_hash}" in ''|*[!0-9a-f]*) exit 1 ;; esac
+      case "${#scoped_hash}" in 40|64) ;; *) exit 1 ;; esac ;;
+  esac
+  (cd "${ci_root}"; PATH="${external_diagnostic_bin}:${PATH}" DIAGNOSTIC_PLATFORM=linux/x86_64 \
+    DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_CAT_NORMALIZE=0 DIAGNOSTIC_USERS=0 DIAGNOSTIC_PS_STATUS=0 \
+    DIAGNOSTIC_ARGV="${tmp_dir}/cache-${scoped_case}.argv" GITHUB_ACTIONS="${scoped_actions}" \
+    GITHUB_REPOSITORY="${scoped_repo}" GITHUB_REF="${scoped_ref}" ZMK_EXTERNAL_CACHE_PREFIX="${scoped_prefix}" \
+    bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/cache-${scoped_case}-diagnostic" 2>&1
+  cmp "${tmp_dir}/cache-${scoped_case}.argv" <(printf '%s\0' ps -aq --no-trunc --filter "volume=${scoped_actual}-second")
+  if grep -Eq 'synthetic-owner|synthetic-fork|synthetic-private-topic|synthetic-explicit|zmk-cache' \
+      "${tmp_dir}/cache-${scoped_case}-console" "${tmp_dir}/cache-${scoped_case}-diagnostic"; then
+    echo 'CI cache scope disclosed raw namespace data' >&2; exit 1
+  fi
+done
+cmp "${tmp_dir}/cache-main" "${tmp_dir}/cache-repeated"
+cmp "${tmp_dir}/cache-main" "${tmp_dir}/cache-direct"
+for scoped_case in topic tag fork; do
+  if cmp -s "${tmp_dir}/cache-main" "${tmp_dir}/cache-${scoped_case}"; then
+    echo 'CI external cache shares a namespace across refs or repositories' >&2; exit 1
+  fi
+done
+if cmp -s "${tmp_dir}/cache-topic" "${tmp_dir}/cache-tag"; then
+  echo 'CI external cache conflates branch and tag refs' >&2; exit 1
+fi
+
+# Hashing failures and incomplete/malformed context must not fall back to a shared cache.
+cache_git_bin="${tmp_dir}/cache-git-bin"
+mkdir "${cache_git_bin}"
+cat > "${cache_git_bin}/git" <<'EOF'
+#!/usr/bin/env bash
+[ "$*" = 'hash-object --stdin' ] || exit 29
+cat >/dev/null
+case "${CACHE_GIT_PROBE}" in
+  failed) echo 'synthetic-private-host /synthetic/private secret=value' >&2; exit 23 ;;
+  failed-after-output) printf '%040d\n' 1; exit 23 ;;
+  invalid) printf 'not-a-hash\n' ;;
+  nul) printf '%040d\000\n' 1 ;;
+  duplicate) printf '%040d\n%040d\n' 1 2 ;;
+  crlf) printf '%040d\r\n' 1 ;;
+  sha256) printf '%064d\n' 1 ;;
+esac
+EOF
+chmod +x "${cache_git_bin}/git"
+for cache_probe in missing-repo missing-ref failed failed-after-output invalid nul duplicate crlf sha256; do
+  cache_repo=synthetic-owner/project cache_ref=refs/heads/synthetic-private-topic cache_path="${cache_git_bin}:${PATH}"
+  case "${cache_probe}" in
+    missing-repo) cache_repo= ;;
+    missing-ref) cache_ref= ;;
+  esac
+  rm -f "${tmp_dir}/cache-probe-started"
+  if (cd "${ci_root}"; PATH="${cache_path}" CACHE_GIT_PROBE="${cache_probe}" GITHUB_ACTIONS=true \
+    GITHUB_REPOSITORY="${cache_repo}" GITHUB_REF="${cache_ref}" PUBLIC_PROBE_EXIT=0 \
+    CACHE_PREFIX_CAPTURE="${tmp_dir}/cache-probe-started" \
+    bash .github/scripts/check-build-output.sh ci-source-index 2) > "${tmp_dir}/cache-probe-console" 2>&1; then cache_status=0; else cache_status=$?; fi
+  if [ "${cache_probe}" = crlf ]; then
+    [ "${cache_status}" = 0 ]
+    cmp "${tmp_dir}/cache-probe-started" <(printf 'zmk-cache-external-ci-%040d' 1)
+  elif [ "${cache_probe}" = sha256 ]; then
+    [ "${cache_status}" = 0 ]
+    cmp "${tmp_dir}/cache-probe-started" <(printf 'zmk-cache-external-ci-%064d' 1)
+  else
+    [ "${cache_status}" != 0 ] && [ ! -e "${tmp_dir}/cache-probe-started" ]
+    case "${cache_probe}" in failed|failed-after-output) [ "${cache_status}" = 23 ] ;; esac
+    rm -f "${tmp_dir}/cache-probe-diagnostic.argv"
+    (cd "${ci_root}"; PATH="${cache_git_bin}:${external_diagnostic_bin}:${PATH}" \
+      DIAGNOSTIC_PLATFORM=linux/x86_64 DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_CAT_NORMALIZE=0 \
+      DIAGNOSTIC_USERS=0 DIAGNOSTIC_PS_STATUS=0 DIAGNOSTIC_ARGV="${tmp_dir}/cache-probe-diagnostic.argv" \
+      CACHE_GIT_PROBE="${cache_probe}" GITHUB_ACTIONS=true GITHUB_REPOSITORY="${cache_repo}" GITHUB_REF="${cache_ref}" \
+      bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/cache-probe-diagnostic" 2>&1
+    [ ! -e "${tmp_dir}/cache-probe-diagnostic.argv" ]
+    grep -qx 'External diagnostic cache-users: unavailable' "${tmp_dir}/cache-probe-diagnostic"
+    if grep -Eq 'synthetic-private|/synthetic/private|secret=|synthetic-owner|refs/heads' "${tmp_dir}/cache-probe-diagnostic"; then exit 1; fi
+  fi
+  if grep -Eq 'synthetic-private|/synthetic/private|secret=|synthetic-owner|refs/heads' "${tmp_dir}/cache-probe-console"; then exit 1; fi
 done
 printf 'Status: SUCCESS\nMode: build\nBuilt targets: 1\n' > "${ci_root}/.build/${run_name}/build-summary.txt"
 for selection in index-zero index-octal-zero index-negative index-missing index-newline index-nul platform-unknown platform-nul index-link; do

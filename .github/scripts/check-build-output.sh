@@ -291,6 +291,32 @@ read_ci_selection() {
   fi
 }
 
+configure_external_ci_cache() {
+  local scope="" receipt="${1}/cache-scope.txt"
+  # An explicit prefix remains the runner owner's override. Local CLI helpers
+  # retain their existing defaults; only GitHub Actions gets ref isolation.
+  [ -z "${ZMK_EXTERNAL_CACHE_PREFIX:-}" ] || return 0
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  if [ -z "${GITHUB_REPOSITORY:-}" ] || [ -z "${GITHUB_REF:-}" ]; then
+    echo 'CI cache context is incomplete.' >&2
+    return 1
+  fi
+  # Full refs distinguish heads/tags/PR refs. NUL fields prevent concatenation
+  # ambiguities, and the opaque digest keeps repository/ref text out of names.
+  printf '%s\0%s\0' "${GITHUB_REPOSITORY}" "${GITHUB_REF}" |
+    git hash-object --stdin > "${receipt}" || return "$?"
+  IFS= read -r scope < "${receipt}" || true
+  scope="${scope%$'\r'}"
+  case "${scope}" in ''|*[!0-9a-f]*) echo 'Invalid CI cache scope.' >&2; return 1 ;; esac
+  case "${#scope}" in 40|64) ;; *) echo 'Invalid CI cache scope.' >&2; return 1 ;; esac
+  if ! cmp -s "${receipt}" <(printf '%s\n' "${scope}") &&
+      ! cmp -s "${receipt}" <(printf '%s\r\n' "${scope}"); then
+    echo 'Invalid CI cache scope record.' >&2
+    return 1
+  fi
+  export ZMK_EXTERNAL_CACHE_PREFIX="zmk-cache-external-ci-${scope}"
+}
+
 run_indexed_source() {
   local index="$1" source_file
   local args=()
@@ -334,7 +360,8 @@ external_diagnostics() {
       fi
     done
   fi
-  if source_file="$(cat .build/ci-source-file 2>> "${directory}/command.log")" &&
+  if configure_external_ci_cache "${directory}" 2>> "${directory}/command.log" &&
+      source_file="$(cat .build/ci-source-file 2>> "${directory}/command.log")" &&
       bash "${repo_root}/scripts/auto-build-external.sh" --list --sources-file "${source_file}" --source-index "${index}" \
         > "${directory}/selection.tsv" 2>> "${directory}/command.log"; then
     # Only the first two generated fields are needed. The source value after
@@ -447,14 +474,15 @@ case "${mode}" in
         shift
         printf '1\n' > .build/ci-source.status
         printf '%s\n' "${ci_execution}/command.log" > .build/ci-source.record
-        if [ "${mode}" = ci-source-index ]; then
+        (
+          configure_external_ci_cache "${ci_execution}" || exit "$?"
           # Capture direct-script notices privately; CI publishes only fixed reports.
-          GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= run_indexed_source "${1:-}" \
-            > "${ci_execution}/command.log" 2>&1 || status=$?
-        else
-          GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= bash "${repo_root}/scripts/build-external-source.sh" "$@" \
-            > "${ci_execution}/command.log" 2>&1 || status=$?
-        fi
+          if [ "${mode}" = ci-source-index ]; then
+            GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= run_indexed_source "${1:-}"
+          else
+            GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= bash "${repo_root}/scripts/build-external-source.sh" "$@"
+          fi
+        ) > "${ci_execution}/command.log" 2>&1 || status=$?
         printf '%s\n' "${status}" > .build/ci-source.status ;;
       ci-check)
         case "${2:-}" in build|validate) ;; *) echo 'Invalid output mode.' >&2; exit 2 ;; esac

@@ -347,7 +347,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | `ZMK_EXTERNAL_PRISTINE` | `0` |
 | `ZMK_EXTERNAL_SETTINGS_RESET` | `0` |
 | `ZMK_EXTERNAL_SOURCE_JOBS` | `1` |
-| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external`; each source adds its unique slug. |
+| `ZMK_EXTERNAL_CACHE_PREFIX` | Local CLI: `zmk-cache-external`; GitHub CI helpers: a repository/ref-scoped default. An explicit value overrides either default. Each source adds its unique slug. |
 | `ZMK_EXTERNAL_CLONE_IMAGE` | `zmkfirmware/zmk-build-arm:stable` |
 | `ZMK_EXTERNAL_CLONE_ATTEMPTS` | `3` |
 | `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh`; worker used by the multi-source wrapper. |
@@ -638,6 +638,16 @@ the number of containers retaining that source's cache. Unavailable observations
 remain `unavailable`; raw errors, container IDs, cache names and paths stay private.
 Only numeric indices enter the matrix and step environment; source paths, URLs
 and slugs stay out of runner-generated step details as well as command output.
+With GitHub Actions and no explicit `ZMK_EXTERNAL_CACHE_PREFIX`, the source and
+diagnostic helpers use a cache namespace derived from the repository and full Git
+ref. The same ref reuses its cache across runs; branches, tags and repositories
+are isolated. Raw repository/ref values stay out of cache names and diagnostics.
+An explicit prefix retains the runner owner's chosen namespace; local CLI defaults
+are unchanged. CI scope hashing requires Git. Missing CI context or a failed scope calculation stops the source
+before invoking its worker, rather than falling back to a shared cache.
+Existing unscoped volumes and retaining containers are left untouched. Pristine
+still resets only the selected volume and refuses any in-use reference, including
+a retained container on the same ref.
 The selector preparation uses the Node runtime bundled with `actions/github-script`;
 it adds no host requirement to the local CLI.
 

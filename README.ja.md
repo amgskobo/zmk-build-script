@@ -321,7 +321,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | `ZMK_EXTERNAL_PRISTINE` | `0` |
 | `ZMK_EXTERNAL_SETTINGS_RESET` | `0` |
 | `ZMK_EXTERNAL_SOURCE_JOBS` | `1` |
-| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external`。source ごとの一意な slug を付けます。 |
+| `ZMK_EXTERNAL_CACHE_PREFIX` | local CLI は `zmk-cache-external`、GitHub CI helper は repository / ref ごとの既定値。明示値はどちらの既定値より優先し、source ごとに一意な slug を付けます。 |
 | `ZMK_EXTERNAL_CLONE_IMAGE` | `zmkfirmware/zmk-build-arm:stable` |
 | `ZMK_EXTERNAL_CLONE_ATTEMPTS` | `3` |
 | `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh`。複数 source wrapper が起動する worker。 |
@@ -554,7 +554,15 @@ CI helper は呼び出し元の directory にかかわらず、この repository
 許可した summary の失敗段階・image 系統、Docker architecture、対象 cache を保持する container 数だけを表示します。
 取得できない項目は `unavailable` とし、生のエラー、container ID、cache 名、path は非公開に保ちます。
 matrix と step の環境変数には数値 index だけを渡し、source の path / URL / slug は
-runner 自身の事前表示にも command 出力にも含めません。selector の準備には `actions/github-script` に付属する Node runtime を使い、
+runner 自身の事前表示にも command 出力にも含めません。
+GitHub Actions で `ZMK_EXTERNAL_CACHE_PREFIX` を明示していない場合、source 実行と診断は
+repository と完全な Git ref から求めた cache namespace を共通で使います。同じ ref は実行をまたいで再利用し、
+branch・tag・repository ごとに分離します。生の repository / ref は cache 名や診断に含めません。
+明示した prefix は runner 管理側の指定を優先し、local CLI の既定値は維持します。
+CI の scope hash 計算には Git が必要です。CI context の不足や scope 計算の失敗時は、共有 cache に戻さず worker 起動前に失敗させます。
+既存の scope 無し volume や保持 container は変更しません。pristine は選択した volume だけを初期化し、
+同じ ref で保持している container を含め、使用中の参照があれば拒否します。
+selector の準備には `actions/github-script` に付属する Node runtime を使い、
 local CLI の host 必須依存は増やしません。
 
 ## 保守と検証

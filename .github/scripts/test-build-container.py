@@ -149,7 +149,8 @@ class ContainerContracts(unittest.TestCase):
                               ['Build source (Unix)', 'Build source (Windows)'])
         (self.root / 'scripts').mkdir()
         (self.root / 'scripts/build-external-source.sh').write_text(
-            '#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$WORKFLOW_ARGV"\n')
+            '#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$WORKFLOW_ARGV"\n'
+            'printf "%s" "$ZMK_EXTERNAL_CACHE_PREFIX" > "$WORKFLOW_CACHE"\n')
         (self.root / '.github/scripts').mkdir(parents=True)
         shutil.copyfile('/tmp/check-build-output.sh', self.root / '.github/scripts/check-build-output.sh')
         for script in ('auto-build-external.sh', 'source-common.sh'):
@@ -167,7 +168,10 @@ class ContainerContracts(unittest.TestCase):
                                       else str(self.root / 'source with spaces'))
                             env = dict(os.environ, EXTERNAL_MODE=mode, EXTERNAL_BUILD_JOBS='2',
                                        EXTERNAL_PRISTINE=pristine, SOURCE_INDEX='0002',
-                                       WORKFLOW_ARGV=str(self.root / 'workflow.argv'))
+                                       WORKFLOW_ARGV=str(self.root / 'workflow.argv'),
+                                       WORKFLOW_CACHE=str(self.root / 'workflow.cache'),
+                                       GITHUB_ACTIONS='true', GITHUB_REPOSITORY='synthetic-owner/project',
+                                       GITHUB_REF='refs/heads/synthetic-private-topic', ZMK_EXTERNAL_CACHE_PREFIX='')
                             sources = self.root / 'sources.txt'
                             sources.write_text('repo:https://example.invalid/unselected.git\n' + source_type + ':' + source +
                                                (' ' + revision if revision else '') + '\n')
@@ -186,6 +190,10 @@ class ContainerContracts(unittest.TestCase):
                             if pristine == 'true':
                                 expected.append('--pristine')
                             self.assertEqual(actual, expected)
+                            scope = b'synthetic-owner/project\0refs/heads/synthetic-private-topic\0'
+                            blob = b'blob ' + str(len(scope)).encode() + b'\0' + scope
+                            expected_prefix = 'zmk-cache-external-ci-' + hashlib.sha1(blob).hexdigest()
+                            self.assertEqual((self.root / 'workflow.cache').read_text(), expected_prefix)
                             self.assertNotIn('unselected.git', (self.root / record).read_text())
                             self.assertNotIn(source, result.stdout.decode())
 
