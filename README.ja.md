@@ -321,7 +321,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | `ZMK_EXTERNAL_PRISTINE` | `0` |
 | `ZMK_EXTERNAL_SETTINGS_RESET` | `0` |
 | `ZMK_EXTERNAL_SOURCE_JOBS` | `1` |
-| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external`。source ごとの一意な slug を付けます。 |
+| `ZMK_EXTERNAL_CACHE_PREFIX` | local CLI は `zmk-cache-external`、GitHub CI helper は repository / ref ごとの既定値。明示値はどちらの既定値より優先し、source ごとに一意な slug を付けます。 |
 | `ZMK_EXTERNAL_CLONE_IMAGE` | `zmkfirmware/zmk-build-arm:stable` |
 | `ZMK_EXTERNAL_CLONE_ATTEMPTS` | `3` |
 | `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh`。複数 source wrapper が起動する worker。 |
@@ -502,6 +502,12 @@ self-hosted runner は信頼できる workflow に限定します。
 
 ### scheduleと並列数
 
+外部 workflow の手動実行では `platform: auto|macos|windows|linux` と任意の
+`source_index` を指定できます。既定の `auto` は利用可能な対象 runner を使い、OS を選ぶと
+必須の custom label を保持したまま標準の OS label を追加します。source index は解決した一覧から
+元の番号と固定 revision を保持して1件を選び、空欄では全件を選びます。
+定期実行は OS の自動割り当てと全件選択を維持します。
+
 外部 matrix は `runner.os` で Bash / Git Bash と artifact 名を選びます。
 `source_jobs` は matrix 並列数（既定 4）、`build_jobs` は target 並列数（既定 1）です。
 schedule は同じ既定値で pristine build を行います。cron は UTC、JST 換算は workflow comment に記載し、
@@ -511,7 +517,8 @@ online / busy / label / 登録先を確認し、外部 job から除外する場
 ### 公開レポートとCI helper
 
 CI の自動 upload は `.build/public/` の固定項目の text report に限定し、command の結果と既知の test status を記録します。
-host test の失敗時は、検証済みの数値のソース行番号も記録できます。生のエラー文は含めません。
+host test の失敗時は、検証済みの数値のソース行番号も記録できます。
+output-contract test の失敗時も CI の表示に検証済みの数値の行番号を出せます。どちらも生のエラー文は含めません。
 raw な環境情報、path、source label、runner 名、log、firmware は自動 upload しません。
 外部 job の公開名には source の数値 index を使います。report は raw evidence と別の公開用コピーです。
 hosted runner の raw evidence は一時的で、job の削除後は残りません。詳細な診断には local での再現、
@@ -543,8 +550,19 @@ archive は自動 upload の対象に含めず、hosted runner では一時的�
 外部 CI は `ci-matrix` と `ci-source-index N` を使い、workflow event から実行時に準備する非公開の
 `.build/ci-source-file` を読みます。selector は常に list file として扱い、不足する list は matrix 解決時に失敗させます。
 CI helper は呼び出し元の directory にかかわらず、この repository の root を基準に実行します。
+外部 job が失敗したときは archive 前に `ci-diagnostics INDEX build|validate` を実行し、
+許可した summary の失敗段階・image 系統、Docker architecture、対象 cache を保持する container 数だけを表示します。
+取得できない項目は `unavailable` とし、生のエラー、container ID、cache 名、path は非公開に保ちます。
 matrix と step の環境変数には数値 index だけを渡し、source の path / URL / slug は
-runner 自身の事前表示にも command 出力にも含めません。selector の準備には `actions/github-script` に付属する Node runtime を使い、
+runner 自身の事前表示にも command 出力にも含めません。
+GitHub Actions で `ZMK_EXTERNAL_CACHE_PREFIX` を明示していない場合、source 実行と診断は
+repository と完全な Git ref から求めた cache namespace を共通で使います。同じ ref は実行をまたいで再利用し、
+branch・tag・repository ごとに分離します。生の repository / ref は cache 名や診断に含めません。
+明示した prefix は runner 管理側の指定を優先し、local CLI の既定値は維持します。
+CI の scope hash 計算には Git が必要です。CI context の不足や scope 計算の失敗時は、共有 cache に戻さず worker 起動前に失敗させます。
+既存の scope 無し volume や保持 container は変更しません。pristine は選択した volume だけを初期化し、
+同じ ref で保持している container を含め、使用中の参照があれば拒否します。
+selector の準備には `actions/github-script` に付属する Node runtime を使い、
 local CLI の host 必須依存は増やしません。
 
 ## 保守と検証
@@ -563,11 +581,12 @@ bash .github/scripts/test.sh all
 | 層 | 確認範囲 |
 | --- | --- |
 | `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白・Unicode 入り target / module / 一時 path、option や shell 構文に見える文字・絵文字を含む literal file 名、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
-| `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。image 内の Python / PyYAML を使います。 |
-| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
+| `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。稼働中・停止済みの cache holder がある場合、build / validate の pristine を拒否します。pristine lane では所有 holder の解放後に validate が成功し、workspace / ccache の古い状態が消えることも確認します。image 内の Python / PyYAML を使います。 |
+| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。pristine lane は標準 build 前に workspace / ccache に古い状態を置き、削除を確認します。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | 独立した shell case と、順序を保つ Docker 検証・firmware の処理を並行して実行します。 |
 
-hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `docker` と `build` を実行します。
+hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `ZMK_TEST_PRISTINE=1` を必須にした
+`docker` と `build` を実行します。
 手動 self-hosted の `mode=validate` は `shell` と `docker`、`mode=build` は選択した各 native host で
 `all` を実行します。native Docker で firmware まで確認するときは後者を使います。
 shell または validate の成功だけでは、その確認にはなりません。
@@ -657,6 +676,9 @@ test cache は既定で専用 volume を作り、終了時に削除します。p
 self-hosted workflow は repository / OS ごとの prefix を設定します。同じ OS の job は cache を保護するため
 直列化し、異なる OS の job は独立して実行します。表示するのは固定形式の Docker CPU / memory 容量の数値と、
 既存 cache override の有無だけです。host / device の識別値と実 cache 名は非公開の証跡に保持します。
-`ZMK_TEST_PRISTINE=1` は標準 build 前だけ初期化し、
-復元検証では保持します。各 build / validate の直後に、その run を明示して output check を実行します。
+`ZMK_TEST_PRISTINE=1` は Docker の cache holder 拒否 case 後と標準 firmware build 前に初期化し、
+volume root・workspace・ccache に置いた古い状態の削除も検証します。復元検証では cache を保持します。
+`ZMK_TEST_PRISTINE=0` は再利用の検証を選び、その成功だけでは pristine 成功とは扱いません。
+test が解放するのは自分で取得した container 参照だけで、未知の holder は拒否します。
+各 build / validate の直後に、その run を明示して output check を実行します。
 local / remote CI / host platform / 実機の結果は分けて報告し、公開操作は user の明示指示がある場合だけ行います。

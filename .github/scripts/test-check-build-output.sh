@@ -2,6 +2,7 @@
 set -euo pipefail
 # Synthetic coordinator fixtures choose their cache policy explicitly.
 export ZMK_TEST_CACHE_PREFIX=
+export ZMK_EXTERNAL_CACHE_PREFIX= GITHUB_ACTIONS= GITHUB_REPOSITORY= GITHUB_REF=
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 checker="${repo_root}/.github/scripts/check-build-output.sh"
@@ -28,6 +29,7 @@ cleanup() {
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
+trap 'output_contract_status=$? output_contract_line=$LINENO; printf "[output-contract] failure line: %s\n" "${output_contract_line}" >&2; exit "${output_contract_status}"' ERR
 
 reset_case() {
   rm -rf "${case_root}"
@@ -709,6 +711,49 @@ run_path="${case_root}/.build/${run_name}"
 run_ok validate "${run_path}"
 run_fail validate 'run directory' "${case_root}/../case..name/.build/${run_name}"
 
+# Diagnostics reuse validated metadata and never copy error text into public output.
+while IFS='|' read -r diagnostic_reason diagnostic_phase; do
+  reset_case
+  write_summary <<EOF
+Status: FAILED
+Mode: build
+Reason: ${diagnostic_reason}
+Docker image: zmkfirmware/zmk-build-arm:3.5-branch
+
+Failure excerpt
+Reason: synthetic-private-host /synthetic/private secret=value
+EOF
+  diagnostic="$(cd "${case_root}"; bash "${checker}" diagnostic build "${run_path}")"
+  [ "${diagnostic}" = "${diagnostic_phase}"$'\t'legacy-3.5 ]
+done <<'EOF'
+host setup failed|setup
+run directory reservation failed|reservation
+cache reset failed|cache-reset
+container creation failed|container-create
+container start failed|container-start
+manifest image selection failed|image-selection
+source copy failed|source-copy
+validation failed|validation
+firmware build failed|compile
+artifact copy failed|artifact-copy
+container cleanup failed|cleanup
+interrupted by TERM|interrupted
+synthetic-private-host /synthetic/private secret=value|unknown
+EOF
+printf 'Reason: cache reset failed\n' >> "${run_path}/build-summary.txt"
+# A log excerpt cannot replace the header's reason.
+diagnostic="$(cd "${case_root}"; bash "${checker}" diagnostic build "${run_path}")"
+[ "${diagnostic}" = unknown$'\t'legacy-3.5 ]
+printf 'Status: FAILED\nMode: build\nReason: cache reset failed\nReason: firmware build failed\n' > "${run_path}/build-summary.txt"
+if (cd "${case_root}"; bash "${checker}" diagnostic build "${run_path}") >/dev/null 2>&1; then
+  echo 'diagnostics accepted duplicate summary metadata' >&2; exit 1
+fi
+reset_case
+write_summary <<'EOF'
+Status: SUCCESS
+Mode: validate
+EOF
+
 # Publication copies contain only fixed labels/statuses, never raw identities or binaries.
 mkdir -p "${case_root}/raw evidence"
 printf 'case\tstatus\tseconds\nsyntax\tPASS\t1\nfirmware\tFAIL(23)\t2\nsynthetic-private-host\tPASS\t3\n' \
@@ -912,6 +957,7 @@ cp "${checker}" "${ci_root}/.github/scripts/check-build-output.sh"
 cat > "${ci_root}/scripts/build-external-source.sh" <<'EOF'
 #!/usr/bin/env bash
 echo 'synthetic-private-host /synthetic/private/source secret=value'
+[ -z "${CACHE_PREFIX_CAPTURE:-}" ] || printf '%s' "${ZMK_EXTERNAL_CACHE_PREFIX:-zmk-cache-external}" > "${CACHE_PREFIX_CAPTURE}"
 [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo 'private source identity' >> "${GITHUB_STEP_SUMMARY}"
 exit "${PUBLIC_PROBE_EXIT}"
 EOF
@@ -939,6 +985,32 @@ for expected in 23 0; do
   if grep -Eq 'synthetic-private-host|/synthetic/private|private-device|secret=' "${ci_root}/.build/public/build.txt"; then exit 1; fi
 done
 [ "$(find "${ci_root}/.build" -name command.log -type f | wc -l | tr -d '[:space:]')" = 4 ]
+
+cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${TEST_FAILURE_MARKER}"
+echo 'synthetic-private-host /synthetic/private secret=value' >&2
+exit 1
+EOF
+for marker in valid cr zero oversized duplicate private; do
+  failure_marker='[output-contract] failure line: 42'
+  case "${marker}" in
+    cr) failure_marker="${failure_marker}"$'\r' ;;
+    zero) failure_marker='[output-contract] failure line: 0' ;;
+    oversized) failure_marker='[output-contract] failure line: 9999999' ;;
+    duplicate) failure_marker="${failure_marker}"$'\n'"${failure_marker}" ;;
+    private) failure_marker='[output-contract] failure line: /synthetic/private secret=value' ;;
+  esac
+  if (cd "${ci_root}"; ZMK_TEST_PROFILE=0 TEST_FAILURE_MARKER="${failure_marker}" \
+      bash .github/scripts/check-build-output.sh ci-tests shell) > "${tmp_dir}/failure-line-console" 2>&1; then
+    echo 'output diagnostic hid the original test failure' >&2; exit 1
+  fi
+  case "${marker}" in
+    valid|cr) grep -qx 'Output contract failure line: 42' "${tmp_dir}/failure-line-console" ;;
+    *) if grep '^Output contract failure line:' "${tmp_dir}/failure-line-console" >/dev/null; then exit 1; fi ;;
+  esac
+  if grep -Eq 'synthetic-private|/synthetic/private|secret=' "${tmp_dir}/failure-line-console"; then exit 1; fi
+done
 
 cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -1083,6 +1155,199 @@ printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
 grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/matrix-output"
 grep -qx 'Resolved source count: 2' "${tmp_dir}/matrix-summary"
 if grep -Eq '/synthetic/private|first|second' "${tmp_dir}/matrix-output" "${tmp_dir}/matrix-summary" "${tmp_dir}/matrix-console"; then exit 1; fi
+# Regression control: selecting one original source must not silently run the full list.
+printf '0002' > "${ci_root}/.build/ci-source-index"
+(cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/selected-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/selected-matrix-summary" \
+  bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/selected-matrix-console" 2>&1
+if ! grep -qx 'matrix={"include":\[{"index":2}\]}' "${tmp_dir}/selected-matrix-output"; then
+  echo 'CI matrix ignored the selected original source index' >&2; exit 1
+fi
+grep -qx 'Resolved source count: 1' "${tmp_dir}/selected-matrix-summary"
+for platform in auto macos windows linux; do
+  printf '%s' "${platform}" > "${ci_root}/.build/ci-runner-platform"
+  (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/platform-${platform}-output" GITHUB_STEP_SUMMARY="${tmp_dir}/platform-summary" \
+    bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/platform-console" 2>&1
+  case "${platform}" in
+    auto) labels='["self-hosted","zmk-docker","zmk-docker-active"]' ;;
+    macos) labels='["self-hosted","macOS","zmk-docker","zmk-docker-active"]' ;;
+    windows) labels='["self-hosted","Windows","zmk-docker","zmk-docker-active"]' ;;
+    linux) labels='["self-hosted","Linux","zmk-docker","zmk-docker-active"]' ;;
+  esac
+  grep -Fxq "runner_labels=${labels}" "${tmp_dir}/platform-${platform}-output"
+  grep -qx 'matrix={"include":\[{"index":2}\]}' "${tmp_dir}/platform-${platform}-output"
+done
+rm "${ci_root}/.build/ci-source-index" "${ci_root}/.build/ci-runner-platform"
+external_diagnostic_bin="${tmp_dir}/external-diagnostic-bin"
+mkdir "${external_diagnostic_bin}"
+cat > "${external_diagnostic_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+[ "${MSYS_NO_PATHCONV:-}" = 1 ] && [ "${MSYS2_ARG_CONV_EXCL:-}" = '*' ] || exit 29
+case "$1" in
+  info) printf '%s\r\n' "${DIAGNOSTIC_PLATFORM}" ;;
+  ps)
+    printf '%s\0' "$@" > "${DIAGNOSTIC_ARGV}"
+    [ "${DIAGNOSTIC_USERS}" != 1 ] || printf '%064d\r\n' 1
+    [ "${DIAGNOSTIC_USERS}" != malformed ] || printf 'not-a-container-id\n'
+    [ "${DIAGNOSTIC_USERS}" != nul ] || printf '%064d\000\n' 1
+    exit "${DIAGNOSTIC_PS_STATUS}" ;;
+  *) exit 29 ;;
+esac
+EOF
+chmod +x "${external_diagnostic_bin}/docker"
+cat > "${external_diagnostic_bin}/cat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${DIAGNOSTIC_CAT_NORMALIZE:-0}" = 1 ]; then
+  "${DIAGNOSTIC_REAL_CAT}" "$@" | tr -d '\r'
+else
+  exec "${DIAGNOSTIC_REAL_CAT}" "$@"
+fi
+EOF
+chmod +x "${external_diagnostic_bin}/cat"
+diagnostic_real_cat="$(command -v cat)"
+printf 'Status: FAILED\nMode: build\nReason: cache reset failed\nDocker image: zmkfirmware/zmk-build-arm:3.5-branch\n' \
+  > "${ci_root}/.build/${run_name}/build-summary.txt"
+for probe in holders normalized-cat empty failed malformed nul unknown-platform; do
+  diagnostic_users=1 diagnostic_ps_status=0 diagnostic_platform=linux/x86_64 expected_users=1 expected_platform=linux-amd64 diagnostic_cat_normalize=0
+  case "${probe}" in
+    normalized-cat) diagnostic_cat_normalize=1 ;;
+    empty) diagnostic_users=0 expected_users=0 ;;
+    failed) diagnostic_ps_status=23 expected_users=unavailable ;;
+    malformed|nul) diagnostic_users="${probe}" expected_users=unavailable ;;
+    unknown-platform) diagnostic_platform='synthetic-private-host /synthetic/private secret=value'; expected_platform=unavailable ;;
+  esac
+  (cd "${ci_root}"; PATH="${external_diagnostic_bin}:${PATH}" DIAGNOSTIC_PLATFORM="${diagnostic_platform}" \
+    DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_CAT_NORMALIZE="${diagnostic_cat_normalize}" \
+    DIAGNOSTIC_USERS="${diagnostic_users}" DIAGNOSTIC_PS_STATUS="${diagnostic_ps_status}" DIAGNOSTIC_ARGV="${tmp_dir}/diagnostic.argv" \
+    bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/diagnostic-console" 2>&1
+  grep -qx 'External diagnostic phase: cache-reset' "${tmp_dir}/diagnostic-console"
+  grep -qx 'External diagnostic image: legacy-3.5' "${tmp_dir}/diagnostic-console"
+  grep -qx "External diagnostic docker-platform: ${expected_platform}" "${tmp_dir}/diagnostic-console"
+  grep -qx "External diagnostic cache-users: ${expected_users}" "${tmp_dir}/diagnostic-console"
+  cmp "${tmp_dir}/diagnostic.argv" <(printf '%s\0' ps -aq --no-trunc --filter volume=zmk-cache-external-second)
+  if grep -Eq 'synthetic-private|/synthetic/private|secret=|zmk-cache|0000000000' "${tmp_dir}/diagnostic-console"; then
+    echo 'external diagnostics disclosed raw data' >&2; exit 1
+  fi
+done
+# CI caches are stable within a repository/ref and distinct across refs/forks.
+# The same wrapper entry and diagnostic selector must receive the same prefix.
+for scoped_case in main repeated topic tag fork direct explicit local; do
+  scoped_repo=synthetic-owner/project scoped_ref=refs/heads/main scoped_actions=true scoped_prefix=
+  scoped_args=(ci-source-index 2)
+  case "${scoped_case}" in
+    topic) scoped_ref=refs/heads/synthetic-private-topic ;;
+    tag) scoped_ref=refs/tags/synthetic-private-topic ;;
+    fork) scoped_repo=synthetic-fork/project ;;
+    direct) scoped_args=(ci-source --path /synthetic/private/second) ;;
+    explicit) scoped_repo= scoped_ref= scoped_prefix=synthetic-explicit-prefix ;;
+    local) scoped_actions= ;;
+  esac
+  (cd "${ci_root}"; GITHUB_ACTIONS="${scoped_actions}" GITHUB_REPOSITORY="${scoped_repo}" GITHUB_REF="${scoped_ref}" \
+    GITHUB_RUN_ID="${scoped_case}" ZMK_EXTERNAL_CACHE_PREFIX="${scoped_prefix}" PUBLIC_PROBE_EXIT=0 \
+    CACHE_PREFIX_CAPTURE="${tmp_dir}/cache-${scoped_case}" \
+    bash .github/scripts/check-build-output.sh "${scoped_args[@]}") > "${tmp_dir}/cache-${scoped_case}-console" 2>&1
+  scoped_actual="$(cat "${tmp_dir}/cache-${scoped_case}")"
+  case "${scoped_case}" in
+    explicit) [ "${scoped_actual}" = synthetic-explicit-prefix ] ;;
+    local) [ "${scoped_actual}" = zmk-cache-external ] ;;
+    *)
+      case "${scoped_actual}" in zmk-cache-external-ci-*) ;; *) echo 'CI external cache lacks a repository/ref namespace' >&2; exit 1 ;; esac
+      scoped_hash="${scoped_actual#zmk-cache-external-ci-}"
+      case "${scoped_hash}" in ''|*[!0-9a-f]*) exit 1 ;; esac
+      case "${#scoped_hash}" in 40|64) ;; *) exit 1 ;; esac ;;
+  esac
+  (cd "${ci_root}"; PATH="${external_diagnostic_bin}:${PATH}" DIAGNOSTIC_PLATFORM=linux/x86_64 \
+    DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_CAT_NORMALIZE=0 DIAGNOSTIC_USERS=0 DIAGNOSTIC_PS_STATUS=0 \
+    DIAGNOSTIC_ARGV="${tmp_dir}/cache-${scoped_case}.argv" GITHUB_ACTIONS="${scoped_actions}" \
+    GITHUB_REPOSITORY="${scoped_repo}" GITHUB_REF="${scoped_ref}" ZMK_EXTERNAL_CACHE_PREFIX="${scoped_prefix}" \
+    bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/cache-${scoped_case}-diagnostic" 2>&1
+  cmp "${tmp_dir}/cache-${scoped_case}.argv" <(printf '%s\0' ps -aq --no-trunc --filter "volume=${scoped_actual}-second")
+  if grep -Eq 'synthetic-owner|synthetic-fork|synthetic-private-topic|synthetic-explicit|zmk-cache' \
+      "${tmp_dir}/cache-${scoped_case}-console" "${tmp_dir}/cache-${scoped_case}-diagnostic"; then
+    echo 'CI cache scope disclosed raw namespace data' >&2; exit 1
+  fi
+done
+cmp "${tmp_dir}/cache-main" "${tmp_dir}/cache-repeated"
+cmp "${tmp_dir}/cache-main" "${tmp_dir}/cache-direct"
+for scoped_case in topic tag fork; do
+  if cmp -s "${tmp_dir}/cache-main" "${tmp_dir}/cache-${scoped_case}"; then
+    echo 'CI external cache shares a namespace across refs or repositories' >&2; exit 1
+  fi
+done
+if cmp -s "${tmp_dir}/cache-topic" "${tmp_dir}/cache-tag"; then
+  echo 'CI external cache conflates branch and tag refs' >&2; exit 1
+fi
+
+# Hashing failures and incomplete/malformed context must not fall back to a shared cache.
+cache_git_bin="${tmp_dir}/cache-git-bin"
+mkdir "${cache_git_bin}"
+cat > "${cache_git_bin}/git" <<'EOF'
+#!/usr/bin/env bash
+[ "$*" = 'hash-object --stdin' ] || exit 29
+cat >/dev/null
+case "${CACHE_GIT_PROBE}" in
+  failed) echo 'synthetic-private-host /synthetic/private secret=value' >&2; exit 23 ;;
+  failed-after-output) printf '%040d\n' 1; exit 23 ;;
+  invalid) printf 'not-a-hash\n' ;;
+  nul) printf '%040d\000\n' 1 ;;
+  duplicate) printf '%040d\n%040d\n' 1 2 ;;
+  crlf) printf '%040d\r\n' 1 ;;
+  sha256) printf '%064d\n' 1 ;;
+esac
+EOF
+chmod +x "${cache_git_bin}/git"
+for cache_probe in missing-repo missing-ref failed failed-after-output invalid nul duplicate crlf sha256; do
+  cache_repo=synthetic-owner/project cache_ref=refs/heads/synthetic-private-topic cache_path="${cache_git_bin}:${PATH}"
+  case "${cache_probe}" in
+    missing-repo) cache_repo= ;;
+    missing-ref) cache_ref= ;;
+  esac
+  rm -f "${tmp_dir}/cache-probe-started"
+  if (cd "${ci_root}"; PATH="${cache_path}" CACHE_GIT_PROBE="${cache_probe}" GITHUB_ACTIONS=true \
+    GITHUB_REPOSITORY="${cache_repo}" GITHUB_REF="${cache_ref}" PUBLIC_PROBE_EXIT=0 \
+    CACHE_PREFIX_CAPTURE="${tmp_dir}/cache-probe-started" \
+    bash .github/scripts/check-build-output.sh ci-source-index 2) > "${tmp_dir}/cache-probe-console" 2>&1; then cache_status=0; else cache_status=$?; fi
+  if [ "${cache_probe}" = crlf ]; then
+    [ "${cache_status}" = 0 ]
+    cmp "${tmp_dir}/cache-probe-started" <(printf 'zmk-cache-external-ci-%040d' 1)
+  elif [ "${cache_probe}" = sha256 ]; then
+    [ "${cache_status}" = 0 ]
+    cmp "${tmp_dir}/cache-probe-started" <(printf 'zmk-cache-external-ci-%064d' 1)
+  else
+    [ "${cache_status}" != 0 ] && [ ! -e "${tmp_dir}/cache-probe-started" ]
+    case "${cache_probe}" in failed|failed-after-output) [ "${cache_status}" = 23 ] ;; esac
+    rm -f "${tmp_dir}/cache-probe-diagnostic.argv"
+    (cd "${ci_root}"; PATH="${cache_git_bin}:${external_diagnostic_bin}:${PATH}" \
+      DIAGNOSTIC_PLATFORM=linux/x86_64 DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_CAT_NORMALIZE=0 \
+      DIAGNOSTIC_USERS=0 DIAGNOSTIC_PS_STATUS=0 DIAGNOSTIC_ARGV="${tmp_dir}/cache-probe-diagnostic.argv" \
+      CACHE_GIT_PROBE="${cache_probe}" GITHUB_ACTIONS=true GITHUB_REPOSITORY="${cache_repo}" GITHUB_REF="${cache_ref}" \
+      bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/cache-probe-diagnostic" 2>&1
+    [ ! -e "${tmp_dir}/cache-probe-diagnostic.argv" ]
+    grep -qx 'External diagnostic cache-users: unavailable' "${tmp_dir}/cache-probe-diagnostic"
+    if grep -Eq 'synthetic-private|/synthetic/private|secret=|synthetic-owner|refs/heads' "${tmp_dir}/cache-probe-diagnostic"; then exit 1; fi
+  fi
+  if grep -Eq 'synthetic-private|/synthetic/private|secret=|synthetic-owner|refs/heads' "${tmp_dir}/cache-probe-console"; then exit 1; fi
+done
+printf 'Status: SUCCESS\nMode: build\nBuilt targets: 1\n' > "${ci_root}/.build/${run_name}/build-summary.txt"
+for selection in index-zero index-octal-zero index-negative index-missing index-newline index-nul platform-unknown platform-nul index-link; do
+  case "${selection}" in
+    index-zero) printf 0 > "${ci_root}/.build/ci-source-index" ;;
+    index-octal-zero) printf 00 > "${ci_root}/.build/ci-source-index" ;;
+    index-negative) printf -- -1 > "${ci_root}/.build/ci-source-index" ;;
+    index-missing) printf 3 > "${ci_root}/.build/ci-source-index" ;;
+    index-newline) printf '1\n2' > "${ci_root}/.build/ci-source-index" ;;
+    index-nul) printf '2\000' > "${ci_root}/.build/ci-source-index" ;;
+    platform-unknown) printf 'macOS' > "${ci_root}/.build/ci-runner-platform" ;;
+    platform-nul) printf 'macos\000' > "${ci_root}/.build/ci-runner-platform" ;;
+    index-link) MSYS=winsymlinks:sys ln -s "${ci_root}/sources.txt" "${ci_root}/.build/ci-source-index"; test -L "${ci_root}/.build/ci-source-index" ;;
+  esac
+  if (cd "${ci_root}"; GITHUB_OUTPUT="${tmp_dir}/rejected-${selection}-output" GITHUB_STEP_SUMMARY="${tmp_dir}/rejected-summary" \
+      bash .github/scripts/check-build-output.sh ci-matrix) >"${tmp_dir}/rejected-console" 2>&1; then
+    echo "CI matrix accepted invalid private selection: ${selection}" >&2; exit 1
+  fi
+  [ ! -e "${tmp_dir}/rejected-${selection}-output" ]
+  rm -f "${ci_root}/.build/ci-source-index" "${ci_root}/.build/ci-runner-platform"
+done
 # A selector is always a list file, never an inferred source or a URL.
 for selector in missing-list.txt https://example.invalid/sources.txt; do
   printf '%s\n' "${selector}" > "${ci_root}/.build/ci-source-file"

@@ -129,6 +129,18 @@ class ContainerContracts(unittest.TestCase):
         self.expect_targets({'application': '.', 'board': 'A'}, [target('A-zmk')])
         self.assertFalse((self.root / 'zephyr/module.yml').exists())
 
+    def test_hosted_clean_lane_requires_pristine(self):
+        workflow = yaml.load(pathlib.Path('/tmp/workflows/compatibility.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        job = workflow['jobs']['docker']
+        self.assertEqual(job.get('env', {}).get('ZMK_TEST_PRISTINE'), '1',
+                         'hosted Docker and firmware checks must exercise pristine')
+        commands = [step.get('run') for step in job['steps']]
+        self.assertIn('bash .github/scripts/check-build-output.sh ci-tests docker', commands)
+        self.assertIn('bash .github/scripts/check-build-output.sh ci-tests build', commands)
+        for step in job['steps']:
+            self.assertNotIn('ZMK_TEST_PRISTINE', step.get('env', {}))
+
     def test_external_workflow_forwards_pristine_in_both_modes(self):
         workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
         steps = [step for step in workflow['jobs']['build-runner']['steps']
@@ -137,7 +149,8 @@ class ContainerContracts(unittest.TestCase):
                               ['Build source (Unix)', 'Build source (Windows)'])
         (self.root / 'scripts').mkdir()
         (self.root / 'scripts/build-external-source.sh').write_text(
-            '#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$WORKFLOW_ARGV"\n')
+            '#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$WORKFLOW_ARGV"\n'
+            'printf "%s" "$ZMK_EXTERNAL_CACHE_PREFIX" > "$WORKFLOW_CACHE"\n')
         (self.root / '.github/scripts').mkdir(parents=True)
         shutil.copyfile('/tmp/check-build-output.sh', self.root / '.github/scripts/check-build-output.sh')
         for script in ('auto-build-external.sh', 'source-common.sh'):
@@ -155,7 +168,10 @@ class ContainerContracts(unittest.TestCase):
                                       else str(self.root / 'source with spaces'))
                             env = dict(os.environ, EXTERNAL_MODE=mode, EXTERNAL_BUILD_JOBS='2',
                                        EXTERNAL_PRISTINE=pristine, SOURCE_INDEX='0002',
-                                       WORKFLOW_ARGV=str(self.root / 'workflow.argv'))
+                                       WORKFLOW_ARGV=str(self.root / 'workflow.argv'),
+                                       WORKFLOW_CACHE=str(self.root / 'workflow.cache'),
+                                       GITHUB_ACTIONS='true', GITHUB_REPOSITORY='synthetic-owner/project',
+                                       GITHUB_REF='refs/heads/synthetic-private-topic', ZMK_EXTERNAL_CACHE_PREFIX='')
                             sources = self.root / 'sources.txt'
                             sources.write_text('repo:https://example.invalid/unselected.git\n' + source_type + ':' + source +
                                                (' ' + revision if revision else '') + '\n')
@@ -174,8 +190,41 @@ class ContainerContracts(unittest.TestCase):
                             if pristine == 'true':
                                 expected.append('--pristine')
                             self.assertEqual(actual, expected)
+                            scope = b'synthetic-owner/project\0refs/heads/synthetic-private-topic\0'
+                            blob = b'blob ' + str(len(scope)).encode() + b'\0' + scope
+                            expected_prefix = 'zmk-cache-external-ci-' + hashlib.sha1(blob).hexdigest()
+                            self.assertEqual((self.root / 'workflow.cache').read_text(), expected_prefix)
                             self.assertNotIn('unselected.git', (self.root / record).read_text())
                             self.assertNotIn(source, result.stdout.decode())
+
+    def test_external_workflow_selects_platform_and_original_source_privately(self):
+        workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+        inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(inputs['platform']['type'], 'choice')
+        self.assertEqual(inputs['platform']['options'], ['auto', 'macos', 'windows', 'linux'])
+        self.assertEqual(inputs['platform']['default'], 'auto')
+        self.assertEqual(inputs['source_index']['type'], 'string')
+        self.assertEqual(inputs['source_index']['default'], '')
+        resolver = workflow['jobs']['sources']
+        self.assertEqual(resolver['outputs']['runner_labels'], '${{ steps.resolve.outputs.runner_labels }}')
+        prepare = next(s for s in resolver['steps'] if s.get('name') == 'Prepare private source selector')
+        self.assertIn("'.build/ci-source-index'", prepare['with']['script'])
+        self.assertIn("'.build/ci-runner-platform'", prepare['with']['script'])
+        self.assertIn('source_index', prepare['with']['script'])
+        self.assertIn('platform', prepare['with']['script'])
+        self.assertEqual(workflow['jobs']['build-runner']['runs-on'],
+                         '${{ fromJSON(needs.sources.outputs.runner_labels) }}')
+        self.assertEqual(workflow['on']['schedule'], [{'cron': '13 0 * * *'}])
+        self.assertEqual(workflow['jobs']['build-runner']['timeout-minutes'], '180')
+        steps = workflow['jobs']['build-runner']['steps']
+        diagnostics = [s for s in steps if s.get('name', '').startswith('Inspect external failure (')]
+        self.assertEqual(len(diagnostics), 2)
+        for step in diagnostics:
+            self.assertIn('failure()', step['if'])
+            self.assertEqual(step['env'], {'SOURCE_INDEX': '${{ matrix.source.index }}'})
+            self.assertEqual(step['run'], 'bash .github/scripts/check-build-output.sh ci-diagnostics "${SOURCE_INDEX}" "${EXTERNAL_MODE}"')
+        self.assertLess(steps.index(diagnostics[-1]),
+                        next(i for i, s in enumerate(steps) if s.get('name') == 'Preserve private evidence (Unix)'))
 
     def test_external_clone_pins_commit_after_default_branch_advances(self):
         # Run the production clone command with real Git. Only Docker transport is local.

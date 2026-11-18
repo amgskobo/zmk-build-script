@@ -1722,22 +1722,56 @@ for file in keep.txt 'nested/valid name.txt' nested/COM0.txt nested/my..file.txt
     '-C' '--exclude=src' 'literal [ab] $value; & (test).txt' 'unicode-名前-📦.txt'; do
   cmp "${tmp_dir}/.clone destination 名前/returned files/${file}" <(printf 'clone payload\n')
 done
-# Use the existing validate container as the holder; never reset a production cache.
+# Use only acquired validation containers on the dedicated test cache. Reject an
+# unknown holder before deleting anything; a stopped container still retains it.
 : "${ZMK_DOCKER_CACHE_VOLUME:?Run Docker contracts through test.sh}"
 docker inspect -f '{{range .Mounts}}{{println .Name}}{{end}}' "${last_container}" |
   grep -Fxq "${ZMK_DOCKER_CACHE_VOLUME}"
-ZMK_KEEP_CONTAINER=0 bash "${tool_root}/build.sh" validate "${target_no_west}" --pristine \
-  >"${tmp_dir}/pristine-in-use.log" 2>&1 &
-pristine_pid=$!
-if wait "${pristine_pid}"; then
-  echo 'pristine continued with an in-use cache volume' >&2; exit 1
-fi
-summary="$(summary_from_log "${tmp_dir}/pristine-in-use.log")"
-grep -qx 'Status: FAILED' "${summary}"
-grep -qx 'Reason: cache reset failed' "${summary}"
-grep -q 'volume is in use' "${summary%/*}/build.log"
-[ "$(docker inspect -f '{{.State.Running}}' "${last_container}")" = true ]
-docker volume inspect "${ZMK_DOCKER_CACHE_VOLUME}" >/dev/null
+docker ps -aq --no-trunc --filter "volume=${ZMK_DOCKER_CACHE_VOLUME}" |
+  tr -d '\r' > "${tmp_dir}/pristine-holders.txt"
+for log in "${container_logs[@]}"; do
+  [ -f "${log}" ] || continue
+  awk '{gsub(/\r/, "")} length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}' "${log}"
+done > "${tmp_dir}/pristine-owned.txt"
+while IFS= read -r container; do
+  [ "${#container}" = 64 ] && [[ "${container}" != *[!0-9a-f]* ]] &&
+    grep -Fxq "${container}" "${tmp_dir}/pristine-owned.txt" || {
+      echo 'Pristine fixture cache has an unowned container reference.' >&2; exit 1;
+    }
+done < "${tmp_dir}/pristine-holders.txt"
+while IFS= read -r container; do
+  [ "${container}" = "${last_container}" ] || docker rm -f "${container}" >/dev/null
+done < "${tmp_dir}/pristine-holders.txt"
+docker exec "${last_container}" sh -c '
+  set -eu
+  mkdir -p /workspaces/zmk-config /workspaces/.ccache
+  for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
+    printf "stale pristine fixture\n" > "$root/.ci-pristine-stale"
+  done'
+assert_pristine_rejected() {
+  local state="$1" command log summary container
+  local args=()
+  for command in build validate; do
+    echo "[build-contract] pristine-${state}-${command}-rejected"
+    log="${tmp_dir}/pristine-${state}-${command}.log"
+    container_logs+=("${log}")
+    args=("${target_no_west}" --pristine)
+    [ "${command}" != validate ] || args=(validate "${args[@]}")
+    if ZMK_KEEP_CONTAINER=0 bash "${tool_root}/build.sh" "${args[@]}" > "${log}" 2>&1; then
+      echo "pristine ${command} continued with a ${state} cache holder" >&2; return 1
+    fi
+    summary="$(summary_from_log "${log}")"
+    grep -qx 'Status: FAILED' "${summary}"
+    grep -qx 'Pristine: 1' "${summary}"
+    grep -qx 'Reason: cache reset failed' "${summary}"
+    grep -q 'volume is in use' "${summary%/*}/build.log"
+    container="$(awk '{gsub(/\r/, "")} length($0) == 64 && $0 !~ /[^0-9a-f]/ {print}' "${log}")"
+    [ -z "${container}" ] || { echo 'Pristine failure created a container.' >&2; return 1; }
+    [ "$(docker inspect -f '{{.State.Running}}' "${last_container}")" = "$2" ]
+    docker volume inspect "${ZMK_DOCKER_CACHE_VOLUME}" >/dev/null
+  done
+}
+assert_pristine_rejected running true
 
 if [ "${ZMK_TEST_PROFILE:-0}" = 1 ]; then
   : "${ZMK_TEST_RESULTS:?Profiling requires the canonical test entry point}"
@@ -1754,6 +1788,40 @@ if [ "${ZMK_TEST_PROFILE:-0}" = 1 ]; then
   IFS= read -r profile_duration < "${ZMK_TEST_RESULTS}/probe-docker-exec.time"
   printf 'probe-docker-exec\t%s\t5\t%s\n' "${profile_status}" "${profile_duration}" >> "${ZMK_TEST_RESULTS}/profile.tsv"
   [ "${profile_status}" = 0 ] || exit "${profile_status}"
+fi
+
+docker stop --time 5 "${last_container}" >/dev/null
+docker ps -aq --no-trunc --filter "volume=${ZMK_DOCKER_CACHE_VOLUME}" |
+  tr -d '\r' > "${tmp_dir}/pristine-stopped-holder.txt"
+cmp "${tmp_dir}/pristine-stopped-holder.txt" <(printf '%s\n' "${last_container}")
+assert_pristine_rejected stopped false
+docker start "${last_container}" >/dev/null
+docker exec "${last_container}" sh -c '
+  set -eu
+  for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
+    test "$(cat "$root/.ci-pristine-stale")" = "stale pristine fixture"
+    [ "$1" = 1 ] || rm "$root/.ci-pristine-stale"
+  done' _ "${ZMK_TEST_PRISTINE:-0}"
+docker rm -f "${last_container}" >/dev/null
+if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
+  echo '[build-contract] pristine-validate-recovery'
+  log="${tmp_dir}/pristine-validate-recovery.log"
+  container_logs+=("${log}")
+  printf '%s\0' image "${ZMK_BUILD_IMAGE}" target "$(cd "${target_no_west}" && pwd -P)" \
+    cache "${ZMK_DOCKER_CACHE_VOLUME}" > "${tmp_dir}/pristine-validate-recovery.expect"
+  ZMK_KEEP_CONTAINER=1 bash "${tool_root}/build.sh" validate "${target_no_west}" --pristine > "${log}" 2>&1
+  summary="$(summary_from_log "${log}")"
+  bash "${repo_root}/.github/scripts/check-build-output.sh" validate "${summary%/*}" \
+    --expect "${tmp_dir}/pristine-validate-recovery.expect"
+  grep -qx 'Pristine: 1' "${summary}"
+  last_container="$(awk '{gsub(/\r/, "")} length($0) == 64 && $0 !~ /[^0-9a-f]/ && !found {print; found=1}' "${log}")"
+  [ "${#last_container}" = 64 ]
+  docker exec "${last_container}" sh -c '
+    set -eu
+    for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
+      test ! -e "$root/.ci-pristine-stale"
+    done'
+  docker rm -f "${last_container}" >/dev/null
 fi
 
 echo "build host/copy contracts passed."

@@ -278,6 +278,45 @@ if [ "${mode}" = timings ]; then
   exit "$?"
 fi
 
+read_ci_selection() {
+  local file="$1" fallback="$2" value
+  CI_SELECTION_VALUE="${fallback}"
+  if [ -e "${file}" ] || [ -L "${file}" ]; then
+    [ -f "${file}" ] && [ ! -L "${file}" ] || { echo 'Invalid private CI selector file.' >&2; return 1; }
+    value="$(cat "${file}")" || return 1
+    # These runtime files have no terminator. Reject NUL and stripped newlines
+    # before a shell variable can turn malformed input into a valid selection.
+    cmp -s "${file}" <(printf '%s' "${value}") || { echo 'Invalid private CI selector bytes.' >&2; return 1; }
+    CI_SELECTION_VALUE="${value}"
+  fi
+}
+
+configure_external_ci_cache() {
+  local scope="" receipt="${1}/cache-scope.txt"
+  # An explicit prefix remains the runner owner's override. Local CLI helpers
+  # retain their existing defaults; only GitHub Actions gets ref isolation.
+  [ -z "${ZMK_EXTERNAL_CACHE_PREFIX:-}" ] || return 0
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  if [ -z "${GITHUB_REPOSITORY:-}" ] || [ -z "${GITHUB_REF:-}" ]; then
+    echo 'CI cache context is incomplete.' >&2
+    return 1
+  fi
+  # Full refs distinguish heads/tags/PR refs. NUL fields prevent concatenation
+  # ambiguities, and the opaque digest keeps repository/ref text out of names.
+  printf '%s\0%s\0' "${GITHUB_REPOSITORY}" "${GITHUB_REF}" |
+    git hash-object --stdin > "${receipt}" || return "$?"
+  IFS= read -r scope < "${receipt}" || true
+  scope="${scope%$'\r'}"
+  case "${scope}" in ''|*[!0-9a-f]*) echo 'Invalid CI cache scope.' >&2; return 1 ;; esac
+  case "${#scope}" in 40|64) ;; *) echo 'Invalid CI cache scope.' >&2; return 1 ;; esac
+  if ! cmp -s "${receipt}" <(printf '%s\n' "${scope}") &&
+      ! cmp -s "${receipt}" <(printf '%s\r\n' "${scope}"); then
+    echo 'Invalid CI cache scope record.' >&2
+    return 1
+  fi
+  export ZMK_EXTERNAL_CACHE_PREFIX="zmk-cache-external-ci-${scope}"
+}
+
 run_indexed_source() {
   local index="$1" source_file
   local args=()
@@ -289,23 +328,99 @@ run_indexed_source() {
   bash "${repo_root}/scripts/auto-build-external.sh" "${args[@]}"
 }
 
+external_diagnostics() {
+  local index="$1" output_mode="$2" directory="$3" phase=unavailable image=unavailable
+  local platform=unavailable users=unavailable source_file slug cache rest record identifier count valid
+  case "${output_mode}" in build|validate) ;; *) return 2 ;; esac
+  case "${index}" in ''|*[!0-9]*) return 2 ;; esac
+  record="${index}"
+  while [ "${record#0}" != "${record}" ]; do record="${record#0}"; done
+  [ -n "${record}" ] || return 2
+  if bash "${repo_root}/.github/scripts/check-build-output.sh" diagnostic "${output_mode}" \
+      > "${directory}/summary.record" 2> "${directory}/command.log"; then
+    if read_ci_selection "${directory}/summary.record" ''; then
+      record="${CI_SELECTION_VALUE}"
+      phase="${record%%$'\t'*}" image="${record#*$'\t'}"
+      case "${phase}" in setup|reservation|cache-reset|container-create|container-start|image-selection|source-copy|validation|compile|artifact-copy|cleanup|interrupted|complete|unknown) ;; *) phase=unavailable ;; esac
+      case "${image}" in stable|legacy-3.5|zephyr-4.1|other) ;; *) image=unavailable ;; esac
+    fi
+  fi
+  if MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker info --format '{{.OSType}}/{{.Architecture}}' \
+      > "${directory}/docker-platform.txt" 2>> "${directory}/command.log"; then
+    # Compare complete known byte records directly: a text-mode cat can strip
+    # CR on Windows, while shell substitution can discard NUL or final newlines.
+    for record in linux/amd64 linux/x86_64 linux/arm64 linux/aarch64 linux/arm/v7 linux/armv7l; do
+      if cmp -s "${directory}/docker-platform.txt" <(printf '%s\n' "${record}") ||
+          cmp -s "${directory}/docker-platform.txt" <(printf '%s\r\n' "${record}"); then
+        case "${record}" in
+          linux/amd64|linux/x86_64) platform=linux-amd64 ;;
+          linux/arm64|linux/aarch64) platform=linux-arm64 ;;
+          linux/arm/v7|linux/armv7l) platform=linux-armv7 ;;
+        esac
+      fi
+    done
+  fi
+  if configure_external_ci_cache "${directory}" 2>> "${directory}/command.log" &&
+      source_file="$(cat .build/ci-source-file 2>> "${directory}/command.log")" &&
+      bash "${repo_root}/scripts/auto-build-external.sh" --list --sources-file "${source_file}" --source-index "${index}" \
+        > "${directory}/selection.tsv" 2>> "${directory}/command.log"; then
+    # Only the first two generated fields are needed. The source value after
+    # them can contain tabs/newlines and never becomes a Docker operand.
+    if IFS=$'\t' read -r slug cache rest < "${directory}/selection.tsv"; then
+      case "${cache}" in
+        ''|*[!A-Za-z0-9_.-]*) ;;
+        *)
+          if MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker ps -aq --no-trunc --filter "volume=${cache}" \
+              > "${directory}/cache-users.txt" 2>> "${directory}/command.log"; then
+            count=0 valid=1
+            LC_ALL=C tr -d '\000' < "${directory}/cache-users.txt" > "${directory}/cache-users.checked" || return 1
+            cmp -s "${directory}/cache-users.txt" "${directory}/cache-users.checked" || valid=0
+            while IFS= read -r identifier || [ -n "${identifier}" ]; do
+              identifier="${identifier%$'\r'}"
+              case "${identifier}" in ''|*[!0-9a-f]*) valid=0 ;; esac
+              [ "${#identifier}" = 64 ] || valid=0
+              count=$((count + 1))
+            done < "${directory}/cache-users.txt"
+            [ "${valid}" != 1 ] || users="${count}"
+          fi ;;
+      esac
+    fi
+  fi
+  printf 'External diagnostic phase: %s\nExternal diagnostic image: %s\nExternal diagnostic docker-platform: %s\nExternal diagnostic cache-users: %s\n' \
+    "${phase}" "${image}" "${platform}" "${users}"
+}
+
 case "${mode}" in
-  ci-tests|ci-tools|ci-lf|ci-syntax|ci-source|ci-source-index|ci-matrix|ci-check)
+  ci-tests|ci-tools|ci-lf|ci-syntax|ci-source|ci-source-index|ci-matrix|ci-check|ci-diagnostics)
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
     cd "${repo_root}"
     mkdir -p .build
     ci_execution="$(mktemp -d .build/ci-execution.XXXXXX)"
     status=0
     case "${mode}" in
+      ci-diagnostics)
+        external_diagnostics "${2:-}" "${3:-}" "${ci_execution}" || status=$? ;;
       ci-matrix)
         (
           source_file="$(cat .build/ci-source-file)" || exit 1
           [ -n "${source_file}" ] || exit 1
-          bash "${repo_root}/scripts/auto-build-external.sh" --list-indices-json --sources-file "${source_file}" \
+          read_ci_selection .build/ci-source-index '' || exit 1
+          source_index="${CI_SELECTION_VALUE}"
+          read_ci_selection .build/ci-runner-platform auto || exit 1
+          case "${CI_SELECTION_VALUE}" in
+            auto) runner_labels='["self-hosted","zmk-docker","zmk-docker-active"]' ;;
+            macos) runner_labels='["self-hosted","macOS","zmk-docker","zmk-docker-active"]' ;;
+            windows) runner_labels='["self-hosted","Windows","zmk-docker","zmk-docker-active"]' ;;
+            linux) runner_labels='["self-hosted","Linux","zmk-docker","zmk-docker-active"]' ;;
+            *) echo 'Invalid CI runner platform.' >&2; exit 1 ;;
+          esac
+          matrix_args=(--list-indices-json --sources-file "${source_file}")
+          [ -z "${source_index}" ] || matrix_args+=(--source-index "${source_index}")
+          bash "${repo_root}/scripts/auto-build-external.sh" "${matrix_args[@]}" \
             > "${ci_execution}/matrix.json" || exit "$?"
           matrix="$(cat "${ci_execution}/matrix.json")" || exit 1
           [ "${matrix}" != '{"include":[]}' ] || exit 1
-          printf 'matrix=%s\n' "${matrix}" >> "${GITHUB_OUTPUT:?}"
+          printf 'matrix=%s\nrunner_labels=%s\n' "${matrix}" "${runner_labels}" >> "${GITHUB_OUTPUT:?}"
           count="$(grep -o '"index":' "${ci_execution}/matrix.json" | wc -l | tr -d '[:space:]')"
           printf 'Resolved source count: %s\n' "${count}" >> "${GITHUB_STEP_SUMMARY:?}"
         ) > "${ci_execution}/command.log" 2>&1 || status=$? ;;
@@ -359,14 +474,15 @@ case "${mode}" in
         shift
         printf '1\n' > .build/ci-source.status
         printf '%s\n' "${ci_execution}/command.log" > .build/ci-source.record
-        if [ "${mode}" = ci-source-index ]; then
+        (
+          configure_external_ci_cache "${ci_execution}" || exit "$?"
           # Capture direct-script notices privately; CI publishes only fixed reports.
-          GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= run_indexed_source "${1:-}" \
-            > "${ci_execution}/command.log" 2>&1 || status=$?
-        else
-          GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= bash "${repo_root}/scripts/build-external-source.sh" "$@" \
-            > "${ci_execution}/command.log" 2>&1 || status=$?
-        fi
+          if [ "${mode}" = ci-source-index ]; then
+            GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= run_indexed_source "${1:-}"
+          else
+            GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= bash "${repo_root}/scripts/build-external-source.sh" "$@"
+          fi
+        ) > "${ci_execution}/command.log" 2>&1 || status=$?
         printf '%s\n' "${status}" > .build/ci-source.status ;;
       ci-check)
         case "${2:-}" in build|validate) ;; *) echo 'Invalid output mode.' >&2; exit 2 ;; esac
@@ -375,6 +491,18 @@ case "${mode}" in
         [ "${source_status}" = 0 ] || status=1
         publish_report "$2" "${status}" || status=1 ;;
     esac
+    if [ "${mode}" = ci-tests ] && [ "${status}" != 0 ]; then
+      failure_line="$(LC_ALL=C awk '
+        { sub(/\r$/, "") }
+        /^\[output-contract\] failure line: [1-9][0-9]*$/ {
+          matches++; if (length($NF) <= 6) line = $NF
+        }
+        END { if (matches == 1) print line }
+      ' "${ci_execution}/command.log")" || failure_line=
+      if public_source_line "${failure_line}"; then
+        printf 'Output contract failure line: %s\n' "${failure_line}"
+      fi
+    fi
     printf '%s\n' "${status}" > "${ci_execution}/exit.status"
     if [ "${status}" = 0 ]; then
       echo 'Verification command completed successfully.'
@@ -554,6 +682,12 @@ read_run_order() {
   RUN_ORDER_KEY="${key}" RUN_ORDER_NUMBER="${sequence}"
 }
 
+diagnostic_only=0
+if [ "${mode}" = diagnostic ]; then
+  diagnostic_only=1
+  shift
+  mode="${1:-}" run_dir="${2:-}"
+fi
 case "${mode}" in
   validate|build) ;;
   *)
@@ -664,6 +798,38 @@ case "${compiler_jobs}" in
 esac
 
 summary_field Status
+if [ "${diagnostic_only}" = 1 ]; then
+  diagnostic_status="${SUMMARY_VALUE}"
+  case "${diagnostic_status}" in SUCCESS|FAILED) ;; *) exit 1 ;; esac
+  summary_field Mode
+  [ "${SUMMARY_VALUE}" = "${mode}" ] || exit 1
+  summary_field Reason
+  case "${SUMMARY_VALUE}" in
+    'host setup failed') diagnostic_phase=setup ;;
+    'run directory reservation failed') diagnostic_phase=reservation ;;
+    'cache reset failed') diagnostic_phase=cache-reset ;;
+    'container creation failed'|'container creation logging failed') diagnostic_phase=container-create ;;
+    'container start failed') diagnostic_phase=container-start ;;
+    'manifest image selection failed') diagnostic_phase=image-selection ;;
+    'source copy failed') diagnostic_phase=source-copy ;;
+    'validation failed'|'validate execution failed') diagnostic_phase=validation ;;
+    'firmware build failed'|'build execution failed') diagnostic_phase=compile ;;
+    'artifact copy failed') diagnostic_phase=artifact-copy ;;
+    'run directory reservation cleanup failed'|'container cleanup failed'|'container receipt cleanup failed'|'manifest inspection cleanup failed'|'image selection container cleanup failed'|'container stop failed') diagnostic_phase=cleanup ;;
+    'interrupted by INT'|'interrupted by TERM') diagnostic_phase=interrupted ;;
+    *) diagnostic_phase=unknown ;;
+  esac
+  [ "${diagnostic_status}" != SUCCESS ] || diagnostic_phase=complete
+  summary_field 'Docker image'
+  case "${SUMMARY_VALUE}" in
+    zmkfirmware/zmk-build-arm:stable) diagnostic_image=stable ;;
+    zmkfirmware/zmk-build-arm:3.5-branch) diagnostic_image=legacy-3.5 ;;
+    zmkfirmware/zmk-build-arm:4.1-branch) diagnostic_image=zephyr-4.1 ;;
+    *) diagnostic_image=other ;;
+  esac
+  printf '%s\t%s' "${diagnostic_phase}" "${diagnostic_image}"
+  exit 0
+fi
 if [ "${SUMMARY_VALUE}" != SUCCESS ]; then
   echo "build-summary.txt does not report success: ${build_summary}" >&2
   exit 1

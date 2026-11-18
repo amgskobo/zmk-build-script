@@ -8,6 +8,17 @@ on:
         required: true
         type: string
         default: repos.txt
+      source_index:
+        description: Optional original source index; blank builds the full list.
+        required: false
+        type: string
+        default: ''
+      platform:
+        description: Select an eligible runner OS or allow any eligible runner.
+        required: true
+        type: choice
+        options: [auto, macos, windows, linux]
+        default: auto
       mode:
         description: Run validate only or full firmware builds.
         required: true
@@ -57,6 +68,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.resolve.outputs.matrix }}
+      runner_labels: ${{ steps.resolve.outputs.runner_labels }}
     steps:
       - uses: actions/checkout@v6
 
@@ -67,6 +79,8 @@ jobs:
             const fs = require('node:fs');
             fs.mkdirSync('.build', {recursive: true});
             fs.writeFileSync('.build/ci-source-file', context.payload.inputs?.source_file || 'repos.txt');
+            fs.writeFileSync('.build/ci-source-index', context.payload.inputs?.source_index ?? '');
+            fs.writeFileSync('.build/ci-runner-platform', context.payload.inputs?.platform ?? 'auto');
 
       - name: Resolve source indices
         id: resolve
@@ -86,7 +100,7 @@ jobs:
       max-parallel: ${{ fromJSON(github.event.inputs.source_jobs || '4') }}
       matrix:
         source: ${{ fromJSON(needs.sources.outputs.matrix).include }}
-    runs-on: [self-hosted, zmk-docker, zmk-docker-active]
+    runs-on: ${{ fromJSON(needs.sources.outputs.runner_labels) }}
     timeout-minutes: 180
 
     steps:
@@ -195,6 +209,20 @@ jobs:
         if: ${{ runner.os == 'Windows' && always() }}
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
         run: bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}"
+
+      - name: Inspect external failure (Unix)
+        if: ${{ runner.os != 'Windows' && failure() }}
+        shell: bash
+        env:
+          SOURCE_INDEX: ${{ matrix.source.index }}
+        run: bash .github/scripts/check-build-output.sh ci-diagnostics "${SOURCE_INDEX}" "${EXTERNAL_MODE}"
+
+      - name: Inspect external failure (Windows)
+        if: ${{ runner.os == 'Windows' && failure() }}
+        shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
+        env:
+          SOURCE_INDEX: ${{ matrix.source.index }}
+        run: bash .github/scripts/check-build-output.sh ci-diagnostics "${SOURCE_INDEX}" "${EXTERNAL_MODE}"
 
       - name: Preserve private evidence (Unix)
         if: ${{ runner.os != 'Windows' && always() }}

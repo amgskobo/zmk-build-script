@@ -347,7 +347,7 @@ bash scripts/build-external-source.sh --path ../your-zmk-config --source-slug ex
 | `ZMK_EXTERNAL_PRISTINE` | `0` |
 | `ZMK_EXTERNAL_SETTINGS_RESET` | `0` |
 | `ZMK_EXTERNAL_SOURCE_JOBS` | `1` |
-| `ZMK_EXTERNAL_CACHE_PREFIX` | `zmk-cache-external`; each source adds its unique slug. |
+| `ZMK_EXTERNAL_CACHE_PREFIX` | Local CLI: `zmk-cache-external`; GitHub CI helpers: a repository/ref-scoped default. An explicit value overrides either default. Each source adds its unique slug. |
 | `ZMK_EXTERNAL_CLONE_IMAGE` | `zmkfirmware/zmk-build-arm:stable` |
 | `ZMK_EXTERNAL_CLONE_ATTEMPTS` | `3` |
 | `ZMK_EXTERNAL_SOURCE_BUILDER` | `scripts/build-external-source.sh`; worker used by the multi-source wrapper. |
@@ -575,6 +575,12 @@ Limit self-hosted execution to trusted workflows.
 
 ### Scheduling and parallelism
 
+Manual external runs accept `platform: auto|macos|windows|linux` and an optional
+`source_index`. The default `auto` permits any eligible runner; selecting an OS
+adds its standard label while retaining the required custom labels. A source index
+selects one entry from the resolved list with its original index and pinned revision;
+blank selects the full list. Scheduled runs retain automatic routing and the full list.
+
 External matrix jobs use `runner.os` for Bash/Git Bash selection and artifact
 names. `source_jobs` caps matrix parallelism (default 4); `build_jobs` controls
 target parallelism (default 1). Scheduled runs use these defaults and pristine
@@ -587,7 +593,8 @@ Check online/busy state, labels and registration scope. Remove
 
 CI publishes only fixed-field text reports under `.build/public/`. These contain
 the command outcome and recognized test statuses. A host test failure can also
-include a validated numeric source line, without raw error text. Raw environment
+include a validated numeric source line. Output-contract failures can print a
+validated numeric source line in the CI log. Neither includes raw error text. Raw environment
 records, paths, source labels, runner names, logs and firmware are excluded from automatic
 uploads. External jobs use a numeric source index in their public names.
 These reports are sanitized copies, separate from the raw evidence. On hosted
@@ -625,8 +632,22 @@ External CI uses `ci-matrix` and `ci-source-index N` with a private
 `.build/ci-source-file` selector prepared from the workflow event at runtime.
 The selector always names a list file; missing lists fail during matrix resolution.
 CI helpers operate from this repository's root regardless of the caller's directory.
+Failed external jobs run `ci-diagnostics INDEX build|validate` before archiving.
+It reports an allowlisted summary phase and image family, Docker architecture and
+the number of containers retaining that source's cache. Unavailable observations
+remain `unavailable`; raw errors, container IDs, cache names and paths stay private.
 Only numeric indices enter the matrix and step environment; source paths, URLs
 and slugs stay out of runner-generated step details as well as command output.
+With GitHub Actions and no explicit `ZMK_EXTERNAL_CACHE_PREFIX`, the source and
+diagnostic helpers use a cache namespace derived from the repository and full Git
+ref. The same ref reuses its cache across runs; branches, tags and repositories
+are isolated. Raw repository/ref values stay out of cache names and diagnostics.
+An explicit prefix retains the runner owner's chosen namespace; local CLI defaults
+are unchanged. CI scope hashing requires Git. Missing CI context or a failed scope calculation stops the source
+before invoking its worker, rather than falling back to a shared cache.
+Existing unscoped volumes and retaining containers are left untouched. Pristine
+still resets only the selected volume and refuses any in-use reference, including
+a retained container on the same ref.
 The selector preparation uses the Node runtime bundled with `actions/github-script`;
 it adds no host requirement to the local CLI.
 
@@ -647,12 +668,13 @@ bash .github/scripts/test.sh all
 | Layer | Scope |
 | --- | --- |
 | `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module and temporary paths with spaces/Unicode, literal option-like/shell-character/emoji filenames, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
-| `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Uses the image's Python/PyYAML. |
-| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
+| `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Build/validate must reject pristine with running or stopped cache holders. The pristine lane also checks validation recovery after releasing its own holders and removal of stale workspace/ccache state. Uses the image's Python/PyYAML. |
+| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. The pristine lane seeds stale workspace/ccache state before the standard build and verifies its removal. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run independent shell cases alongside the ordered Docker contracts and firmware chain. |
 
 Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
-Ubuntu. Manual self-hosted `mode=validate` runs `shell` and `docker`;
+Ubuntu with `ZMK_TEST_PRISTINE=1` required for both Docker and firmware checks.
+Manual self-hosted `mode=validate` runs `shell` and `docker`;
 `mode=build` runs `all` on each selected native host. Use the latter for native
 Docker firmware coverage: a shell or validate result alone does not establish it.
 `mode=firmware` selects the existing `build` layer for focused firmware/concurrency
@@ -757,7 +779,11 @@ The self-hosted workflow supplies a repository/OS prefix. Jobs for the same OS a
 serialized to protect that cache; different OS jobs remain independent. It prints
 only fixed numeric Docker CPU/memory capacity and presence of an existing cache
 override. Host/device identifiers and actual cache names stay in private evidence.
-`ZMK_TEST_PRISTINE=1` resets that test cache before the standard build, while
-restoration always retains it. Each build/validate result is checked immediately
+`ZMK_TEST_PRISTINE=1` tests a reset after the Docker cache-holder rejection cases
+and before the standard firmware build, including removal of seeded stale state
+at the volume root, in the workspace and in ccache. Restoration always retains
+the cache. `ZMK_TEST_PRISTINE=0` selects reuse checks; its success does not establish
+pristine success. Tests release only their own acquired container references and
+reject unknown holders. Each build/validate result is checked immediately
 using its exact run directory. Report local, remote CI, host-platform and physical
 hardware evidence separately. Publication requires an explicit user instruction.
