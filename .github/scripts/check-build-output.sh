@@ -328,16 +328,56 @@ run_indexed_source() {
   bash "${repo_root}/scripts/auto-build-external.sh" "${args[@]}"
 }
 
+normalize_ci_source_index() {
+  CI_SOURCE_INDEX="$1"
+  case "${CI_SOURCE_INDEX}" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "${CI_SOURCE_INDEX#0}" != "${CI_SOURCE_INDEX}" ]; do CI_SOURCE_INDEX="${CI_SOURCE_INDEX#0}"; done
+  [ -n "${CI_SOURCE_INDEX}" ]
+}
+
+write_ci_source_context() {
+  printf '%s\0' "${GITHUB_RUN_ID:-}" "${GITHUB_RUN_ATTEMPT:-}" "${GITHUB_JOB:-}"
+}
+
+ci_source_run_dir() {
+  local index="${1:-}" require_success="${2:-0}" source_log directory name source_status
+  [ ! -L .build ] && [ -f .build/ci-source.record ] && [ ! -L .build/ci-source.record ] || return 1
+  IFS= read -r source_log < .build/ci-source.record || return 1
+  case "${source_log}" in .build/ci-execution.??????/command.log) ;; *) return 1 ;; esac
+  directory="${source_log%/*}"
+  case "${directory##*.}" in *[!A-Za-z0-9]*) return 1 ;; esac
+  cmp -s .build/ci-source.record <(printf '%s\n' "${source_log}") || return 1
+  [ -d "${directory}" ] && [ ! -L "${directory}" ] || return 1
+  [ -f "${directory}/source-context" ] && [ ! -L "${directory}/source-context" ] || return 1
+  cmp -s "${directory}/source-context" <(write_ci_source_context) || return 1
+  if [ -n "${index}" ]; then
+    read_ci_selection "${directory}/source-index" '' || return 1
+    [ "${CI_SELECTION_VALUE}" = "${index}" ] || return 1
+  fi
+  [ -f .build/ci-source.status ] && [ ! -L .build/ci-source.status ] &&
+    [ -f "${directory}/exit.status" ] && [ ! -L "${directory}/exit.status" ] || return 1
+  IFS= read -r source_status < "${directory}/exit.status" || return 1
+  case "${source_status}" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  [ "${source_status}" -le 255 ] || return 1
+  [ "${require_success}" != 1 ] || [ "${source_status}" = 0 ] || return 1
+  cmp -s "${directory}/exit.status" <(printf '%s\n' "${source_status}") &&
+    cmp -s "${directory}/exit.status" .build/ci-source.status || return 1
+  read_ci_selection "${directory}/build-run" '' || return 1
+  name="${CI_SELECTION_VALUE}"
+  case "${name}" in run-*) ;; *) return 1 ;; esac
+  case "${name}" in *[!a-z0-9_-]*) return 1 ;; esac
+  [ -d ".build/${name}" ] && [ ! -L ".build/${name}" ] || return 1
+  printf '.build/%s\n' "${name}"
+}
+
 external_diagnostics() {
   local index="$1" output_mode="$2" directory="$3" phase=unavailable image=unavailable
-  local platform=unavailable users=unavailable source_file slug cache rest record identifier count valid
+  local platform=unavailable users=unavailable source_file slug cache rest record identifier count valid run
   case "${output_mode}" in build|validate) ;; *) return 2 ;; esac
-  case "${index}" in ''|*[!0-9]*) return 2 ;; esac
-  record="${index}"
-  while [ "${record#0}" != "${record}" ]; do record="${record#0}"; done
-  [ -n "${record}" ] || return 2
-  if bash "${repo_root}/.github/scripts/check-build-output.sh" diagnostic "${output_mode}" \
-      > "${directory}/summary.record" 2> "${directory}/command.log"; then
+  normalize_ci_source_index "${index}" || return 2
+  if run="$(ci_source_run_dir "${CI_SOURCE_INDEX}" 2> "${directory}/command.log")" &&
+      bash "${repo_root}/.github/scripts/check-build-output.sh" diagnostic "${output_mode}" "${run}" \
+      > "${directory}/summary.record" 2>> "${directory}/command.log"; then
     if read_ci_selection "${directory}/summary.record" ''; then
       record="${CI_SELECTION_VALUE}"
       phase="${record%%$'\t'*}" image="${record#*$'\t'}"
@@ -395,6 +435,15 @@ case "${mode}" in
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
     cd "${repo_root}"
     mkdir -p .build
+    case "${mode}" in
+      ci-source|ci-source-index)
+        [ ! -L .build ] && [ ! -L .build/ci-source.status ] || exit 1
+        # Fence off any previous receipt before allocating this invocation's directory.
+        if ! printf 'pending\n' > .build/ci-source.status; then
+          rm -f .build/ci-source.record
+          exit 1
+        fi ;;
+    esac
     ci_execution="$(mktemp -d .build/ci-execution.XXXXXX)"
     status=0
     case "${mode}" in
@@ -472,9 +521,15 @@ case "${mode}" in
         ) > "${ci_execution}/command.log" 2>&1 || status=$? ;;
       ci-source|ci-source-index)
         shift
-        printf '1\n' > .build/ci-source.status
+        [ ! -L .build/ci-source.record ] || exit 1
         printf '%s\n' "${ci_execution}/command.log" > .build/ci-source.record
         (
+          write_ci_source_context > "${ci_execution}/source-context" || exit "$?"
+          if [ "${mode}" = ci-source-index ]; then
+            normalize_ci_source_index "${1:-}" || exit 1
+            printf '%s' "${CI_SOURCE_INDEX}" > "${ci_execution}/source-index" || exit "$?"
+          fi
+          export ZMK_CI_BUILD_RUN_FILE="${repo_root}/${ci_execution}/build-run"
           configure_external_ci_cache "${ci_execution}" || exit "$?"
           # Capture direct-script notices privately; CI publishes only fixed reports.
           if [ "${mode}" = ci-source-index ]; then
@@ -482,13 +537,17 @@ case "${mode}" in
           else
             GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= bash "${repo_root}/scripts/build-external-source.sh" "$@"
           fi
-        ) > "${ci_execution}/command.log" 2>&1 || status=$?
-        printf '%s\n' "${status}" > .build/ci-source.status ;;
+        ) > "${ci_execution}/command.log" 2>&1 || status=$? ;;
       ci-check)
         case "${2:-}" in build|validate) ;; *) echo 'Invalid output mode.' >&2; exit 2 ;; esac
-        bash "${repo_root}/.github/scripts/check-build-output.sh" "$2" > "${ci_execution}/command.log" 2>&1 || status=$?
-        source_status="$(cat .build/ci-source.status 2>/dev/null || true)"
-        [ "${source_status}" = 0 ] || status=1
+        (
+          CI_SOURCE_INDEX=
+          [ "$#" -lt 3 ] || normalize_ci_source_index "$3" || exit 1
+          run="$(ci_source_run_dir "${CI_SOURCE_INDEX}" 1)" || {
+            echo 'The current source did not record a successful run.' >&2; exit 1;
+          }
+          bash "${repo_root}/.github/scripts/check-build-output.sh" "$2" "${run}"
+        ) > "${ci_execution}/command.log" 2>&1 || status=$?
         publish_report "$2" "${status}" || status=1 ;;
     esac
     if [ "${mode}" = ci-tests ] && [ "${status}" != 0 ]; then
@@ -504,6 +563,12 @@ case "${mode}" in
       fi
     fi
     printf '%s\n' "${status}" > "${ci_execution}/exit.status"
+    case "${mode}" in
+      ci-source|ci-source-index)
+        if cmp -s .build/ci-source.record <(printf '%s\n' "${ci_execution}/command.log"); then
+          printf '%s\n' "${status}" > .build/ci-source.status
+        fi ;;
+    esac
     if [ "${status}" = 0 ]; then
       echo 'Verification command completed successfully.'
     else
@@ -816,7 +881,7 @@ if [ "${diagnostic_only}" = 1 ]; then
     'firmware build failed'|'build execution failed') diagnostic_phase=compile ;;
     'artifact copy failed') diagnostic_phase=artifact-copy ;;
     'run directory reservation cleanup failed'|'container cleanup failed'|'container receipt cleanup failed'|'manifest inspection cleanup failed'|'image selection container cleanup failed'|'container stop failed') diagnostic_phase=cleanup ;;
-    'interrupted by INT'|'interrupted by TERM') diagnostic_phase=interrupted ;;
+    'interrupted by INT'|'interrupted by TERM'|'interrupted by SIGINT'|'interrupted by SIGTERM') diagnostic_phase=interrupted ;;
     *) diagnostic_phase=unknown ;;
   esac
   [ "${diagnostic_status}" != SUCCESS ] || diagnostic_phase=complete

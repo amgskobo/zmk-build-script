@@ -24,6 +24,12 @@ capture_container_build_stream() {
   return 1
 }
 
+check_pristine_cache_reset() {
+  local volume="$1" log="$2"
+  sed $'s/\033\\[[0-9;]*m//g' "${log}" | tr -d '\r' |
+    grep -Fx -e "${volume}" -e "Cache volume is not present; starting fresh: ${volume}" >/dev/null
+}
+
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "${repo_root}"
@@ -87,6 +93,10 @@ build_case() {
   case "${name}" in
     standard)
       grep -qx 'Built targets: 8' "${run}/build-summary.txt"
+      if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
+        grep -qx 'Pristine: 1' "${run}/build-summary.txt"
+        check_pristine_cache_reset "${ZMK_DOCKER_CACHE_VOLUME}" "${run}/build.log"
+      fi
       if [ "${ZMK_BUILD_JOBS:-1}" -gt 1 ]; then
         grep -F "Building targets in parallel (jobs=${ZMK_BUILD_JOBS})" "${run}/build.log"
       fi
@@ -104,44 +114,17 @@ build_case() {
   [ -n "${last_container}" ] || { echo 'build did not return a container ID' >&2; return 1; }
 }
 pristine=()
-if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
-  pristine+=(--pristine)
-  # Populate all cache scopes before the real build. Removing the acquired seed
-  # container is required: even a stopped reference would prevent pristine.
-  seed_id="$(docker create --label owner.repository=amgskobo/zmk-build-script \
-    --label owner.purpose=pristine-fixture-seed -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces" \
-    "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" sh -c '
-      set -eu
-      mkdir -p /workspaces/zmk-config /workspaces/.ccache
-      for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-        printf "stale pristine fixture\n" > "$root/.ci-pristine-stale"
-        test -s "$root/.ci-pristine-stale"
-      done
-      echo "[pristine-contract] firmware stale state seeded"' | tr -d '\r')"
-  containers+=("${seed_id}")
-  docker start -a "${seed_id}" | tee "${ZMK_TEST_RESULTS}/pristine-seed.log"
-  grep -Fxq '[pristine-contract] firmware stale state seeded' "${ZMK_TEST_RESULTS}/pristine-seed.log"
-  docker rm "${seed_id}" >/dev/null
-fi
+# The Docker contracts check removal of seeded state. The real firmware build
+# leaves the selected cache untouched until build.sh can reset it with Docker.
+[ "${ZMK_TEST_PRISTINE:-0}" != 1 ] || pristine+=(--pristine)
 build_case standard .github/fixtures/ci-zmk-config --jobs "${ZMK_BUILD_JOBS:-1}" ${pristine[@]+"${pristine[@]}"}
 cache_reader="zmk-test-cache-$$"
 # Record ownership only after create succeeds.
-cache_reader_id="$(docker create --name "${cache_reader}" --label owner.repository=amgskobo/zmk-build-script \
-  --label owner.purpose=firmware-cache-reader -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces" \
-  "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" sh -c '
-    set -eu
-    [ "$1" = 1 ] || exit 0
-    for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-      test ! -e "$root/.ci-pristine-stale"
-    done
-    echo "[pristine-contract] firmware stale state removed"' _ "${ZMK_TEST_PRISTINE:-0}" | tr -d '\r')"
+reader_args=(create --name "${cache_reader}" --label owner.repository=amgskobo/zmk-build-script
+  --label owner.purpose=firmware-cache-reader -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces:ro,nocopy")
+[ -z "${ZMK_DOCKER_PLATFORM:-}" ] || reader_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
+cache_reader_id="$(docker "${reader_args[@]}" "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" /bin/sh -c ':' | tr -d '\r')"
 containers+=("${cache_reader_id}")
-docker start -a "${cache_reader_id}" | tee "${ZMK_TEST_RESULTS}/pristine-check.log"
-if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
-  grep -Fxq '[pristine-contract] firmware stale state removed' "${ZMK_TEST_RESULTS}/pristine-check.log"
-  standard_run="$(awk -F '\t' '$1 == "standard" {print $2}' "${ZMK_TEST_RESULTS}/firmware-runs.tsv")"
-  grep -qx 'Pristine: 1' "${standard_run}/build-summary.txt"
-fi
 # Use the same native host-path conversion as external clone.
 source scripts/build-external-source.sh
 module_parent="${scratch}/.module inputs 名前"

@@ -211,13 +211,14 @@ together.
   gate. Missing inputs block dependent checks only; documented preparation within an authorized
   build/setup remains in scope.
 
-- Reuse compatible environments/caches, retaining required clean-cache lanes. Provide required
-  inputs, including relevant untracked files, through read-only mounts or isolated container copies;
-  verify source identity before/after. Isolate mutable build/runtime/install trees per job under one
-  CPU/memory budget, including nested workers. Build once per configuration and reuse that exact
-  binary for identical repeats; cached PASS is not a new run. Performance comparisons separate
-  preparation/staging/build/execution/validation and cold/warm conditions. Existing hosted platform
-  jobs retain their own OS requirements.
+- Reuse compatible environments/caches, retaining required clean-cache lanes. Reuse the owner's
+  per-repository/tool cache volume rather than creating a dependency cache per task. Provide
+  required inputs, including relevant untracked files, through read-only mounts or isolated
+  container copies; verify source identity before/after. Isolate mutable build/runtime/install
+  trees per job under one CPU/memory budget, including nested workers. Build once per
+  configuration and reuse that exact binary for identical repeats; cached PASS is not a new run.
+  Performance comparisons separate preparation/staging/build/execution/validation and cold/warm
+  conditions. Existing hosted platform jobs retain their own OS requirements.
 
 ## Checks and entry points
 
@@ -281,7 +282,10 @@ together.
   output/times, retaining first failures and relevant config/DTS/binaries. Source or dependency
   drift invalidates affected results; never edit running scripts. Put retained outputs on a mounted
   named volume or export them before container removal, including failures; a path printed inside a
-  disposable container is not retained evidence.
+  disposable container is not retained evidence. Label each container and volume you create with
+  its owner repository and task. At handoff, export only retained evidence to a private host path,
+  remove that task's containers and volumes, keep reusable caches and report anything left; never
+  remove resources you did not create or that an active task still uses.
 
 - Preserve exact fixed-input traces or specification-based timing bounds; totals do not replace
   per-report order/time. Before calling a mismatch nondeterministic, repeat identical

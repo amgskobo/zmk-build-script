@@ -29,7 +29,11 @@ cleanup() {
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
-trap 'output_contract_status=$? output_contract_line=$LINENO; printf "[output-contract] failure line: %s\n" "${output_contract_line}" >&2; exit "${output_contract_status}"' ERR
+fail_output_contract() {
+  printf '[output-contract] failure line: %s\n' "$2" >&2
+  exit "$1"
+}
+trap 'fail_output_contract "$?" "$LINENO"' ERR
 
 reset_case() {
   rm -rf "${case_root}"
@@ -44,13 +48,16 @@ write_summary() {
 run_ok() {
   local mode="$1" run_arg="${2:-}" expected_file="${3:-}"
   if [ -n "${expected_file}" ]; then
-    (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" --expect "${expected_file}" >/dev/null)
+    (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" --expect "${expected_file}" >/dev/null) ||
+      fail_output_contract "$?" "${BASH_LINENO[0]}"
     return
   fi
   if [ -n "${run_arg}" ]; then
-    (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" >/dev/null)
+    (cd "${case_root}" && bash "${checker}" "${mode}" "${run_arg}" >/dev/null) ||
+      fail_output_contract "$?" "${BASH_LINENO[0]}"
   else
-    (cd "${case_root}" && bash "${checker}" "${mode}" >/dev/null)
+    (cd "${case_root}" && bash "${checker}" "${mode}" >/dev/null) ||
+      fail_output_contract "$?" "${BASH_LINENO[0]}"
   fi
 }
 
@@ -64,9 +71,9 @@ run_fail() {
   [ -z "${expected_file}" ] || check_cmd+=(--expect "${expected_file}")
   if (cd "${case_root}" && "${check_cmd[@]}" >"${tmp_dir}/stdout" 2>"${tmp_dir}/stderr"); then
     echo "check-build-output.sh ${mode} unexpectedly succeeded" >&2
-    exit 1
+    fail_output_contract 1 "${BASH_LINENO[0]}"
   fi
-  grep -q "${expected}" "${tmp_dir}/stderr"
+  grep -q "${expected}" "${tmp_dir}/stderr" || fail_output_contract "$?" "${BASH_LINENO[0]}"
 }
 
 rm -rf "${case_root}"
@@ -738,6 +745,8 @@ firmware build failed|compile
 artifact copy failed|artifact-copy
 container cleanup failed|cleanup
 interrupted by TERM|interrupted
+interrupted by SIGINT|interrupted
+interrupted by SIGTERM|interrupted
 synthetic-private-host /synthetic/private secret=value|unknown
 EOF
 printf 'Reason: cache reset failed\n' >> "${run_path}/build-summary.txt"
@@ -958,6 +967,7 @@ cat > "${ci_root}/scripts/build-external-source.sh" <<'EOF'
 #!/usr/bin/env bash
 echo 'synthetic-private-host /synthetic/private/source secret=value'
 [ -z "${CACHE_PREFIX_CAPTURE:-}" ] || printf '%s' "${ZMK_EXTERNAL_CACHE_PREFIX:-zmk-cache-external}" > "${CACHE_PREFIX_CAPTURE}"
+[ -z "${PROBE_RUN_NAME:-}" ] || printf '%s' "${PROBE_RUN_NAME}" > "${ZMK_CI_BUILD_RUN_FILE}"
 [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo 'private source identity' >> "${GITHUB_STEP_SUMMARY}"
 exit "${PUBLIC_PROBE_EXIT}"
 EOF
@@ -965,7 +975,7 @@ printf 'Status: SUCCESS\nMode: build\nBuilt targets: 1\n' > "${ci_root}/.build/$
 printf 'synthetic private build log\n' > "${ci_root}/.build/${run_name}/build.log"
 printf 'synthetic private firmware\n' > "${ci_root}/.build/${run_name}/private-device.bin"
 for expected in 23 0; do
-  if (cd "${ci_root}"; PUBLIC_PROBE_EXIT="${expected}" GITHUB_STEP_SUMMARY="${tmp_dir}/public-summary" \
+  if (cd "${ci_root}"; PUBLIC_PROBE_EXIT="${expected}" PROBE_RUN_NAME="${run_name}" GITHUB_STEP_SUMMARY="${tmp_dir}/public-summary" \
       bash .github/scripts/check-build-output.sh ci-source --path /synthetic/private/source) \
       >"${tmp_dir}/ci-stdout" 2>"${tmp_dir}/ci-stderr"; then status=0; else status=$?; fi
   [ "${status}" = "${expected}" ]
@@ -985,6 +995,13 @@ for expected in 23 0; do
   if grep -Eq 'synthetic-private-host|/synthetic/private|private-device|secret=' "${ci_root}/.build/public/build.txt"; then exit 1; fi
 done
 [ "$(find "${ci_root}/.build" -name command.log -type f | wc -l | tr -d '[:space:]')" = 4 ]
+(cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-source --path /synthetic/private/source) \
+  > "${tmp_dir}/source-without-run-console" 2>&1
+if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-check build) \
+    >> "${tmp_dir}/source-without-run-console" 2>&1; then
+  echo 'CI output check accepted a stale successful run.' >&2; exit 1
+fi
+grep -qx 'Outcome: FAILED' "${ci_root}/.build/public/build.txt"
 
 cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -1010,6 +1027,39 @@ for marker in valid cr zero oversized duplicate private; do
     *) if grep '^Output contract failure line:' "${tmp_dir}/failure-line-console" >/dev/null; then exit 1; fi ;;
   esac
   if grep -Eq 'synthetic-private|/synthetic/private|secret=' "${tmp_dir}/failure-line-console"; then exit 1; fi
+done
+
+# Exercise the actual marker producer by failing assertions early in a fresh copy.
+assertion_scripts="${tmp_dir}/assertion-producer/.github/scripts"
+mkdir -p "${assertion_scripts}"
+cp "${BASH_SOURCE[0]}" "${assertion_scripts}/test-check-build-output.sh"
+cat > "${assertion_scripts}/check-build-output.sh" <<'EOF'
+#!/usr/bin/env bash
+case "${ASSERTION_PROBE}" in
+  unexpected-success) exit 0 ;;
+  wrong-error) echo 'different error' >&2; exit 1 ;;
+esac
+if [ ! -d .build ]; then
+  echo '.build directory was not created' >&2; exit 1
+fi
+if [ ! -f ".build/${PROBE_RUN_NAME}/build-summary.txt" ]; then
+  echo 'build-summary.txt was not produced' >&2; exit 1
+fi
+exit 23
+EOF
+for assertion_probe in unexpected-success wrong-error unexpected-failure; do
+  assertion_call='run_fail validate ".build directory was not created"' assertion_expected=1
+  if [ "${assertion_probe}" = unexpected-failure ]; then
+    assertion_call='run_ok validate' assertion_expected=23
+  fi
+  assertion_line="$(awk -v call="${assertion_call}" '$0 == call {print NR; exit}' "${BASH_SOURCE[0]}")"
+  [ -n "${assertion_line}" ]
+  assertion_status=0
+  ASSERTION_PROBE="${assertion_probe}" PROBE_RUN_NAME="${run_name}" bash "${assertion_scripts}/test-check-build-output.sh" \
+    > "${tmp_dir}/assertion-${assertion_probe}.log" 2>&1 || assertion_status=$?
+  [ "${assertion_status}" = "${assertion_expected}" ]
+  grep -F '[output-contract] failure line:' "${tmp_dir}/assertion-${assertion_probe}.log" |
+    cmp - <(printf '[output-contract] failure line: %s\n' "${assertion_line}")
 done
 
 cat > "${ci_root}/.github/scripts/test.sh" <<'EOF'
@@ -1207,6 +1257,12 @@ chmod +x "${external_diagnostic_bin}/cat"
 diagnostic_real_cat="$(command -v cat)"
 printf 'Status: FAILED\nMode: build\nReason: cache reset failed\nDocker image: zmkfirmware/zmk-build-arm:3.5-branch\n' \
   > "${ci_root}/.build/${run_name}/build-summary.txt"
+unrelated_run="${ci_root}/.build/run-2026-05-24_00-00-00-unrelated"
+mkdir "${unrelated_run}"
+printf 'Status: SUCCESS\nMode: build\nDocker image: zmkfirmware/zmk-build-arm:stable\n' > "${unrelated_run}/build-summary.txt"
+printf 'synthetic unrelated build\n' > "${unrelated_run}/build.log"
+(cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 PROBE_RUN_NAME="${run_name}" bash .github/scripts/check-build-output.sh ci-source-index 0002) \
+  > "${tmp_dir}/diagnostic-source-console" 2>&1
 for probe in holders normalized-cat empty failed malformed nul unknown-platform; do
   diagnostic_users=1 diagnostic_ps_status=0 diagnostic_platform=linux/x86_64 expected_users=1 expected_platform=linux-amd64 diagnostic_cat_normalize=0
   case "${probe}" in
@@ -1228,6 +1284,26 @@ for probe in holders normalized-cat empty failed malformed nul unknown-platform;
   if grep -Eq 'synthetic-private|/synthetic/private|secret=|zmk-cache|0000000000' "${tmp_dir}/diagnostic-console"; then
     echo 'external diagnostics disclosed raw data' >&2; exit 1
   fi
+done
+# Failed pre-builder invocation, mismatched source and stale job attempt must hide the old summary.
+for stale_probe in missing-run wrong-index wrong-attempt; do
+  stale_run="${run_name}" stale_index=2 stale_attempt=1
+  case "${stale_probe}" in
+    missing-run) stale_run= ;;
+    wrong-index) stale_index=1 ;;
+    wrong-attempt) stale_attempt=2 ;;
+  esac
+  stale_status=0
+  (cd "${ci_root}"; GITHUB_RUN_ID=111 GITHUB_RUN_ATTEMPT=1 PUBLIC_PROBE_EXIT=23 PROBE_RUN_NAME="${stale_run}" \
+    bash .github/scripts/check-build-output.sh ci-source-index "${stale_index}") > "${tmp_dir}/stale-source-console" 2>&1 || stale_status=$?
+  [ "${stale_status}" = 1 ]
+  (cd "${ci_root}"; PATH="${external_diagnostic_bin}:${PATH}" DIAGNOSTIC_PLATFORM=linux/x86_64 \
+    DIAGNOSTIC_REAL_CAT="${diagnostic_real_cat}" DIAGNOSTIC_USERS=0 DIAGNOSTIC_PS_STATUS=0 \
+    DIAGNOSTIC_ARGV="${tmp_dir}/diagnostic.argv" GITHUB_RUN_ID=111 GITHUB_RUN_ATTEMPT="${stale_attempt}" \
+    bash .github/scripts/check-build-output.sh ci-diagnostics 2 build) > "${tmp_dir}/stale-diagnostic-console" 2>&1
+  grep -qx 'External diagnostic phase: unavailable' "${tmp_dir}/stale-diagnostic-console"
+  grep -qx 'External diagnostic image: unavailable' "${tmp_dir}/stale-diagnostic-console"
+  grep -qx 'External diagnostic cache-users: 0' "${tmp_dir}/stale-diagnostic-console"
 done
 # CI caches are stable within a repository/ref and distinct across refs/forks.
 # The same wrapper entry and diagnostic selector must receive the same prefix.
@@ -1363,9 +1439,33 @@ printf 'sources.txt\n' > "${ci_root}/.build/ci-source-file"
 (cd "${tmp_dir}"; GITHUB_OUTPUT="${tmp_dir}/outside-matrix-output" GITHUB_STEP_SUMMARY="${tmp_dir}/matrix-summary" \
   bash "${ci_root}/.github/scripts/check-build-output.sh" ci-matrix) >"${tmp_dir}/outside-matrix-console" 2>&1
 grep -qx 'matrix={"include":\[{"index":1},{"index":2}\]}' "${tmp_dir}/outside-matrix-output"
-(cd "${ci_root}/.github"; bash scripts/check-build-output.sh ci-check build) \
+(cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 PROBE_RUN_NAME="${run_name}" bash .github/scripts/check-build-output.sh ci-source-index 2) \
+  > "${tmp_dir}/relative-source-console" 2>&1
+if (cd "${ci_root}/.github"; bash scripts/check-build-output.sh ci-check build 1) \
+    > "${tmp_dir}/wrong-source-check-console" 2>&1; then
+  echo 'CI certified the output of another source.' >&2; exit 1
+fi
+(cd "${ci_root}/.github"; bash scripts/check-build-output.sh ci-check build 2) \
   >"${tmp_dir}/relative-check-console" 2>&1
 grep -qx 'Outcome: SUCCESS' "${ci_root}/.build/public/build.txt"
+retry_bin="${tmp_dir}/retry-bin"
+mkdir "${retry_bin}"
+cat > "${retry_bin}/mktemp" <<'EOF'
+#!/usr/bin/env bash
+echo 'injected CI execution allocation failure' >&2
+exit 23
+EOF
+chmod +x "${retry_bin}/mktemp"
+status=0
+(cd "${ci_root}"; PATH="${retry_bin}:${PATH}" PUBLIC_PROBE_EXIT=0 PROBE_RUN_NAME="${run_name}" \
+  bash .github/scripts/check-build-output.sh ci-source-index 2) > "${tmp_dir}/source-retry-console" 2>&1 || status=$?
+[ "${status}" = 23 ]
+grep -Fxq 'injected CI execution allocation failure' "${tmp_dir}/source-retry-console"
+if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-check build 2) \
+    >> "${tmp_dir}/source-retry-console" 2>&1; then
+  echo 'CI certified stale output after a failed retry setup.' >&2; exit 1
+fi
+grep -qx 'Outcome: FAILED' "${ci_root}/.build/public/build.txt"
 for invalid in '' 0 3 bad; do
   if (cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-source-index "${invalid}") \
     >"${tmp_dir}/index-console" 2>&1; then echo 'invalid CI source index accepted' >&2; exit 1; fi

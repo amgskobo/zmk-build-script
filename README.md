@@ -604,7 +604,7 @@ diagnosis requires a local reproduction or separately reviewed private retrieval
 CI uses `bash .github/scripts/check-build-output.sh ci-tests <mode>` to run the
 [canonical test entry point](#maintenance), retaining detailed output in `.build/`
 logs, using a fresh `.build/ci-execution.XXXXXX/` for each command. `ci-tools`,
-`ci-lf`, `ci-syntax`, `ci-source <wrapper arguments>` and `ci-check build|validate`
+`ci-lf`, `ci-syntax`, `ci-source <wrapper arguments>` and `ci-check build|validate [INDEX]`
 provide the same boundary for external builds. `publish clear` initializes the
 known report files before a job, and `publish verify` checks the final payload
 before upload. Both steps must succeed for the upload to run.
@@ -633,7 +633,9 @@ External CI uses `ci-matrix` and `ci-source-index N` with a private
 The selector always names a list file; missing lists fail during matrix resolution.
 CI helpers operate from this repository's root regardless of the caller's directory.
 Failed external jobs run `ci-diagnostics INDEX build|validate` before archiving.
-It reports an allowlisted summary phase and image family, Docker architecture and
+The output check and diagnostics use the run directory recorded by the current
+source invocation. Wrappers used by CI must pass the builder's environment through.
+Diagnostics report an allowlisted summary phase and image family, Docker architecture and
 the number of containers retaining that source's cache. Unavailable observations
 remain `unavailable`; raw errors, container IDs, cache names and paths stay private.
 Only numeric indices enter the matrix and step environment; source paths, URLs
@@ -669,7 +671,7 @@ bash .github/scripts/test.sh all
 | --- | --- |
 | `shell` | Bash syntax, LF/checkout, whitespace, output/private-archive checks, source queue/failures/cancellation, host guards and help. Native tar/Git copy checks cover target/module and temporary paths with spaces/Unicode, literal option-like/shell-character/emoji filenames, binary contents, actual symlinks, root versus nested exclusions, Git selection and fallback. Git is required for this test layer. |
 | `docker` | Actual source copy, metadata, image/build parsers, controlled workspace/update/overlay failures and cancellation, cleanup, ccache hits, Windows clone copy-back and external workflow argument forwarding. Build/validate must reject pristine with running or stopped cache holders. The pristine lane also checks validation recovery after releasing its own holders and removal of stale workspace/ccache state. Uses the image's Python/PyYAML. |
-| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. The pristine lane seeds stale workspace/ccache state before the standard build and verifies its removal. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
+| `build` | [Standard firmware](.github/fixtures/ci-zmk-config/build.yaml), [project overlays](.github/fixtures/module-override-zmk-config/build.yaml), extra modules, restoration without pristine and a standalone application with root snippets. The pristine lane verifies that Docker removes the selected cache or finds it already absent before the standard build. Real Docker paths include spaces, Unicode and hidden parents; checks require exact outputs, target log order, concurrency settings and dependency identities. |
 | `all` | Run independent shell cases alongside the ordered Docker contracts and firmware chain. |
 
 Hosted CI runs `shell` on Linux, macOS and Windows, plus `docker` and `build` on
@@ -779,10 +781,11 @@ The self-hosted workflow supplies a repository/OS prefix. Jobs for the same OS a
 serialized to protect that cache; different OS jobs remain independent. It prints
 only fixed numeric Docker CPU/memory capacity and presence of an existing cache
 override. Host/device identifiers and actual cache names stay in private evidence.
-`ZMK_TEST_PRISTINE=1` tests a reset after the Docker cache-holder rejection cases
-and before the standard firmware build, including removal of seeded stale state
-at the volume root, in the workspace and in ccache. Restoration always retains
-the cache. `ZMK_TEST_PRISTINE=0` selects reuse checks; its success does not establish
+`ZMK_TEST_PRISTINE=1` verifies removal of seeded stale state at the volume root,
+in the workspace and in ccache after the Docker cache-holder rejection cases.
+The standard firmware build runs with `--pristine`, and a late-holder control
+confirms that a refused reset leaves the existing cache markers unchanged.
+Restoration always retains the cache. `ZMK_TEST_PRISTINE=0` selects reuse checks; its success does not establish
 pristine success. Tests release only their own acquired container references and
 reject unknown holders. Each build/validate result is checked immediately
 using its exact run directory. Report local, remote CI, host-platform and physical

@@ -203,12 +203,16 @@ jobs:
       - name: Check build output (Unix)
         if: ${{ runner.os != 'Windows' && always() }}
         shell: bash
-        run: bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}"
+        env:
+          SOURCE_INDEX: ${{ matrix.source.index }}
+        run: bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}" "${SOURCE_INDEX}"
 
       - name: Check build output (Windows)
         if: ${{ runner.os == 'Windows' && always() }}
         shell: C:\Progra~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
-        run: bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}"
+        env:
+          SOURCE_INDEX: ${{ matrix.source.index }}
+        run: bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}" "${SOURCE_INDEX}"
 
       - name: Inspect external failure (Unix)
         if: ${{ runner.os != 'Windows' && failure() }}
