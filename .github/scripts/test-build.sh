@@ -1750,7 +1750,7 @@ docker exec "${last_container}" sh -c '
   set -eu
   mkdir -p /workspaces/zmk-config /workspaces/.ccache
   for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-    printf "stale pristine fixture\n" > "$root/.ci-pristine-stale"
+    printf "pristine contract canary\n" > "$root/.ci-pristine-stale"
   done'
 assert_pristine_rejected() {
   local state="$1" command log summary container
@@ -1804,28 +1804,30 @@ docker start "${last_container}" >/dev/null
 docker exec "${last_container}" sh -c '
   set -eu
   for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-    test "$(cat "$root/.ci-pristine-stale")" = "stale pristine fixture"
+    test "$(cat "$root/.ci-pristine-stale")" = "pristine contract canary"
     [ "$1" = 1 ] || rm "$root/.ci-pristine-stale"
   done' _ "${ZMK_TEST_PRISTINE:-0}"
 
-# Attach a holder at the first cache mutation. On the old fixture this occurs
-# after its final holder check, as the seed is about to start. With no seed,
-# the same control attaches it immediately before Docker attempts the reset.
-echo '[build-contract] pristine-firmware-late-holder-preserves-cache'
-pristine_snapshot='set -eu
-  export LC_ALL=C
-  for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-    for marker in "$root"/.ci-pristine-stale "$root"/.ci-pristine-stale-*; do
-      [ ! -f "$marker" ] || cksum "$marker"
-    done
-  done'
-docker exec "${last_container}" sh -c "${pristine_snapshot}" > "${tmp_dir}/pristine-firmware-before.log"
-docker rm -f "${last_container}" >/dev/null
-firmware_rejection="${tmp_dir}/pristine-firmware-rejection"
-pristine_bin="${tmp_dir}/pristine-bin"
-mkdir "${firmware_rejection}" "${pristine_bin}" "${tool_root}/.github/scripts"
-cp "${repo_root}/.github/scripts/test-build-fixtures.sh" "${tool_root}/.github/scripts/"
-cat > "${pristine_bin}/docker" <<'EOF'
+if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
+  # Attach a holder at the first cache mutation. On the old fixture this occurs
+  # after its final holder check, as the seed is about to start. With no seed,
+  # the same control attaches it immediately before Docker attempts the reset.
+  echo '[build-contract] pristine-firmware-late-holder-preserves-cache'
+  pristine_snapshot='set -eu
+    export LC_ALL=C
+    for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
+      test -f "$root/.ci-pristine-stale"
+      for marker in "$root"/.ci-pristine-stale "$root"/.ci-pristine-stale-*; do
+        [ ! -f "$marker" ] || cksum "$marker"
+      done
+    done'
+  docker exec "${last_container}" sh -c "${pristine_snapshot}" > "${tmp_dir}/pristine-firmware-before.log"
+  docker rm -f "${last_container}" >/dev/null
+  firmware_rejection="${tmp_dir}/pristine-firmware-rejection"
+  pristine_bin="${tmp_dir}/pristine-bin"
+  mkdir "${firmware_rejection}" "${pristine_bin}" "${tool_root}/.github/scripts"
+  cp "${repo_root}/.github/scripts/test-build-fixtures.sh" "${tool_root}/.github/scripts/"
+  cat > "${pristine_bin}/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 attach=0
@@ -1842,25 +1844,24 @@ if [ "${attach}" = 1 ] && [ ! -e "${ZMK_TEST_PRISTINE_HOLDER}" ]; then
 fi
 exec "${ZMK_TEST_REAL_DOCKER}" "$@"
 EOF
-chmod +x "${pristine_bin}/docker"
-pristine_holder_log="${tmp_dir}/pristine-firmware-holder.log"
-container_logs+=("${pristine_holder_log}" "${firmware_rejection}/standard.log")
-if ZMK_TEST_REAL_DOCKER="$(command -v docker)" PATH="${pristine_bin}:${PATH}" \
-    ZMK_TEST_PRISTINE_HOLDER="${pristine_holder_log}" ZMK_TEST_PRISTINE_SNAPSHOT="${pristine_snapshot}" \
-    ZMK_TEST_PRISTINE=1 ZMK_TEST_RESULTS="${firmware_rejection}" \
-    bash "${tool_root}/.github/scripts/test-build-fixtures.sh" > "${tmp_dir}/pristine-firmware-rejection.log" 2>&1; then
-  echo 'Firmware fixture accepted a late cache holder.' >&2; exit 1
-fi
-summary="$(summary_from_log "${firmware_rejection}/standard.log")"
-grep -qx 'Status: FAILED' "${summary}"
-grep -qx 'Reason: cache reset failed' "${summary}"
-grep -q 'volume is in use' "${summary%/*}/build.log"
-pristine_holder="$(cat "${pristine_holder_log}")"
-[ "${#pristine_holder}" = 64 ] && [[ "${pristine_holder}" != *[!0-9a-f]* ]]
-docker start -a "${pristine_holder}" > "${tmp_dir}/pristine-firmware-after.log"
-cmp "${tmp_dir}/pristine-firmware-before.log" "${tmp_dir}/pristine-firmware-after.log"
-docker rm "${pristine_holder}" >/dev/null
-if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
+  chmod +x "${pristine_bin}/docker"
+  pristine_holder_log="${tmp_dir}/pristine-firmware-holder.log"
+  container_logs+=("${pristine_holder_log}" "${firmware_rejection}/standard.log")
+  if ZMK_TEST_REAL_DOCKER="$(command -v docker)" PATH="${pristine_bin}:${PATH}" \
+      ZMK_TEST_PRISTINE_HOLDER="${pristine_holder_log}" ZMK_TEST_PRISTINE_SNAPSHOT="${pristine_snapshot}" \
+      ZMK_TEST_PRISTINE=1 ZMK_TEST_RESULTS="${firmware_rejection}" \
+      bash "${tool_root}/.github/scripts/test-build-fixtures.sh" > "${tmp_dir}/pristine-firmware-rejection.log" 2>&1; then
+    echo 'Firmware fixture accepted a late cache holder.' >&2; exit 1
+  fi
+  summary="$(summary_from_log "${firmware_rejection}/standard.log")"
+  grep -qx 'Status: FAILED' "${summary}"
+  grep -qx 'Reason: cache reset failed' "${summary}"
+  grep -q 'volume is in use' "${summary%/*}/build.log"
+  pristine_holder="$(cat "${pristine_holder_log}")"
+  [ "${#pristine_holder}" = 64 ] && [[ "${pristine_holder}" != *[!0-9a-f]* ]]
+  docker start -a "${pristine_holder}" > "${tmp_dir}/pristine-firmware-after.log"
+  cmp "${tmp_dir}/pristine-firmware-before.log" "${tmp_dir}/pristine-firmware-after.log"
+  docker rm "${pristine_holder}" >/dev/null
   echo '[build-contract] pristine-validate-recovery'
   log="${tmp_dir}/pristine-validate-recovery.log"
   container_logs+=("${log}")
@@ -1878,7 +1879,7 @@ if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
     for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
       test ! -e "$root/.ci-pristine-stale"
     done'
-  docker rm -f "${last_container}" >/dev/null
 fi
+docker rm -f "${last_container}" >/dev/null
 
 echo "build host/copy contracts passed."

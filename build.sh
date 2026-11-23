@@ -2195,11 +2195,21 @@ create_run_directory() {
     # Keep the actual sequence in the summary; a config name may itself end in digits.
     RUN_SEQUENCE="${number}" artifact_dir="${candidate}" LOG_FILE="${candidate}/build.log"
     : > "${LOG_FILE}"
-    # The run can produce a failed summary even if releasing its claim fails.
+    msg "Run directory: ${artifact_dir}" >> "${LOG_FILE}"
+    msg "Run directory: ${artifact_dir}"
+    # Write in the reserving shell so the existing INT/TERM deferral covers the receipt.
     if [ -n "${ZMK_CI_BUILD_RUN_FILE:-}" ]; then
-        (set -C; printf '%s' "${candidate##*/}" > "${ZMK_CI_BUILD_RUN_FILE}") || die "failed to record CI run directory"
+        local had_noclobber=0 receipt_failed=0
+        case $- in *C*) had_noclobber=1 ;; esac
+        set -C
+        printf '%s' "${candidate##*/}" 2>> "${LOG_FILE}" > "${ZMK_CI_BUILD_RUN_FILE}" || receipt_failed=1
+        [ "${had_noclobber}" = 1 ] || set +C
+        if [ "${receipt_failed}" = 1 ]; then
+            printf '%s\n' 'failed to record CI run directory' >> "${LOG_FILE}" || true
+            [ "${run_signal_status}" = 0 ] || return "${run_signal_status}"
+            die "failed to record CI run directory"
+        fi
     fi
-    msg "Run directory: ${artifact_dir}" | tee -a "${LOG_FILE}"
     release_run_claim
 }
 

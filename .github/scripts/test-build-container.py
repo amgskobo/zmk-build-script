@@ -1530,6 +1530,83 @@ sys.exit(99)
                         except ProcessLookupError: pass
                         if process.poll() is None: process.wait(timeout=3)
 
+    def test_run_receipt_signal_deferral_and_io_failure(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (self.root / 'build.yaml').write_text('board: A\n')
+        docker = binary / 'docker'
+        docker.write_text('''#!/usr/bin/env bash
+: > "${RECEIPT_DOCKER_CALLED}"
+exit 99
+''')
+        docker.chmod(0o755)
+        hook = self.root / 'receipt-hook'
+        hook.write_text('''printf() {
+    if [ "${1:-}" = %s ] && [[ "${2:-}" = run-* ]]; then
+        : > "${RECEIPT_REACHED}"
+        while [ ! -e "${RECEIPT_RELEASE}" ]; do sleep .01; done
+    fi
+    builtin printf "$@"
+}
+''')
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signum):
+                case = self.root / ('receipt-%s' % signum)
+                case.mkdir()
+                receipt = case / 'build-run'
+                env = dict(os.environ, ZMK_IN_CONTAINER='0', BASH_ENV=str(hook),
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                           ZMK_CI_BUILD_RUN_FILE=str(receipt), RECEIPT_DOCKER_CALLED=str(case / 'docker-called'),
+                           RECEIPT_REACHED=str(case / 'reached'), RECEIPT_RELEASE=str(case / 'release'))
+                process = subprocess.Popen(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                           start_new_session=True, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not (case / 'reached').exists() and time.monotonic() < deadline:
+                        self.assertIsNone(process.poll())
+                        time.sleep(.01)
+                    self.assertTrue((case / 'reached').exists())
+                    os.killpg(process.pid, signum)
+                    (case / 'release').touch()
+                    output, _ = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 128 + signum, output)
+                    run = self.run_directory(output)
+                    self.assertEqual(receipt.read_text(), run.name)
+                    self.assertIn('Reason: interrupted by ' + signal.Signals(signum).name,
+                                  (run / 'build-summary.txt').read_text())
+                    self.assertFalse((case / 'docker-called').exists(), output)
+                finally:
+                    (case / 'release').touch()
+                    try: os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError: pass
+                    if process.poll() is None: process.wait(timeout=3)
+
+        env = dict(os.environ, ZMK_IN_CONTAINER='0', ZMK_CI_BUILD_RUN_FILE=str(self.root),
+                   PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                   RECEIPT_DOCKER_CALLED=str(self.root / 'docker-called'))
+        result = subprocess.run(['bash', str(BUILD), 'validate', str(self.root)], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        run = self.run_directory(result.stdout)
+        for name in ('build.log', 'build-summary.txt'):
+            self.assertIn('failed to record CI run directory', (run / name).read_text())
+        self.assertFalse((self.root / 'docker-called').exists(), result.stdout)
+
+    def test_firmware_pristine_evidence_uses_docker_result(self):
+        for output, expected in (
+                ('fixture-cache\nUpdating west dependencies\n', True),
+                ('\x1b[0;90mCache volume is not present; starting fresh: fixture-cache\x1b[0m\r\n', True),
+                ('Docker cache volume: fixture-cache\nInitializing west workspace\n', False),
+                ('another-fixture-cache\n', False)):
+            with self.subTest(output=output):
+                log = self.root / 'firmware.log'
+                log.write_bytes(output.encode())
+                result = subprocess.run(['bash', '-c',
+                                         'source /tmp/test-build-fixtures.sh; check_pristine_cache_reset "$1" "$2"',
+                                         '_', 'fixture-cache', str(log)], capture_output=True)
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+
     def test_create_group_signals_acquire_identity_before_cleanup(self):
         binary = self.root / 'bin'
         binary.mkdir()

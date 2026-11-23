@@ -24,6 +24,12 @@ capture_container_build_stream() {
   return 1
 }
 
+check_pristine_cache_reset() {
+  local volume="$1" log="$2"
+  sed $'s/\033\\[[0-9;]*m//g' "${log}" | tr -d '\r' |
+    grep -Fx -e "${volume}" -e "Cache volume is not present; starting fresh: ${volume}" >/dev/null
+}
+
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "${repo_root}"
@@ -89,7 +95,7 @@ build_case() {
       grep -qx 'Built targets: 8' "${run}/build-summary.txt"
       if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
         grep -qx 'Pristine: 1' "${run}/build-summary.txt"
-        grep -Fq 'Initializing west workspace' "${run}/build.log"
+        check_pristine_cache_reset "${ZMK_DOCKER_CACHE_VOLUME}" "${run}/build.log"
       fi
       if [ "${ZMK_BUILD_JOBS:-1}" -gt 1 ]; then
         grep -F "Building targets in parallel (jobs=${ZMK_BUILD_JOBS})" "${run}/build.log"
@@ -114,9 +120,10 @@ pristine=()
 build_case standard .github/fixtures/ci-zmk-config --jobs "${ZMK_BUILD_JOBS:-1}" ${pristine[@]+"${pristine[@]}"}
 cache_reader="zmk-test-cache-$$"
 # Record ownership only after create succeeds.
-cache_reader_id="$(docker create --name "${cache_reader}" --label owner.repository=amgskobo/zmk-build-script \
-  --label owner.purpose=firmware-cache-reader -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces:ro,nocopy" \
-  "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" | tr -d '\r')"
+reader_args=(create --name "${cache_reader}" --label owner.repository=amgskobo/zmk-build-script
+  --label owner.purpose=firmware-cache-reader -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces:ro,nocopy")
+[ -z "${ZMK_DOCKER_PLATFORM:-}" ] || reader_args+=(--platform "${ZMK_DOCKER_PLATFORM}")
+cache_reader_id="$(docker "${reader_args[@]}" "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" /bin/sh -c ':' | tr -d '\r')"
 containers+=("${cache_reader_id}")
 # Use the same native host-path conversion as external clone.
 source scripts/build-external-source.sh

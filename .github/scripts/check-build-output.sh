@@ -340,7 +340,7 @@ write_ci_source_context() {
 }
 
 ci_source_run_dir() {
-  local index="${1:-}" require_success="${2:-0}" source_log directory name
+  local index="${1:-}" require_success="${2:-0}" source_log directory name source_status
   [ ! -L .build ] && [ -f .build/ci-source.record ] && [ ! -L .build/ci-source.record ] || return 1
   IFS= read -r source_log < .build/ci-source.record || return 1
   case "${source_log}" in .build/ci-execution.??????/command.log) ;; *) return 1 ;; esac
@@ -354,10 +354,14 @@ ci_source_run_dir() {
     read_ci_selection "${directory}/source-index" '' || return 1
     [ "${CI_SELECTION_VALUE}" = "${index}" ] || return 1
   fi
-  if [ "${require_success}" = 1 ]; then
+  [ -f .build/ci-source.status ] && [ ! -L .build/ci-source.status ] &&
     [ -f "${directory}/exit.status" ] && [ ! -L "${directory}/exit.status" ] || return 1
-    cmp -s "${directory}/exit.status" <(printf '0\n') || return 1
-  fi
+  IFS= read -r source_status < "${directory}/exit.status" || return 1
+  case "${source_status}" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  [ "${source_status}" -le 255 ] || return 1
+  [ "${require_success}" != 1 ] || [ "${source_status}" = 0 ] || return 1
+  cmp -s "${directory}/exit.status" <(printf '%s\n' "${source_status}") &&
+    cmp -s "${directory}/exit.status" .build/ci-source.status || return 1
   read_ci_selection "${directory}/build-run" '' || return 1
   name="${CI_SELECTION_VALUE}"
   case "${name}" in run-*) ;; *) return 1 ;; esac
@@ -431,6 +435,15 @@ case "${mode}" in
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
     cd "${repo_root}"
     mkdir -p .build
+    case "${mode}" in
+      ci-source|ci-source-index)
+        [ ! -L .build ] && [ ! -L .build/ci-source.status ] || exit 1
+        # Fence off any previous receipt before allocating this invocation's directory.
+        if ! printf 'pending\n' > .build/ci-source.status; then
+          rm -f .build/ci-source.record
+          exit 1
+        fi ;;
+    esac
     ci_execution="$(mktemp -d .build/ci-execution.XXXXXX)"
     status=0
     case "${mode}" in
@@ -508,7 +521,7 @@ case "${mode}" in
         ) > "${ci_execution}/command.log" 2>&1 || status=$? ;;
       ci-source|ci-source-index)
         shift
-        printf '1\n' > .build/ci-source.status
+        [ ! -L .build/ci-source.record ] || exit 1
         printf '%s\n' "${ci_execution}/command.log" > .build/ci-source.record
         (
           write_ci_source_context > "${ci_execution}/source-context" || exit "$?"
@@ -524,8 +537,7 @@ case "${mode}" in
           else
             GITHUB_STEP_SUMMARY= GITHUB_ACTIONS= bash "${repo_root}/scripts/build-external-source.sh" "$@"
           fi
-        ) > "${ci_execution}/command.log" 2>&1 || status=$?
-        printf '%s\n' "${status}" > .build/ci-source.status ;;
+        ) > "${ci_execution}/command.log" 2>&1 || status=$? ;;
       ci-check)
         case "${2:-}" in build|validate) ;; *) echo 'Invalid output mode.' >&2; exit 2 ;; esac
         (
@@ -551,6 +563,12 @@ case "${mode}" in
       fi
     fi
     printf '%s\n' "${status}" > "${ci_execution}/exit.status"
+    case "${mode}" in
+      ci-source|ci-source-index)
+        if cmp -s .build/ci-source.record <(printf '%s\n' "${ci_execution}/command.log"); then
+          printf '%s\n' "${status}" > .build/ci-source.status
+        fi ;;
+    esac
     if [ "${status}" = 0 ]; then
       echo 'Verification command completed successfully.'
     else
@@ -863,7 +881,7 @@ if [ "${diagnostic_only}" = 1 ]; then
     'firmware build failed'|'build execution failed') diagnostic_phase=compile ;;
     'artifact copy failed') diagnostic_phase=artifact-copy ;;
     'run directory reservation cleanup failed'|'container cleanup failed'|'container receipt cleanup failed'|'manifest inspection cleanup failed'|'image selection container cleanup failed'|'container stop failed') diagnostic_phase=cleanup ;;
-    'interrupted by INT'|'interrupted by TERM') diagnostic_phase=interrupted ;;
+    'interrupted by INT'|'interrupted by TERM'|'interrupted by SIGINT'|'interrupted by SIGTERM') diagnostic_phase=interrupted ;;
     *) diagnostic_phase=unknown ;;
   esac
   [ "${diagnostic_status}" != SUCCESS ] || diagnostic_phase=complete

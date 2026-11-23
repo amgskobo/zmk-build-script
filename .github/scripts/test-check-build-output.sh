@@ -745,6 +745,8 @@ firmware build failed|compile
 artifact copy failed|artifact-copy
 container cleanup failed|cleanup
 interrupted by TERM|interrupted
+interrupted by SIGINT|interrupted
+interrupted by SIGTERM|interrupted
 synthetic-private-host /synthetic/private secret=value|unknown
 EOF
 printf 'Reason: cache reset failed\n' >> "${run_path}/build-summary.txt"
@@ -1446,6 +1448,24 @@ fi
 (cd "${ci_root}/.github"; bash scripts/check-build-output.sh ci-check build 2) \
   >"${tmp_dir}/relative-check-console" 2>&1
 grep -qx 'Outcome: SUCCESS' "${ci_root}/.build/public/build.txt"
+retry_bin="${tmp_dir}/retry-bin"
+mkdir "${retry_bin}"
+cat > "${retry_bin}/mktemp" <<'EOF'
+#!/usr/bin/env bash
+echo 'injected CI execution allocation failure' >&2
+exit 23
+EOF
+chmod +x "${retry_bin}/mktemp"
+status=0
+(cd "${ci_root}"; PATH="${retry_bin}:${PATH}" PUBLIC_PROBE_EXIT=0 PROBE_RUN_NAME="${run_name}" \
+  bash .github/scripts/check-build-output.sh ci-source-index 2) > "${tmp_dir}/source-retry-console" 2>&1 || status=$?
+[ "${status}" = 23 ]
+grep -Fxq 'injected CI execution allocation failure' "${tmp_dir}/source-retry-console"
+if (cd "${ci_root}"; bash .github/scripts/check-build-output.sh ci-check build 2) \
+    >> "${tmp_dir}/source-retry-console" 2>&1; then
+  echo 'CI certified stale output after a failed retry setup.' >&2; exit 1
+fi
+grep -qx 'Outcome: FAILED' "${ci_root}/.build/public/build.txt"
 for invalid in '' 0 3 bad; do
   if (cd "${ci_root}"; PUBLIC_PROBE_EXIT=0 bash .github/scripts/check-build-output.sh ci-source-index "${invalid}") \
     >"${tmp_dir}/index-console" 2>&1; then echo 'invalid CI source index accepted' >&2; exit 1; fi

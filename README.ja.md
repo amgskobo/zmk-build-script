@@ -583,7 +583,7 @@ bash .github/scripts/test.sh all
 | --- | --- |
 | `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白・Unicode 入り target / module / 一時 path、option や shell 構文に見える文字・絵文字を含む literal file 名、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。稼働中・停止済みの cache holder がある場合、build / validate の pristine を拒否します。pristine lane では所有 holder の解放後に validate が成功し、workspace / ccache の古い状態が消えることも確認します。image 内の Python / PyYAML を使います。 |
-| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。pristine lane は標準 build が新しい west workspace を初期化することを確認します。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
+| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。pristine lane は標準 build の前に Docker が対象 cache を削除したか、対象 cache が存在しなかったことを確認します。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | 独立した shell case と、順序を保つ Docker 検証・firmware の処理を並行して実行します。 |
 
 hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `ZMK_TEST_PRISTINE=1` を必須にした
