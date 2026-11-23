@@ -2195,6 +2195,10 @@ create_run_directory() {
     # Keep the actual sequence in the summary; a config name may itself end in digits.
     RUN_SEQUENCE="${number}" artifact_dir="${candidate}" LOG_FILE="${candidate}/build.log"
     : > "${LOG_FILE}"
+    # The run can produce a failed summary even if releasing its claim fails.
+    if [ -n "${ZMK_CI_BUILD_RUN_FILE:-}" ]; then
+        (set -C; printf '%s' "${candidate##*/}" > "${ZMK_CI_BUILD_RUN_FILE}") || die "failed to record CI run directory"
+    fi
     msg "Run directory: ${artifact_dir}" | tee -a "${LOG_FILE}"
     release_run_claim
 }
@@ -2224,9 +2228,6 @@ RUN_STARTED_AT="$(date +%s)"
 RUN_FAILURE_REASON="run directory reservation failed"
 create_run_directory
 run_id="${artifact_dir##*/}"
-if [ -n "${ZMK_CI_BUILD_RUN_FILE:-}" ]; then
-    (set -C; printf '%s' "${run_id}" > "${ZMK_CI_BUILD_RUN_FILE}") || die "failed to record CI run directory"
-fi
 container_name="${ZMK_CONTAINER_NAME:-zmk-build-${run_id}-pid-$$}"
 touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 

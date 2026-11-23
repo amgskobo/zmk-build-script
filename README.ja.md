@@ -583,7 +583,7 @@ bash .github/scripts/test.sh all
 | --- | --- |
 | `shell` | Bash 構文、LF / checkout、空白、成果物と非公開 archive の判定、source queue / 失敗 / 中断、host guard / help。各 OS の tar / Git で、空白・Unicode 入り target / module / 一時 path、option や shell 構文に見える文字・絵文字を含む literal file 名、binary 内容、実 symlink、root と nested の除外、Git 選択と fallback を検証します。この検証層には Git が必要です。 |
 | `docker` | 実 source copy、metadata、image / build parser、workspace / update / overlay の制御した失敗と中断、cleanup、ccache hit、Windows clone の copy back、外部 workflow の引数転送。稼働中・停止済みの cache holder がある場合、build / validate の pristine を拒否します。pristine lane では所有 holder の解放後に validate が成功し、workspace / ccache の古い状態が消えることも確認します。image 内の Python / PyYAML を使います。 |
-| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。pristine lane は標準 build 前に workspace / ccache に古い状態を置き、削除を確認します。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
+| `build` | [標準 firmware](.github/fixtures/ci-zmk-config/build.yaml)、[project overlay](.github/fixtures/module-override-zmk-config/build.yaml)、extra module、pristine 無しの復元、root snippet を使う独立 application。pristine lane は標準 build が新しい west workspace を初期化することを確認します。実 Docker path に空白・Unicode・隠し親 directory を含め、成果物の完全一致・target log 順序・並列数の指定・依存 identity を検証します。 |
 | `all` | 独立した shell case と、順序を保つ Docker 検証・firmware の処理を並行して実行します。 |
 
 hosted CI は Linux・macOS・Windows で `shell`、Ubuntu で `ZMK_TEST_PRISTINE=1` を必須にした
@@ -677,8 +677,8 @@ test cache は既定で専用 volume を作り、終了時に削除します。p
 self-hosted workflow は repository / OS ごとの prefix を設定します。同じ OS の job は cache を保護するため
 直列化し、異なる OS の job は独立して実行します。表示するのは固定形式の Docker CPU / memory 容量の数値と、
 既存 cache override の有無だけです。host / device の識別値と実 cache 名は非公開の証跡に保持します。
-`ZMK_TEST_PRISTINE=1` は Docker の cache holder 拒否 case 後と標準 firmware build 前に初期化し、
-volume root・workspace・ccache に置いた古い状態の削除も検証します。firmware test は古い状態を書き込む前に他の container 参照を確認します。
+`ZMK_TEST_PRISTINE=1` は Docker の cache holder 拒否 case 後に、volume root・workspace・ccache に置いた古い状態の削除を検証します。
+標準 firmware build は `--pristine` で実行します。初期化の直前に別の container が参照を取得するケースでは、拒否後に cache のマーカーが変化していないことを確認します。
 復元検証では cache を保持します。
 `ZMK_TEST_PRISTINE=0` は再利用の検証を選び、その成功だけでは pristine 成功とは扱いません。
 test が解放するのは自分で取得した container 参照だけで、未知の holder は拒否します。
