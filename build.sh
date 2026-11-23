@@ -2224,6 +2224,9 @@ RUN_STARTED_AT="$(date +%s)"
 RUN_FAILURE_REASON="run directory reservation failed"
 create_run_directory
 run_id="${artifact_dir##*/}"
+if [ -n "${ZMK_CI_BUILD_RUN_FILE:-}" ]; then
+    (set -C; printf '%s' "${run_id}" > "${ZMK_CI_BUILD_RUN_FILE}") || die "failed to record CI run directory"
+fi
 container_name="${ZMK_CONTAINER_NAME:-zmk-build-${run_id}-pid-$$}"
 touch "${SCRIPT_DIR}/.build/.gitkeep" 2>>"${LOG_FILE}"
 

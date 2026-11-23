@@ -217,6 +217,11 @@ class ContainerContracts(unittest.TestCase):
         self.assertEqual(workflow['on']['schedule'], [{'cron': '13 0 * * *'}])
         self.assertEqual(workflow['jobs']['build-runner']['timeout-minutes'], '180')
         steps = workflow['jobs']['build-runner']['steps']
+        output_checks = [s for s in steps if s.get('name', '').startswith('Check build output (')]
+        self.assertEqual(len(output_checks), 2)
+        for step in output_checks:
+            self.assertEqual(step['env'], {'SOURCE_INDEX': '${{ matrix.source.index }}'})
+            self.assertEqual(step['run'], 'bash .github/scripts/check-build-output.sh ci-check "${EXTERNAL_MODE}" "${SOURCE_INDEX}"')
         diagnostics = [s for s in steps if s.get('name', '').startswith('Inspect external failure (')]
         self.assertEqual(len(diagnostics), 2)
         for step in diagnostics:

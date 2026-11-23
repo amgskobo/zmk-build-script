@@ -527,7 +527,7 @@ hosted runner の raw evidence は一時的で、job の削除後は残りませ
 CI は `bash .github/scripts/check-build-output.sh ci-tests <mode>` から[共通の検証入口](#保守と検証)を実行し、
 詳細な console 出力を実行ごとの新しい `.build/ci-execution.XXXXXX/` に保存します。
 外部 build には `ci-tools`、`ci-lf`、`ci-syntax`、`ci-source <wrapper arguments>`、
-`ci-check build|validate` を使います。job の開始時に
+`ci-check build|validate [INDEX]` を使います。job の開始時に
 `publish clear` で既知の report file を初期化し、`publish verify` で最終 payload を検査します。
 両方の成功時だけ upload します。
 
@@ -550,8 +550,9 @@ archive は自動 upload の対象に含めず、hosted runner では一時的�
 外部 CI は `ci-matrix` と `ci-source-index N` を使い、workflow event から実行時に準備する非公開の
 `.build/ci-source-file` を読みます。selector は常に list file として扱い、不足する list は matrix 解決時に失敗させます。
 CI helper は呼び出し元の directory にかかわらず、この repository の root を基準に実行します。
-外部 job が失敗したときは archive 前に `ci-diagnostics INDEX build|validate` を実行し、
-許可した summary の失敗段階・image 系統、Docker architecture、対象 cache を保持する container 数だけを表示します。
+外部 job が失敗したときは archive 前に `ci-diagnostics INDEX build|validate` を実行します。
+出力検証と診断は、その source 実行が記録した run directory を使います。CI で使う wrapper は builder に環境変数を引き継ぎます。
+診断には許可した summary の失敗段階・image 系統、Docker architecture、対象 cache を保持する container 数だけを表示します。
 取得できない項目は `unavailable` とし、生のエラー、container ID、cache 名、path は非公開に保ちます。
 matrix と step の環境変数には数値 index だけを渡し、source の path / URL / slug は
 runner 自身の事前表示にも command 出力にも含めません。
@@ -677,7 +678,8 @@ self-hosted workflow は repository / OS ごとの prefix を設定します。�
 直列化し、異なる OS の job は独立して実行します。表示するのは固定形式の Docker CPU / memory 容量の数値と、
 既存 cache override の有無だけです。host / device の識別値と実 cache 名は非公開の証跡に保持します。
 `ZMK_TEST_PRISTINE=1` は Docker の cache holder 拒否 case 後と標準 firmware build 前に初期化し、
-volume root・workspace・ccache に置いた古い状態の削除も検証します。復元検証では cache を保持します。
+volume root・workspace・ccache に置いた古い状態の削除も検証します。firmware test は古い状態を書き込む前に他の container 参照を確認します。
+復元検証では cache を保持します。
 `ZMK_TEST_PRISTINE=0` は再利用の検証を選び、その成功だけでは pristine 成功とは扱いません。
 test が解放するのは自分で取得した container 参照だけで、未知の holder は拒否します。
 各 build / validate の直後に、その run を明示して output check を実行します。

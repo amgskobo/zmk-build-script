@@ -1757,10 +1757,11 @@ assert_pristine_rejected() {
     container_logs+=("${log}")
     args=("${target_no_west}" --pristine)
     [ "${command}" != validate ] || args=(validate "${args[@]}")
-    if ZMK_KEEP_CONTAINER=0 bash "${tool_root}/build.sh" "${args[@]}" > "${log}" 2>&1; then
+    if ZMK_KEEP_CONTAINER=0 ZMK_CI_BUILD_RUN_FILE="${log}.run" bash "${tool_root}/build.sh" "${args[@]}" > "${log}" 2>&1; then
       echo "pristine ${command} continued with a ${state} cache holder" >&2; return 1
     fi
     summary="$(summary_from_log "${log}")"
+    cmp "${log}.run" <(run="${summary%/*}"; printf '%s' "${run##*/}")
     grep -qx 'Status: FAILED' "${summary}"
     grep -qx 'Pristine: 1' "${summary}"
     grep -qx 'Reason: cache reset failed' "${summary}"
@@ -1795,6 +1796,17 @@ docker ps -aq --no-trunc --filter "volume=${ZMK_DOCKER_CACHE_VOLUME}" |
   tr -d '\r' > "${tmp_dir}/pristine-stopped-holder.txt"
 cmp "${tmp_dir}/pristine-stopped-holder.txt" <(printf '%s\n' "${last_container}")
 assert_pristine_rejected stopped false
+echo '[build-contract] pristine-firmware-seed-rejects-stopped-holder'
+firmware_rejection="${tmp_dir}/pristine-firmware-rejection"
+mkdir "${firmware_rejection}"
+if ZMK_TEST_PRISTINE=1 ZMK_TEST_RESULTS="${firmware_rejection}" \
+    bash "${repo_root}/.github/scripts/test-build-fixtures.sh" > "${tmp_dir}/pristine-firmware-rejection.log" 2>&1; then
+  echo 'Firmware fixture accepted a stopped cache holder.' >&2; exit 1
+fi
+grep -Fxq 'Cannot seed pristine firmware cache while another container holds it.' "${tmp_dir}/pristine-firmware-rejection.log"
+[ ! -e "${firmware_rejection}/pristine-seed.log" ]
+docker ps -aq --no-trunc --filter "volume=${ZMK_DOCKER_CACHE_VOLUME}" | tr -d '\r' > "${firmware_rejection}/holders.txt"
+cmp "${tmp_dir}/pristine-stopped-holder.txt" "${firmware_rejection}/holders.txt"
 docker start "${last_container}" >/dev/null
 docker exec "${last_container}" sh -c '
   set -eu

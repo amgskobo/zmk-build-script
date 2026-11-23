@@ -604,7 +604,7 @@ diagnosis requires a local reproduction or separately reviewed private retrieval
 CI uses `bash .github/scripts/check-build-output.sh ci-tests <mode>` to run the
 [canonical test entry point](#maintenance), retaining detailed output in `.build/`
 logs, using a fresh `.build/ci-execution.XXXXXX/` for each command. `ci-tools`,
-`ci-lf`, `ci-syntax`, `ci-source <wrapper arguments>` and `ci-check build|validate`
+`ci-lf`, `ci-syntax`, `ci-source <wrapper arguments>` and `ci-check build|validate [INDEX]`
 provide the same boundary for external builds. `publish clear` initializes the
 known report files before a job, and `publish verify` checks the final payload
 before upload. Both steps must succeed for the upload to run.
@@ -633,7 +633,9 @@ External CI uses `ci-matrix` and `ci-source-index N` with a private
 The selector always names a list file; missing lists fail during matrix resolution.
 CI helpers operate from this repository's root regardless of the caller's directory.
 Failed external jobs run `ci-diagnostics INDEX build|validate` before archiving.
-It reports an allowlisted summary phase and image family, Docker architecture and
+The output check and diagnostics use the run directory recorded by the current
+source invocation. Wrappers used by CI must pass the builder's environment through.
+Diagnostics report an allowlisted summary phase and image family, Docker architecture and
 the number of containers retaining that source's cache. Unavailable observations
 remain `unavailable`; raw errors, container IDs, cache names and paths stay private.
 Only numeric indices enter the matrix and step environment; source paths, URLs
@@ -781,7 +783,8 @@ only fixed numeric Docker CPU/memory capacity and presence of an existing cache
 override. Host/device identifiers and actual cache names stay in private evidence.
 `ZMK_TEST_PRISTINE=1` tests a reset after the Docker cache-holder rejection cases
 and before the standard firmware build, including removal of seeded stale state
-at the volume root, in the workspace and in ccache. Restoration always retains
+at the volume root, in the workspace and in ccache. The firmware test checks for
+other container references before writing the seed markers. Restoration always retains
 the cache. `ZMK_TEST_PRISTINE=0` selects reuse checks; its success does not establish
 pristine success. Tests release only their own acquired container references and
 reject unknown holders. Each build/validate result is checked immediately

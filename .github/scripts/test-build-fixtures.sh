@@ -106,19 +106,32 @@ build_case() {
 pristine=()
 if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
   pristine+=(--pristine)
+  pristine_marker=".ci-pristine-stale-${scratch##*.}"
+  pristine_holders="${ZMK_TEST_RESULTS}/pristine-holders.txt"
+  docker ps -aq --no-trunc --filter "volume=${ZMK_DOCKER_CACHE_VOLUME}" > "${pristine_holders}"
+  if [ -s "${pristine_holders}" ]; then
+    echo 'Cannot seed pristine firmware cache while another container holds it.' >&2
+    exit 1
+  fi
   # Populate all cache scopes before the real build. Removing the acquired seed
   # container is required: even a stopped reference would prevent pristine.
   seed_id="$(docker create --label owner.repository=amgskobo/zmk-build-script \
-    --label owner.purpose=pristine-fixture-seed -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces" \
+    --label owner.purpose=pristine-fixture-seed -v "${ZMK_DOCKER_CACHE_VOLUME}:/workspaces:nocopy" \
     "${ZMK_BUILD_IMAGE:-zmkfirmware/zmk-build-arm:stable}" sh -c '
-      set -eu
+      set -euC
       mkdir -p /workspaces/zmk-config /workspaces/.ccache
       for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-        printf "stale pristine fixture\n" > "$root/.ci-pristine-stale"
-        test -s "$root/.ci-pristine-stale"
+        printf "stale pristine fixture\n" > "$root/$1"
+        test -s "$root/$1"
       done
-      echo "[pristine-contract] firmware stale state seeded"' | tr -d '\r')"
+      echo "[pristine-contract] firmware stale state seeded"' _ "${pristine_marker}" | tr -d '\r')"
   containers+=("${seed_id}")
+  docker ps -aq --no-trunc --filter "volume=${ZMK_DOCKER_CACHE_VOLUME}" > "${pristine_holders}"
+  if ! cmp -s "${pristine_holders}" <(printf '%s\n' "${seed_id}") &&
+      ! cmp -s "${pristine_holders}" <(printf '%s\r\n' "${seed_id}"); then
+    echo 'Cannot seed pristine firmware cache while another container holds it.' >&2
+    exit 1
+  fi
   docker start -a "${seed_id}" | tee "${ZMK_TEST_RESULTS}/pristine-seed.log"
   grep -Fxq '[pristine-contract] firmware stale state seeded' "${ZMK_TEST_RESULTS}/pristine-seed.log"
   docker rm "${seed_id}" >/dev/null
@@ -132,9 +145,9 @@ cache_reader_id="$(docker create --name "${cache_reader}" --label owner.reposito
     set -eu
     [ "$1" = 1 ] || exit 0
     for root in /workspaces /workspaces/zmk-config /workspaces/.ccache; do
-      test ! -e "$root/.ci-pristine-stale"
+      test ! -e "$root/$2"
     done
-    echo "[pristine-contract] firmware stale state removed"' _ "${ZMK_TEST_PRISTINE:-0}" | tr -d '\r')"
+    echo "[pristine-contract] firmware stale state removed"' _ "${ZMK_TEST_PRISTINE:-0}" "${pristine_marker:-}" | tr -d '\r')"
 containers+=("${cache_reader_id}")
 docker start -a "${cache_reader_id}" | tee "${ZMK_TEST_RESULTS}/pristine-check.log"
 if [ "${ZMK_TEST_PRISTINE:-0}" = 1 ]; then
